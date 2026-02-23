@@ -12,7 +12,7 @@ from exo.master.placement_utils import (
     get_shard_assignments,
     get_smallest_cycles,
 )
-from exo.shared.models.model_cards import ModelId
+from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.shared.topology import Topology
 from exo.shared.types.commands import (
     CancelDownload,
@@ -29,20 +29,22 @@ from exo.shared.types.events import (
     TaskStatusUpdated,
 )
 from exo.shared.types.memory import Memory
-from exo.shared.types.profiling import MemoryUsage, NodeNetworkInfo
+from exo.shared.types.profiling import MemoryUsage, NodeIdentity, NodeNetworkInfo
 from exo.shared.types.tasks import Task, TaskId, TaskStatus
 from exo.shared.types.worker.downloads import (
     DownloadOngoing,
     DownloadProgress,
 )
 from exo.shared.types.worker.instances import (
+    DisaggregatedInstance,
     Instance,
     InstanceId,
     InstanceMeta,
     MlxJacclInstance,
     MlxRingInstance,
 )
-from exo.shared.types.worker.shards import Sharding
+from exo.shared.types.worker.runners import RunnerId, ShardAssignments
+from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
 
 
 def random_ephemeral_port() -> int:
@@ -194,6 +196,95 @@ def place_instance(
                 hosts_by_node=hosts_by_node,
                 ephemeral_port=ephemeral_port,
             )
+        case InstanceMeta.Disaggregated:
+            raise ValueError(
+                "Disaggregated instances should use place_disaggregated_instance()"
+            )
+
+    return target_instances
+
+
+def place_disaggregated_instance(
+    model_card: ModelCard,
+    current_instances: Mapping[InstanceId, Instance],
+    node_identities: Mapping[NodeId, NodeIdentity],
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> dict[InstanceId, Instance]:
+    """Place a disaggregated prefill/decode instance across two nodes.
+
+    Identifies prefill node (DGX Spark / CUDA) and decode node (Apple Silicon)
+    from node identities. Both runners load the full model independently.
+    """
+    prefill_node_id: NodeId | None = None
+    decode_node_id: NodeId | None = None
+
+    for node_id, identity in node_identities.items():
+        chip_lower = identity.chip_id.lower()
+        if "dgx-spark" in chip_lower or "cuda" in chip_lower:
+            prefill_node_id = node_id
+        elif "apple" in chip_lower or chip_lower.startswith(("m3", "m4", "m2", "m1")):
+            decode_node_id = node_id
+
+    if prefill_node_id is None:
+        raise ValueError("No prefill node (DGX Spark / CUDA) found in cluster")
+    if decode_node_id is None:
+        raise ValueError("No decode node (Apple Silicon) found in cluster")
+
+    # Find decode node IP (prefer ethernet)
+    decode_network = node_network.get(decode_node_id, NodeNetworkInfo())
+    decode_host: str | None = None
+    priority: dict[str, int] = {
+        "ethernet": 0,
+        "maybe_ethernet": 1,
+        "wifi": 2,
+        "unknown": 3,
+        "thunderbolt": 4,
+    }
+    for iface in sorted(
+        decode_network.interfaces,
+        key=lambda i: priority.get(i.interface_type, 3),
+    ):
+        if iface.ip_address and iface.ip_address != "127.0.0.1":
+            decode_host = iface.ip_address
+            break
+
+    if decode_host is None:
+        raise ValueError(f"Could not find IP address for decode node {decode_node_id}")
+
+    # Both runners get the full model (independent, no distributed comm)
+    prefill_runner_id = RunnerId()
+    decode_runner_id = RunnerId()
+
+    full_shard = PipelineShardMetadata(
+        model_card=model_card,
+        device_rank=0,
+        world_size=1,
+        start_layer=0,
+        end_layer=model_card.n_layers,
+        n_layers=model_card.n_layers,
+    )
+
+    shard_assignments = ShardAssignments(
+        model_id=model_card.model_id,
+        runner_to_shard={
+            prefill_runner_id: full_shard,
+            decode_runner_id: full_shard,
+        },
+        node_to_runner={
+            prefill_node_id: prefill_runner_id,
+            decode_node_id: decode_runner_id,
+        },
+    )
+
+    instance_id = InstanceId()
+    target_instances = dict(deepcopy(current_instances))
+    target_instances[instance_id] = DisaggregatedInstance(
+        instance_id=instance_id,
+        shard_assignments=shard_assignments,
+        prefill_node_id=prefill_node_id,
+        decode_node_id=decode_node_id,
+        decode_node_host=decode_host,
+    )
 
     return target_instances
 

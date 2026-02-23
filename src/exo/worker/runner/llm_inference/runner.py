@@ -6,6 +6,7 @@ from functools import cache
 from typing import TYPE_CHECKING, cast
 
 import mlx.core as mx
+from mlx_lm.generate import stream_generate
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.gpt_oss import Model as GptOssModel
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -33,6 +34,8 @@ from exo.shared.types.events import (
 )
 from exo.shared.types.tasks import (
     ConnectToGroup,
+    DisaggDecode,
+    DisaggPrefill,
     LoadModel,
     Shutdown,
     StartWarmup,
@@ -399,6 +402,171 @@ def main(
                     except PrefillCancelled:
                         logger.info(f"Prefill cancelled for task {task.task_id}")
                     # can we make this more explicit?
+                    except Exception as e:
+                        if device_rank == 0:
+                            event_sender.send(
+                                ChunkGenerated(
+                                    command_id=command_id,
+                                    chunk=ErrorChunk(
+                                        model=shard_metadata.model_card.model_id,
+                                        finish_reason="error",
+                                        error_message=str(e),
+                                    ),
+                                )
+                            )
+                        raise
+
+                    current_status = RunnerReady()
+                    logger.info("runner ready")
+
+                case DisaggPrefill(
+                    task_params=task_params,
+                    command_id=command_id,
+                    decode_node_host=decode_host,
+                    decode_node_port=decode_port,
+                ) if isinstance(current_status, RunnerReady):
+                    logger.info(f"received disaggregated prefill request: {task}")
+                    current_status = RunnerRunning()
+                    event_sender.send(
+                        RunnerStatusUpdated(
+                            runner_id=runner_id, runner_status=current_status
+                        )
+                    )
+                    event_sender.send(TaskAcknowledged(task_id=task.task_id))
+                    assert inference_model
+                    assert tokenizer
+
+                    try:
+                        from mlx_lm.sample_utils import make_sampler
+
+                        from exo.worker.engines.mlx.cache import (
+                            encode_prompt,
+                            make_kv_cache,
+                        )
+                        from exo.worker.engines.mlx.generator.generate import prefill
+                        from exo.worker.engines.mlx.kv_transfer import (
+                            send_kv_cache_sync,
+                        )
+
+                        prompt = apply_chat_template(tokenizer, task_params)
+                        all_prompt_tokens = encode_prompt(tokenizer, prompt)
+
+                        caches = make_kv_cache(model=cast(Model, inference_model))
+                        sampler = make_sampler(
+                            temp=task_params.temperature
+                            if task_params.temperature is not None
+                            else 0.7,
+                        )
+
+                        prefill_tps, num_tokens, _ = prefill(
+                            model=cast(Model, inference_model),
+                            tokenizer=tokenizer,
+                            sampler=sampler,
+                            prompt_tokens=all_prompt_tokens[:-1],
+                            cache=caches,
+                            group=None,
+                            on_prefill_progress=None,
+                        )
+                        logger.info(
+                            f"Disagg prefill done: {num_tokens} tokens at {prefill_tps:.1f} tok/s"
+                        )
+
+                        last_tokens = all_prompt_tokens[-2:]
+                        send_kv_cache_sync(
+                            decode_host, decode_port, caches, last_tokens
+                        )
+                        logger.info("KV cache sent to decode node")
+
+                    except Exception as e:
+                        if device_rank == 0:
+                            event_sender.send(
+                                ChunkGenerated(
+                                    command_id=command_id,
+                                    chunk=ErrorChunk(
+                                        model=shard_metadata.model_card.model_id,
+                                        finish_reason="error",
+                                        error_message=str(e),
+                                    ),
+                                )
+                            )
+                        raise
+
+                    current_status = RunnerReady()
+                    logger.info("runner ready")
+
+                case DisaggDecode(
+                    task_params=task_params,
+                    command_id=command_id,
+                    kv_transfer_port=kv_port,
+                ) if isinstance(current_status, RunnerReady):
+                    logger.info(
+                        f"received disaggregated decode request, waiting for KV cache on port {kv_port}"
+                    )
+                    current_status = RunnerRunning()
+                    event_sender.send(
+                        RunnerStatusUpdated(
+                            runner_id=runner_id, runner_status=current_status
+                        )
+                    )
+                    event_sender.send(TaskAcknowledged(task_id=task.task_id))
+                    assert inference_model
+                    assert tokenizer
+
+                    try:
+                        from mlx_lm.sample_utils import make_sampler
+
+                        from exo.worker.engines.mlx.constants import (
+                            KV_BITS,
+                            KV_GROUP_SIZE,
+                            MAX_TOKENS,
+                        )
+                        from exo.worker.engines.mlx.kv_transfer import (
+                            receive_kv_cache_sync,
+                        )
+
+                        received_caches, last_tokens = receive_kv_cache_sync(kv_port)
+                        logger.info(f"Received KV cache: {len(received_caches)} layers")
+
+                        sampler = make_sampler(
+                            temp=task_params.temperature
+                            if task_params.temperature is not None
+                            else 0.7,
+                            top_p=task_params.top_p
+                            if task_params.top_p is not None
+                            else 1.0,
+                        )
+                        max_tokens = task_params.max_output_tokens or MAX_TOKENS
+
+                        for _completion_tokens, out in enumerate(
+                            stream_generate(
+                                model=cast(Model, inference_model),
+                                tokenizer=tokenizer,
+                                prompt=last_tokens,
+                                max_tokens=max_tokens,
+                                sampler=sampler,
+                                prompt_cache=received_caches,
+                                prefill_step_size=1,
+                                kv_group_size=KV_GROUP_SIZE,
+                                kv_bits=KV_BITS,
+                            ),
+                            start=1,
+                        ):
+                            if device_rank == 0:
+                                event_sender.send(
+                                    ChunkGenerated(
+                                        command_id=command_id,
+                                        chunk=TokenChunk(
+                                            model=shard_metadata.model_card.model_id,
+                                            text=out.text,
+                                            token_id=out.token,
+                                            usage=None,
+                                            finish_reason=out.finish_reason,  # pyright: ignore[reportArgumentType]
+                                        ),
+                                    )
+                                )
+                            if out.finish_reason is not None:
+                                break
+
                     except Exception as e:
                         if device_rank == 0:
                             event_sender.send(

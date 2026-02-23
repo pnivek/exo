@@ -42,6 +42,7 @@ from exo.shared.types.memory import Memory
 from exo.shared.types.text_generation import TextGenerationTaskParams
 from exo.shared.types.worker.instances import (
     BoundInstance,
+    DisaggregatedInstance,
     MlxJacclInstance,
     MlxRingInstance,
 )
@@ -91,7 +92,7 @@ class HostList(RootModel[list[str]]):
 
 def mlx_distributed_init(
     bound_instance: BoundInstance,
-) -> Group:
+) -> Group | None:
     """
     Initialize MLX distributed.
     """
@@ -147,6 +148,10 @@ def mlx_distributed_init(
                 os.environ["MLX_JACCL_COORDINATOR"] = jaccl_coordinator
                 group = mx.distributed.init(backend="jaccl", strict=True)
 
+            case DisaggregatedInstance():
+                # No distributed backend for disaggregated inference
+                return None
+
         logger.info(f"Rank {rank} mlx distributed initialization complete")
 
         return group
@@ -158,7 +163,7 @@ def mlx_distributed_init(
 
 def initialize_mlx(
     bound_instance: BoundInstance,
-) -> Group:
+) -> Group | None:
     # should we unseed it?
     # TODO: pass in seed from params
     mx.random.seed(42)

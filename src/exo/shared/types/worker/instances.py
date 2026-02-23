@@ -15,6 +15,7 @@ class InstanceId(Id):
 class InstanceMeta(str, Enum):
     MlxRing = "MlxRing"
     MlxJaccl = "MlxJaccl"
+    Disaggregated = "Disaggregated"
 
 
 class BaseInstance(TaggedModel):
@@ -35,8 +36,16 @@ class MlxJacclInstance(BaseInstance):
     jaccl_coordinators: dict[NodeId, str]
 
 
-# TODO: Single node instance
-Instance = MlxRingInstance | MlxJacclInstance
+class DisaggregatedInstance(BaseInstance):
+    """Instance for disaggregated prefill/decode across two nodes."""
+
+    prefill_node_id: NodeId
+    decode_node_id: NodeId
+    decode_node_host: str
+    kv_transfer_port: int = 52416
+
+
+Instance = MlxRingInstance | MlxJacclInstance | DisaggregatedInstance
 
 
 class BoundInstance(CamelCaseModel):

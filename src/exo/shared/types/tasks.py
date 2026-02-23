@@ -86,6 +86,29 @@ class Shutdown(BaseTask):  # emitted by Worker
     runner_id: RunnerId
 
 
+class DisaggPrefill(BaseTask):  # emitted by Master
+    """Run prefill on prompt, serialize KV cache, send to decode node."""
+
+    command_id: CommandId
+    task_params: TextGenerationTaskParams
+    decode_node_host: str
+    decode_node_port: int = 52416
+
+    error_type: str | None = Field(default=None)
+    error_message: str | None = Field(default=None)
+
+
+class DisaggDecode(BaseTask):  # emitted by Master
+    """Receive KV cache from prefill node, then run decode."""
+
+    command_id: CommandId
+    task_params: TextGenerationTaskParams
+    kv_transfer_port: int = 52416
+
+    error_type: str | None = Field(default=None)
+    error_message: str | None = Field(default=None)
+
+
 Task = (
     CreateRunner
     | DownloadModel
@@ -97,4 +120,6 @@ Task = (
     | ImageGeneration
     | ImageEdits
     | Shutdown
+    | DisaggPrefill
+    | DisaggDecode
 )

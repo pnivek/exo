@@ -1,3 +1,4 @@
+import os
 import platform
 import socket
 import sys
@@ -122,8 +123,9 @@ async def get_model_and_chip() -> tuple[str, str]:
     model = "Unknown Model"
     chip = "Unknown Chip"
 
-    # TODO: better non mac support
     if sys.platform != "darwin":
+        model = os.environ.get("EXO_DEVICE_MODEL", model)
+        chip = os.environ.get("EXO_DEVICE_CHIP", chip)
         return (model, chip)
 
     try:

@@ -3,6 +3,7 @@ digest.txt
 
 # python
 **/__pycache__
+venv
 
 # nix
 .direnv/

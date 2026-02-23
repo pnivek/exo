@@ -9,6 +9,7 @@ from exo.master.placement import (
     cancel_unnecessary_downloads,
     delete_instance,
     get_transition_events,
+    place_disaggregated_instance,
     place_instance,
 )
 from exo.shared.apply import apply
@@ -47,6 +48,12 @@ from exo.shared.types.events import (
 )
 from exo.shared.types.state import State
 from exo.shared.types.tasks import (
+    DisaggDecode as DisaggDecodeTask,
+)
+from exo.shared.types.tasks import (
+    DisaggPrefill as DisaggPrefillTask,
+)
+from exo.shared.types.tasks import (
     ImageEdits as ImageEditsTask,
 )
 from exo.shared.types.tasks import (
@@ -59,7 +66,11 @@ from exo.shared.types.tasks import (
 from exo.shared.types.tasks import (
     TextGeneration as TextGenerationTask,
 )
-from exo.shared.types.worker.instances import InstanceId
+from exo.shared.types.worker.instances import (
+    DisaggregatedInstance,
+    InstanceId,
+    InstanceMeta,
+)
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.event_buffer import MultiSourceBuffer
 from exo.utils.task_group import TaskGroup
@@ -81,6 +92,7 @@ class Master:
         self.node_id = node_id
         self.session_id = session_id
         self.command_task_mapping: dict[CommandId, TaskId] = {}
+        self.disagg_prefill_task_mapping: dict[CommandId, TaskId] = {}
         self.command_receiver = command_receiver
         self.local_event_receiver = local_event_receiver
         self.global_event_sender = global_event_sender
@@ -157,21 +169,65 @@ class Master:
                                 ],
                             )
 
-                            task_id = TaskId()
-                            generated_events.append(
-                                TaskCreated(
-                                    task_id=task_id,
-                                    task=TextGenerationTask(
-                                        task_id=task_id,
-                                        command_id=command.command_id,
-                                        instance_id=available_instance_ids[0],
-                                        task_status=TaskStatus.Pending,
-                                        task_params=command.task_params,
-                                    ),
-                                )
-                            )
+                            selected_instance = self.state.instances[
+                                available_instance_ids[0]
+                            ]
 
-                            self.command_task_mapping[command.command_id] = task_id
+                            if isinstance(selected_instance, DisaggregatedInstance):
+                                # Disaggregated: create prefill + decode tasks
+                                prefill_task_id = TaskId()
+                                decode_task_id = TaskId()
+
+                                generated_events.append(
+                                    TaskCreated(
+                                        task_id=prefill_task_id,
+                                        task=DisaggPrefillTask(
+                                            task_id=prefill_task_id,
+                                            command_id=command.command_id,
+                                            instance_id=selected_instance.instance_id,
+                                            task_status=TaskStatus.Pending,
+                                            task_params=command.task_params,
+                                            decode_node_host=selected_instance.decode_node_host,
+                                            decode_node_port=selected_instance.kv_transfer_port,
+                                        ),
+                                    )
+                                )
+                                generated_events.append(
+                                    TaskCreated(
+                                        task_id=decode_task_id,
+                                        task=DisaggDecodeTask(
+                                            task_id=decode_task_id,
+                                            command_id=command.command_id,
+                                            instance_id=selected_instance.instance_id,
+                                            task_status=TaskStatus.Pending,
+                                            task_params=command.task_params,
+                                            kv_transfer_port=selected_instance.kv_transfer_port,
+                                        ),
+                                    )
+                                )
+
+                                self.command_task_mapping[command.command_id] = (
+                                    decode_task_id
+                                )
+                                self.disagg_prefill_task_mapping[command.command_id] = (
+                                    prefill_task_id
+                                )
+                            else:
+                                task_id = TaskId()
+                                generated_events.append(
+                                    TaskCreated(
+                                        task_id=task_id,
+                                        task=TextGenerationTask(
+                                            task_id=task_id,
+                                            command_id=command.command_id,
+                                            instance_id=available_instance_ids[0],
+                                            task_status=TaskStatus.Pending,
+                                            task_params=command.task_params,
+                                        ),
+                                    )
+                                )
+
+                                self.command_task_mapping[command.command_id] = task_id
                         case ImageGeneration():
                             for instance in self.state.instances.values():
                                 if (
@@ -295,13 +351,21 @@ class Master:
                                 )
                             generated_events.extend(transition_events)
                         case PlaceInstance():
-                            placement = place_instance(
-                                command,
-                                self.state.topology,
-                                self.state.instances,
-                                self.state.node_memory,
-                                self.state.node_network,
-                            )
+                            if command.instance_meta == InstanceMeta.Disaggregated:
+                                placement = place_disaggregated_instance(
+                                    command.model_card,
+                                    self.state.instances,
+                                    self.state.node_identities,
+                                    self.state.node_network,
+                                )
+                            else:
+                                placement = place_instance(
+                                    command,
+                                    self.state.topology,
+                                    self.state.instances,
+                                    self.state.node_memory,
+                                    self.state.node_network,
+                                )
                             transition_events = get_transition_events(
                                 self.state.instances, placement, self.state.tasks
                             )
@@ -346,6 +410,15 @@ class Master:
                             self.command_task_mapping.pop(
                                 command.finished_command_id, None
                             )
+                            # Clean up paired prefill task for disaggregated inference
+                            if (
+                                prefill_task_id := self.disagg_prefill_task_mapping.pop(
+                                    command.finished_command_id, None
+                                )
+                            ) is not None:
+                                generated_events.append(
+                                    TaskDeleted(task_id=prefill_task_id)
+                                )
                         case RequestEventLog():
                             # We should just be able to send everything, since other buffers will ignore old messages
                             # rate limit to 1000 at a time

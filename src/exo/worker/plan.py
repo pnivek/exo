@@ -7,6 +7,8 @@ from exo.shared.types.tasks import (
     CancelTask,
     ConnectToGroup,
     CreateRunner,
+    DisaggDecode,
+    DisaggPrefill,
     DownloadModel,
     ImageEdits,
     ImageGeneration,
@@ -24,7 +26,12 @@ from exo.shared.types.worker.downloads import (
     DownloadOngoing,
     DownloadProgress,
 )
-from exo.shared.types.worker.instances import BoundInstance, Instance, InstanceId
+from exo.shared.types.worker.instances import (
+    BoundInstance,
+    DisaggregatedInstance,
+    Instance,
+    InstanceId,
+)
 from exo.shared.types.worker.runners import (
     RunnerConnected,
     RunnerConnecting,
@@ -150,6 +157,10 @@ def _init_distributed_backend(
         if is_single_node_instance:
             continue
 
+        # Disaggregated runners are independent — no distributed backend needed
+        if isinstance(instance, DisaggregatedInstance):
+            continue
+
         runner_is_idle = isinstance(runner.status, RunnerIdle)
         all_runners_connecting = all(
             isinstance(
@@ -210,7 +221,10 @@ def _load_model(
             continue
 
         is_single_node_instance = len(instance.shard_assignments.runner_to_shard) == 1
-        if is_single_node_instance and isinstance(runner.status, RunnerIdle):
+        is_independent = is_single_node_instance or isinstance(
+            instance, DisaggregatedInstance
+        )
+        if is_independent and isinstance(runner.status, RunnerIdle):
             return LoadModel(instance_id=instance.instance_id)
 
         is_runner_waiting = isinstance(runner.status, RunnerConnected)
@@ -242,6 +256,12 @@ def _ready_to_warmup(
         world_size = shard.world_size
 
         is_runner_loaded = isinstance(runner.status, RunnerLoaded)
+
+        # Disaggregated runners warm up independently
+        if isinstance(instance, DisaggregatedInstance):
+            if is_runner_loaded:
+                return StartWarmup(instance_id=instance.instance_id)
+            continue
 
         assert device_rank < world_size
         assert device_rank >= 0
@@ -277,7 +297,10 @@ def _pending_tasks(
     for task in tasks.values():
         # for now, just forward chat completions
         # TODO(ciaran): do this better!
-        if not isinstance(task, (TextGeneration, ImageGeneration, ImageEdits)):
+        if not isinstance(
+            task,
+            (TextGeneration, ImageGeneration, ImageEdits, DisaggPrefill, DisaggDecode),
+        ):
             continue
         if task.task_status not in (TaskStatus.Pending, TaskStatus.Running):
             continue
@@ -293,6 +316,21 @@ def _pending_tasks(
         for runner in runners.values():
             if task.instance_id != runner.bound_instance.instance.instance_id:
                 continue
+
+            # Route disaggregated tasks to the correct runner
+            instance = runner.bound_instance.instance
+            if isinstance(instance, DisaggregatedInstance):
+                node_id = runner.bound_instance.bound_node_id
+                if (
+                    isinstance(task, DisaggPrefill)
+                    and node_id != instance.prefill_node_id
+                ):
+                    continue
+                if (
+                    isinstance(task, DisaggDecode)
+                    and node_id != instance.decode_node_id
+                ):
+                    continue
 
             # the task status _should_ be set to completed by the LAST runner
             # it is currently set by the first
