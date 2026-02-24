@@ -14,6 +14,7 @@ use libp2p::futures::StreamExt as _;
 use libp2p::gossipsub;
 use libp2p::gossipsub::{IdentTopic, Message, MessageId, PublishError};
 use libp2p::swarm::SwarmEvent;
+use libp2p::Multiaddr;
 use networking::discovery;
 use networking::swarm::create_swarm;
 use pyo3::prelude::{PyModule, PyModuleMethods as _};
@@ -175,6 +176,10 @@ enum ToTask {
         data: Vec<u8>,
         result_tx: oneshot::Sender<PyResult<MessageId>>,
     },
+    Dial {
+        addr: Multiaddr,
+        result_tx: oneshot::Sender<PyResult<()>>,
+    },
 }
 
 #[allow(clippy::enum_glob_use)]
@@ -240,6 +245,15 @@ async fn networking_task(
                         // send response oneshot (or exit if connection closed)
                         if let Err(e) = result_tx.send(pyresult) {
                             log::error!("RUST: could not publish gossipsub message since channel already closed: {e:?}");
+                            continue;
+                        }
+                    }
+                    Dial { addr, result_tx } => {
+                        log::info!("RUST: dialing peer at {addr}");
+                        let result = swarm.dial(addr).pyerr();
+
+                        if let Err(e) = result_tx.send(result) {
+                            log::error!("RUST: could not send dial result since channel already closed: {e:?}");
                             continue;
                         }
                     }
@@ -533,6 +547,31 @@ impl PyNetworkingHandle {
             .await
             .map_err(|_| PyErr::receiver_channel_closed())??;
         Ok(())
+    }
+
+    // ---- Dial methods ----
+
+    /// Dial a peer at a specific multiaddr (e.g. "/ip4/192.168.0.114/tcp/49382").
+    ///
+    /// This bypasses mDNS discovery and directly connects to the given address.
+    async fn dial_peer(&self, addr: String) -> PyResult<()> {
+        let (tx, rx) = oneshot::channel();
+
+        let multiaddr: Multiaddr = addr.parse().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("invalid multiaddr: {e}"))
+        })?;
+
+        self.to_task_tx()
+            .send_py(ToTask::Dial {
+                addr: multiaddr,
+                result_tx: tx,
+            })
+            .allow_threads_py()
+            .await?;
+
+        rx.allow_threads_py()
+            .await
+            .map_err(|_| PyErr::receiver_channel_closed())?
     }
 
     // ---- Gossipsub message receiver methods ----
