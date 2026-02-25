@@ -8,6 +8,7 @@ the cache for token generation.
 import asyncio
 import struct
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -113,19 +114,30 @@ async def send_kv_cache(
 
     Retries connection if the decode node's server isn't ready yet.
     """
+    t_ser_start = time.monotonic()
     data = serialize_kv_cache(cache, last_tokens)
+    t_ser_end = time.monotonic()
+    kv_size_mb = len(data) / 1024 / 1024
+    logger.info(
+        f"DISAGG_TIMING kv_serialize_ms={(t_ser_end - t_ser_start) * 1000:.1f} "
+        f"kv_size_mb={kv_size_mb:.2f}"
+    )
     header = struct.pack("!Q", len(data))
 
     for attempt in range(retries):
         try:
+            t_net_start = time.monotonic()
             _, writer = await asyncio.open_connection(host, port)
             writer.write(header)
             writer.write(data)
             await writer.drain()
             writer.close()
             await writer.wait_closed()
+            t_net_end = time.monotonic()
+            net_ms = (t_net_end - t_net_start) * 1000
             logger.info(
-                f"Sent KV cache to {host}:{port} ({len(data) / 1024 / 1024:.1f} MB)"
+                f"DISAGG_TIMING kv_network_send_ms={net_ms:.1f} "
+                f"bandwidth_mbps={kv_size_mb / (net_ms / 1000) * 8:.1f}"
             )
             return
         except (ConnectionRefusedError, OSError) as e:
@@ -152,10 +164,25 @@ async def receive_kv_cache(port: int) -> tuple[list[KVCache], mx.array]:
     ) -> None:
         header = await reader.readexactly(8)
         length: int = struct.unpack("!Q", header)[0]  # pyright: ignore[reportAny]
-        logger.info(f"Receiving KV cache: {length / 1024 / 1024:.1f} MB")
+        kv_size_mb = length / 1024 / 1024
+        logger.info(f"Receiving KV cache: {kv_size_mb:.1f} MB")
 
+        t_recv_start = time.monotonic()
         data = await reader.readexactly(length)
+        t_recv_end = time.monotonic()
+        recv_ms = (t_recv_end - t_recv_start) * 1000
+        logger.info(
+            f"DISAGG_TIMING kv_network_recv_ms={recv_ms:.1f} "
+            f"kv_size_mb={kv_size_mb:.2f}"
+        )
+
+        t_deser_start = time.monotonic()
         cache, last_tokens = deserialize_kv_cache(data)
+        t_deser_end = time.monotonic()
+        logger.info(
+            f"DISAGG_TIMING kv_deserialize_ms={(t_deser_end - t_deser_start) * 1000:.1f}"
+        )
+
         await result_queue.put((cache, last_tokens))
 
         writer.close()

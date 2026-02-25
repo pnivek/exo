@@ -458,6 +458,7 @@ def main(
                             else 0.7,
                         )
 
+                        t_prefill_start = time.monotonic()
                         prefill_tps, num_tokens, _ = prefill(
                             model=cast(Model, inference_model),
                             tokenizer=tokenizer,
@@ -467,15 +468,22 @@ def main(
                             group=None,
                             on_prefill_progress=None,
                         )
+                        t_prefill_end = time.monotonic()
                         logger.info(
-                            f"Disagg prefill done: {num_tokens} tokens at {prefill_tps:.1f} tok/s"
+                            f"DISAGG_TIMING prefill_compute_ms={(t_prefill_end - t_prefill_start) * 1000:.1f} "
+                            f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens}"
                         )
 
                         last_tokens = all_prompt_tokens[-2:]
+                        t_send_start = time.monotonic()
                         send_kv_cache_sync(
                             decode_host, decode_port, caches, last_tokens
                         )
-                        logger.info("KV cache sent to decode node")
+                        t_send_end = time.monotonic()
+                        logger.info(
+                            f"DISAGG_TIMING kv_send_total_ms={(t_send_end - t_send_start) * 1000:.1f} "
+                            f"prefill_total_ms={(t_send_end - t_prefill_start) * 1000:.1f}"
+                        )
 
                     except Exception as e:
                         if device_rank == 0:
@@ -524,8 +532,13 @@ def main(
                             receive_kv_cache_sync,
                         )
 
+                        t_kv_wait_start = time.monotonic()
                         received_caches, last_tokens = receive_kv_cache_sync(kv_port)
-                        logger.info(f"Received KV cache: {len(received_caches)} layers")
+                        t_kv_wait_end = time.monotonic()
+                        logger.info(
+                            f"DISAGG_TIMING decode_kv_wait_ms={(t_kv_wait_end - t_kv_wait_start) * 1000:.1f} "
+                            f"layers={len(received_caches)}"
+                        )
 
                         sampler = make_sampler(
                             temp=task_params.temperature
@@ -537,6 +550,8 @@ def main(
                         )
                         max_tokens = task_params.max_output_tokens or MAX_TOKENS
 
+                        t_decode_start = time.monotonic()
+                        t_first_token: float | None = None
                         for _completion_tokens, out in enumerate(
                             stream_generate(
                                 model=cast(Model, inference_model),
@@ -551,6 +566,11 @@ def main(
                             ),
                             start=1,
                         ):
+                            if t_first_token is None:
+                                t_first_token = time.monotonic()
+                                logger.info(
+                                    f"DISAGG_TIMING decode_first_token_ms={(t_first_token - t_decode_start) * 1000:.1f}"
+                                )
                             if device_rank == 0:
                                 event_sender.send(
                                     ChunkGenerated(
