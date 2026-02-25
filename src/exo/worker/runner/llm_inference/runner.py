@@ -443,9 +443,8 @@ def main(
                             encode_prompt,
                             make_kv_cache,
                         )
-                        from exo.worker.engines.mlx.generator.generate import prefill
                         from exo.worker.engines.mlx.kv_transfer import (
-                            send_kv_cache_sync,
+                            send_kv_cache_pipelined_sync,
                         )
 
                         prompt = apply_chat_template(tokenizer, task_params)
@@ -458,31 +457,22 @@ def main(
                             else 0.7,
                         )
 
-                        t_prefill_start = time.monotonic()
-                        prefill_tps, num_tokens, _ = prefill(
+                        last_tokens = all_prompt_tokens[-2:]
+                        t_pipelined_start = time.monotonic()
+                        prefill_tps, num_tokens = send_kv_cache_pipelined_sync(
+                            host=decode_host,
+                            port=decode_port,
                             model=cast(Model, inference_model),
                             tokenizer=tokenizer,
-                            sampler=sampler,
                             prompt_tokens=all_prompt_tokens[:-1],
+                            last_tokens=last_tokens,
                             cache=caches,
-                            group=None,
-                            on_prefill_progress=None,
+                            sampler=sampler,
                         )
-                        t_prefill_end = time.monotonic()
+                        t_pipelined_end = time.monotonic()
                         logger.info(
-                            f"DISAGG_TIMING prefill_compute_ms={(t_prefill_end - t_prefill_start) * 1000:.1f} "
+                            f"DISAGG_TIMING pipelined_total_ms={(t_pipelined_end - t_pipelined_start) * 1000:.1f} "
                             f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens}"
-                        )
-
-                        last_tokens = all_prompt_tokens[-2:]
-                        t_send_start = time.monotonic()
-                        send_kv_cache_sync(
-                            decode_host, decode_port, caches, last_tokens
-                        )
-                        t_send_end = time.monotonic()
-                        logger.info(
-                            f"DISAGG_TIMING kv_send_total_ms={(t_send_end - t_send_start) * 1000:.1f} "
-                            f"prefill_total_ms={(t_send_end - t_prefill_start) * 1000:.1f}"
                         )
 
                     except Exception as e:
@@ -529,11 +519,11 @@ def main(
                             MAX_TOKENS,
                         )
                         from exo.worker.engines.mlx.kv_transfer import (
-                            receive_kv_cache_sync,
+                            receive_kv_cache_auto_sync,
                         )
 
                         t_kv_wait_start = time.monotonic()
-                        received_caches, last_tokens = receive_kv_cache_sync(kv_port)
+                        received_caches, last_tokens = receive_kv_cache_auto_sync(kv_port)
                         t_kv_wait_end = time.monotonic()
                         logger.info(
                             f"DISAGG_TIMING decode_kv_wait_ms={(t_kv_wait_end - t_kv_wait_start) * 1000:.1f} "

@@ -22,8 +22,8 @@ set -euo pipefail
 
 MODEL_ID="mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
 TRIALS=3
-PROMPT_LENGTHS=(45 512 2048 8192)
-MAX_TOKENS=100
+PROMPT_LENGTHS=(45 512 2048 8192 16384 32768)
+MAX_TOKENS=200
 RESULTS_DIR="/tmp"
 
 # Parse arguments
@@ -66,9 +66,9 @@ if not configs:
     print("No result files found in " + results_dir)
     sys.exit(1)
 
-lengths = [45, 512, 2048, 8192]
+lengths = [45, 512, 2048, 8192, 16384, 32768]
 
-print("## Comparison: Llama 3.1 8B 4-bit (3 trials avg, 100 gen tokens)")
+print("## Comparison: Llama 3.1 8B 4-bit (3 trials avg, 200 gen tokens)")
 print()
 
 # TTFT table
@@ -268,7 +268,7 @@ extract_timing() {
 # Compute timeout for a given prompt length
 compute_timeout() {
     local prompt_tokens="$1"
-    python3 -c "print(max(60, int($prompt_tokens / 50 + 30)))"
+    python3 -c "print(max(60, int($prompt_tokens / 20 + 60)))"
 }
 
 # Initial warmup with shortest prompt (loads model into memory)
@@ -335,10 +335,24 @@ for prompt_len in "${PROMPT_LENGTHS[@]}"; do
             prefill_lines=$(ssh "$PREFILL_SSH" "tail -c +$((prefill_offset + 1)) /tmp/exo.log | grep DISAGG_TIMING" 2>/dev/null || echo "")
             decode_lines=$(ssh "$DECODE_SSH" "tail -c +$((decode_offset + 1)) /tmp/exo.log | grep DISAGG_TIMING" 2>/dev/null || echo "")
 
-            prefill_ms=$(extract_timing "$prefill_lines" "prefill_compute_ms")
-            serialize_ms=$(extract_timing "$prefill_lines" "kv_serialize_ms")
-            net_send_ms=$(extract_timing "$prefill_lines" "kv_network_send_ms")
-            kv_size_mb=$(extract_timing "$prefill_lines" "kv_size_mb")
+            # Support both pipelined and bulk timing keys
+            pipelined_total=$(extract_timing "$prefill_lines" "pipelined_total_ms")
+            pipelined_prefill=$(extract_timing "$prefill_lines" "pipelined_prefill_ms")
+
+            if [ "$(echo "$pipelined_total > 0" | bc -l 2>/dev/null || python3 -c "print(1 if $pipelined_total > 0 else 0)")" = "1" ]; then
+                # Pipelined mode — prefill and network overlap
+                prefill_ms=$pipelined_prefill
+                serialize_ms=0  # No separate serialization in pipelined mode
+                net_send_ms=$pipelined_total  # Total includes overlapped network
+                kv_size_mb=$(extract_timing "$prefill_lines" "chunk_mb")
+            else
+                # Bulk mode (legacy fallback)
+                prefill_ms=$(extract_timing "$prefill_lines" "prefill_compute_ms")
+                serialize_ms=$(extract_timing "$prefill_lines" "kv_serialize_ms")
+                net_send_ms=$(extract_timing "$prefill_lines" "kv_network_send_ms")
+                kv_size_mb=$(extract_timing "$prefill_lines" "kv_size_mb")
+            fi
+
             deserialize_ms=$(extract_timing "$decode_lines" "kv_deserialize_ms")
             first_tok_ms=$(extract_timing "$decode_lines" "decode_first_token_ms")
 
