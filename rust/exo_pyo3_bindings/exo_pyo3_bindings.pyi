@@ -73,6 +73,12 @@ class NetworkingHandle:
         For `limit > 0`, if there are no `ConnectionUpdate`s in the channel's queue this method
         will sleep until a `ConnectionUpdate`s is sent.
         """
+    async def dial_peer(self, addr: builtins.str) -> None:
+        r"""
+        Dial a peer at a specific multiaddr (e.g. "/ip4/192.168.0.114/tcp/49382").
+
+        This bypasses mDNS discovery and directly connects to the given address.
+        """
     async def gossipsub_subscribe(self, topic: builtins.str) -> builtins.bool:
         r"""
         Subscribe to a `GossipSub` topic.

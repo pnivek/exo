@@ -217,13 +217,20 @@ def place_disaggregated_instance(
     """
     prefill_node_id: NodeId | None = None
     decode_node_id: NodeId | None = None
+    non_apple_nodes: list[NodeId] = []
 
     for node_id, identity in node_identities.items():
         chip_lower = identity.chip_id.lower()
-        if "dgx-spark" in chip_lower or "cuda" in chip_lower:
+        if "dgx-spark" in chip_lower or "cuda" in chip_lower or "nvidia" in chip_lower:
             prefill_node_id = node_id
         elif "apple" in chip_lower or chip_lower.startswith(("m3", "m4", "m2", "m1")):
             decode_node_id = node_id
+        else:
+            non_apple_nodes.append(node_id)
+
+    # Fall back: use the first non-Apple node as prefill (e.g. Linux with unknown chip)
+    if prefill_node_id is None and len(non_apple_nodes) == 1:
+        prefill_node_id = non_apple_nodes[0]
 
     if prefill_node_id is None:
         raise ValueError("No prefill node (DGX Spark / CUDA) found in cluster")

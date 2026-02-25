@@ -118,6 +118,20 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     return interfaces_info
 
 
+async def _detect_nvidia_gpu() -> str | None:
+    """Try to detect NVIDIA GPU model via nvidia-smi."""
+    try:
+        process = await run_process(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"]
+        )
+        gpu_name = process.stdout.decode().strip().split("\n")[0]
+        if gpu_name:
+            return gpu_name if gpu_name.upper().startswith("NVIDIA") else f"NVIDIA {gpu_name}"
+    except (CalledProcessError, FileNotFoundError):
+        pass
+    return None
+
+
 async def get_model_and_chip() -> tuple[str, str]:
     """Get Mac system information using system_profiler."""
     model = "Unknown Model"
@@ -126,6 +140,8 @@ async def get_model_and_chip() -> tuple[str, str]:
     if sys.platform != "darwin":
         model = os.environ.get("EXO_DEVICE_MODEL", model)
         chip = os.environ.get("EXO_DEVICE_CHIP", chip)
+        if chip == "Unknown Chip":
+            chip = await _detect_nvidia_gpu() or chip
         return (model, chip)
 
     try:

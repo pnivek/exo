@@ -426,6 +426,7 @@ class DownloadCoordinator:
                     await self.event_sender.send(
                         NodeDownloadProgress(download_progress=status)
                     )
+                    await anyio.sleep(0.05)  # Yield to prevent gossipsub queue flooding
                 # Scan EXO_MODELS_PATH for pre-downloaded models
                 if EXO_MODELS_PATH is not None:
                     for card in await get_model_cards():
@@ -458,6 +459,7 @@ class DownloadCoordinator:
                             await self.event_sender.send(
                                 NodeDownloadProgress(download_progress=path_completed)
                             )
+                            await anyio.sleep(0.05)  # Yield to prevent gossipsub queue flooding
 
                 logger.debug(
                     "DownloadCoordinator: Done emitting existing download progress."

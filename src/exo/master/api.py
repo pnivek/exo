@@ -46,7 +46,12 @@ from exo.master.adapters.responses import (
 )
 from exo.master.event_log import DiskEventLog
 from exo.master.image_store import ImageStore
-from exo.master.placement import place_instance as get_instance_placements
+from exo.master.placement import (
+    place_disaggregated_instance,
+)
+from exo.master.placement import (
+    place_instance as get_instance_placements,
+)
 from exo.shared.apply import apply
 from exo.shared.constants import (
     DASHBOARD_DIR,
@@ -400,18 +405,26 @@ class API:
         model_card = await ModelCard.load(model_id)
 
         try:
-            placements = get_instance_placements(
-                PlaceInstance(
-                    model_card=model_card,
-                    sharding=sharding,
-                    instance_meta=instance_meta,
-                    min_nodes=min_nodes,
-                ),
-                node_memory=self.state.node_memory,
-                node_network=self.state.node_network,
-                topology=self.state.topology,
-                current_instances=self.state.instances,
-            )
+            if instance_meta == InstanceMeta.Disaggregated:
+                placements = place_disaggregated_instance(
+                    model_card,
+                    self.state.instances,
+                    self.state.node_identities,
+                    self.state.node_network,
+                )
+            else:
+                placements = get_instance_placements(
+                    PlaceInstance(
+                        model_card=model_card,
+                        sharding=sharding,
+                        instance_meta=instance_meta,
+                        min_nodes=min_nodes,
+                    ),
+                    node_memory=self.state.node_memory,
+                    node_network=self.state.node_network,
+                    topology=self.state.topology,
+                    current_instances=self.state.instances,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -456,24 +469,34 @@ class API:
                         )
                     ]
                 )
-        # TODO: PDD
-        # instance_combinations.append((Sharding.PrefillDecodeDisaggregation, InstanceMeta.MlxRing, 1))
+        # Disaggregated placement (only makes sense with exactly 2 nodes)
+        instance_combinations.append(
+            (Sharding.Pipeline, InstanceMeta.Disaggregated, 1)
+        )
 
         for sharding, instance_meta, min_nodes in instance_combinations:
             try:
-                placements = get_instance_placements(
-                    PlaceInstance(
-                        model_card=model_card,
-                        sharding=sharding,
-                        instance_meta=instance_meta,
-                        min_nodes=min_nodes,
-                    ),
-                    node_memory=self.state.node_memory,
-                    node_network=self.state.node_network,
-                    topology=self.state.topology,
-                    current_instances=self.state.instances,
-                    required_nodes=required_nodes,
-                )
+                if instance_meta == InstanceMeta.Disaggregated:
+                    placements = place_disaggregated_instance(
+                        model_card,
+                        self.state.instances,
+                        self.state.node_identities,
+                        self.state.node_network,
+                    )
+                else:
+                    placements = get_instance_placements(
+                        PlaceInstance(
+                            model_card=model_card,
+                            sharding=sharding,
+                            instance_meta=instance_meta,
+                            min_nodes=min_nodes,
+                        ),
+                        node_memory=self.state.node_memory,
+                        node_network=self.state.node_network,
+                        topology=self.state.topology,
+                        current_instances=self.state.instances,
+                        required_nodes=required_nodes,
+                    )
             except ValueError as exc:
                 if (model_card.model_id, sharding, instance_meta, 0) not in seen:
                     previews.append(
