@@ -272,6 +272,7 @@ def main():
     logger_setup(EXO_LOG, args.verbosity)
     logger.info("Starting EXO")
     logger.info(f"EXO_LIBP2P_NAMESPACE: {os.getenv('EXO_LIBP2P_NAMESPACE')}")
+    logger.info(f"Dial addresses: {args.dial}")
 
     if args.offline:
         logger.info("Running in OFFLINE mode — no internet checks, local models only")

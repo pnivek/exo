@@ -36,7 +36,7 @@ KV_TRANSFER_PORT = 52416
 
 # Pipelined protocol constants
 _MAGIC = b"KVPS"
-_VERSION = 0x01
+_VERSION = 0x02
 _FRAME_CHUNK = 0x01
 _FRAME_LAST_TOKENS = 0x02
 _FRAME_END = 0xFF
@@ -441,13 +441,18 @@ def send_kv_cache_pipelined_sync(
         if not header_sent:
             uses_bfloat16 = cache[0].keys is not None and cache[0].keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
             dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
+            # keys shape: [1, n_kv_heads, offset, head_dim]
+            cache_n_kv_heads = cache[0].keys.shape[1]  # pyright: ignore[reportOptionalMemberAccess]
+            cache_head_dim = cache[0].keys.shape[3]  # pyright: ignore[reportOptionalMemberAccess]
             header = struct.pack(
-                "!4sBIBI",
+                "!4sBIBIII",
                 _MAGIC,
                 _VERSION,
                 num_layers,
                 dtype_flag,
                 num_tokens - 1,
+                cache_n_kv_heads,
+                cache_head_dim,
             )
             _sendall(sock, header)
             sender.start()
@@ -497,13 +502,17 @@ def send_kv_cache_pipelined_sync(
     if not header_sent:
         uses_bfloat16 = cache[0].keys is not None and cache[0].keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
         dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
+        cache_n_kv_heads = cache[0].keys.shape[1]  # pyright: ignore[reportOptionalMemberAccess]
+        cache_head_dim = cache[0].keys.shape[3]  # pyright: ignore[reportOptionalMemberAccess]
         header = struct.pack(
-            "!4sBIBI",
+            "!4sBIBIII",
             _MAGIC,
             _VERSION,
             num_layers,
             dtype_flag,
             num_tokens,
+            cache_n_kv_heads,
+            cache_head_dim,
         )
         _sendall(sock, header)
         sender.start()
@@ -567,7 +576,8 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
 
     The 4-byte magic has already been consumed by the auto-detect logic.
     """
-    # Read rest of header (10 bytes: version(1) + num_layers(4) + dtype_flag(1) + total_tokens(4))
+    # Read rest of header: version(1) + num_layers(4) + dtype_flag(1) + total_tokens(4)
+    # v2 adds: n_kv_heads(4) + head_dim(4)
     rest_header = _recvall(conn, 10)
     version: int
     num_layers: int
@@ -575,13 +585,21 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
     total_tokens: int
     version, num_layers, dtype_flag, total_tokens = struct.unpack("!BIBI", rest_header)  # pyright: ignore[reportAny]
 
-    if version != _VERSION:
+    if version not in (0x01, _VERSION):
         raise ValueError(f"Unsupported KVPS version: {version}")
+
+    # v2: read explicit n_kv_heads and head_dim from header
+    header_n_kv_heads: int | None = None
+    header_head_dim: int | None = None
+    if version >= 0x02:
+        extra = _recvall(conn, 8)
+        header_n_kv_heads, header_head_dim = struct.unpack("!II", extra)  # pyright: ignore[reportAny]
 
     target_dtype = mx.bfloat16 if dtype_flag == _DTYPE_BFLOAT16 else mx.float16
     logger.info(
         f"Pipelined receive: {num_layers} layers, {total_tokens} tokens, "
         f"dtype={'bf16' if dtype_flag == _DTYPE_BFLOAT16 else 'f16'}"
+        + (f", n_kv_heads={header_n_kv_heads}, head_dim={header_head_dim}" if header_n_kv_heads else "")
     )
 
     # Pre-allocated buffers (lazily initialized on first chunk)
@@ -677,14 +695,19 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
     if full_keys is None or full_values is None:
         raise ValueError("No chunk frames received in pipelined stream")
 
-    # Determine n_kv_heads and head_dim from head_dim_x_heads
-    head_dim: int = head_dim_x_heads
-    n_kv_heads: int = 1
-    for candidate_head_dim in [128, 96, 80, 64]:
-        if head_dim_x_heads % candidate_head_dim == 0:
-            head_dim = candidate_head_dim
-            n_kv_heads = head_dim_x_heads // head_dim
-            break
+    # Determine n_kv_heads and head_dim
+    if header_n_kv_heads is not None and header_head_dim is not None:
+        n_kv_heads = header_n_kv_heads
+        head_dim = header_head_dim
+    else:
+        # v1 fallback: guess from head_dim_x_heads
+        head_dim = head_dim_x_heads
+        n_kv_heads = 1
+        for candidate_head_dim in [128, 96, 80, 64]:
+            if head_dim_x_heads % candidate_head_dim == 0:
+                head_dim = candidate_head_dim
+                n_kv_heads = head_dim_x_heads // head_dim
+                break
 
     caches: list[KVCache] = []
     for layer_idx in range(num_layers):
