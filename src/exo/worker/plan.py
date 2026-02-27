@@ -173,15 +173,15 @@ def _init_distributed_backend(
 
         runner_is_idle = isinstance(runner.status, RunnerIdle)
 
-        # For TensorPrefillDisagg, only check peer prefill runners (not decode runner)
+        # TensorPrefillDisagg uses NCCL which handles its own rank coordination.
+        # All prefill runners can start ConnectToGroup immediately — NCCL bootstrap
+        # has a built-in timeout for rank synchronization.
         if isinstance(instance, TensorPrefillDisaggInstance):
-            peer_runner_ids = [
-                rid
-                for rid, shard in shard_assignments.runner_to_shard.items()
-                if isinstance(shard, TensorShardMetadata)
-            ]
-        else:
-            peer_runner_ids = list(shard_assignments.runner_to_shard.keys())
+            if runner_is_idle:
+                return ConnectToGroup(instance_id=instance.instance_id)
+            continue
+
+        peer_runner_ids = list(shard_assignments.runner_to_shard.keys())
 
         all_runners_connecting = all(
             isinstance(
