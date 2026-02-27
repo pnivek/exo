@@ -108,7 +108,9 @@ def deserialize_kv_cache(data: bytes) -> tuple[list[KVCache], mx.array]:
 
     num_layers = int(loaded["num_layers"][0])  # pyright: ignore[reportAny]
     last_tokens = mx.array(loaded["last_tokens"])  # pyright: ignore[reportAny]
-    uses_bfloat16 = bool(loaded["uses_bfloat16"][0]) if "uses_bfloat16" in loaded else False  # pyright: ignore[reportAny]
+    uses_bfloat16 = (
+        bool(loaded["uses_bfloat16"][0]) if "uses_bfloat16" in loaded else False  # pyright: ignore[reportAny]
+    )
 
     caches: list[KVCache] = []
     for i in range(num_layers):
@@ -378,6 +380,105 @@ def extract_kv_delta(
     )
 
 
+def gather_sharded_kv_cache(
+    cache: KVCacheType,
+    group: mx.distributed.Group,
+) -> None:
+    """All-gather KV cache heads across tensor-parallel ranks, in-place.
+
+    Before gather: each rank has [1, n_kv_heads/world, seq_len, head_dim]
+    After gather: each rank has  [1, n_kv_heads, seq_len, head_dim]
+    """
+    for c in cache:
+        # keys/values shape: [1, n_kv_heads_per_rank, seq_len, head_dim]
+        full_k = mx.distributed.all_gather(c.keys, group=group)
+        full_v = mx.distributed.all_gather(c.values, group=group)
+        mx.eval(full_k, full_v)
+        # all_gather concatenates along dim 0 → [world, n_kv_heads/world, seq, hd]
+        # Reshape to [1, n_kv_heads, seq, hd]
+        c.state = (
+            full_k.reshape(1, -1, full_k.shape[2], full_k.shape[3]),
+            full_v.reshape(1, -1, full_v.shape[2], full_v.shape[3]),
+        )
+
+
+def send_precomputed_kv_cache_sync(
+    host: str,
+    port: int,
+    cache: KVCacheType,
+    last_tokens: mx.array,
+) -> None:
+    """Send an already-populated KV cache to the decode node using KVPS protocol.
+
+    Unlike send_kv_cache_pipelined_sync which runs prefill internally, this function
+    takes a pre-computed cache and streams it. Used by TP prefill after gather.
+    """
+    num_layers = len(cache)
+    num_tokens = cache[0].offset
+
+    sock = _connect_with_retries(host, port)
+
+    # Send header
+    uses_bfloat16 = cache[0].keys is not None and cache[0].keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
+    dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
+    cache_n_kv_heads = cache[0].keys.shape[1]
+    cache_head_dim = cache[0].keys.shape[3]
+    header = struct.pack(
+        "!4sBIBIII",
+        _MAGIC,
+        _VERSION,
+        num_layers,
+        dtype_flag,
+        num_tokens,
+        cache_n_kv_heads,
+        cache_head_dim,
+    )
+    _sendall(sock, header)
+
+    # Set up sender thread
+    send_queue: queue.Queue[_QueueItem] = queue.Queue(maxsize=2)
+    error_event = threading.Event()
+    sender = threading.Thread(
+        target=_sender_thread_fn,
+        args=(sock, send_queue, error_event),
+        daemon=True,
+    )
+    sender.start()
+
+    # Extract and send the full cache in chunks
+    chunk_size = 4096
+    chunk_index = 0
+    t_send_start = time.monotonic()
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        delta = extract_kv_delta(cache, start, end, chunk_index)
+        send_queue.put(delta)
+        chunk_index += 1
+
+    # Send last_tokens frame
+    last_tokens_np: np.ndarray[Any, Any] = np.array(last_tokens, copy=False).astype(
+        np.int32
+    )
+    send_queue.put((len(last_tokens_np), last_tokens_np))
+
+    # Send end sentinel and wait for sender thread
+    send_queue.put(None)
+    sender.join(timeout=60.0)
+    sock.close()
+
+    t_send_end = time.monotonic()
+    send_ms = (t_send_end - t_send_start) * 1000
+    kv_size_mb = sum(c.keys.nbytes + c.values.nbytes for c in cache) / 1024 / 1024
+
+    if error_event.is_set():
+        raise ConnectionError("Precomputed KV sender thread encountered a socket error")
+
+    logger.info(
+        f"DISAGG_TIMING precomputed_kv_send_ms={send_ms:.1f} "
+        f"kv_size_mb={kv_size_mb:.2f} chunks={chunk_index}"
+    )
+
+
 def send_kv_cache_pipelined_sync(
     host: str,
     port: int,
@@ -439,11 +540,13 @@ def send_kv_cache_pipelined_sync(
 
         # Send header on first chunk (cache keys are now populated)
         if not header_sent:
-            uses_bfloat16 = cache[0].keys is not None and cache[0].keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
+            uses_bfloat16 = (
+                cache[0].keys is not None and cache[0].keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
+            )
             dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
             # keys shape: [1, n_kv_heads, offset, head_dim]
-            cache_n_kv_heads = cache[0].keys.shape[1]  # pyright: ignore[reportOptionalMemberAccess]
-            cache_head_dim = cache[0].keys.shape[3]  # pyright: ignore[reportOptionalMemberAccess]
+            cache_n_kv_heads = cache[0].keys.shape[1]
+            cache_head_dim = cache[0].keys.shape[3]
             header = struct.pack(
                 "!4sBIBIII",
                 _MAGIC,
@@ -502,8 +605,8 @@ def send_kv_cache_pipelined_sync(
     if not header_sent:
         uses_bfloat16 = cache[0].keys is not None and cache[0].keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
         dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
-        cache_n_kv_heads = cache[0].keys.shape[1]  # pyright: ignore[reportOptionalMemberAccess]
-        cache_head_dim = cache[0].keys.shape[3]  # pyright: ignore[reportOptionalMemberAccess]
+        cache_n_kv_heads = cache[0].keys.shape[1]
+        cache_head_dim = cache[0].keys.shape[3]
         header = struct.pack(
             "!4sBIBIII",
             _MAGIC,
@@ -523,9 +626,7 @@ def send_kv_cache_pipelined_sync(
     if final_offset > prev_offset:
         delta = extract_kv_delta(cache, prev_offset, final_offset, chunk_index)
         send_queue.put(delta)
-        logger.info(
-            f"DISAGG_TIMING pipelined_final_chunk tokens={delta.num_tokens}"
-        )
+        logger.info(f"DISAGG_TIMING pipelined_final_chunk tokens={delta.num_tokens}")
 
     # Send last_tokens frame
     last_tokens_np: np.ndarray[Any, Any] = np.array(last_tokens, copy=False).astype(
@@ -563,9 +664,7 @@ def _recvall(sock: socket.socket, n: int) -> bytes:
     while remaining > 0:
         chunk = sock.recv(min(remaining, 262144))
         if not chunk:
-            raise ConnectionError(
-                f"Connection closed with {remaining} bytes remaining"
-            )
+            raise ConnectionError(f"Connection closed with {remaining} bytes remaining")
         parts.append(chunk)
         remaining -= len(chunk)
     return b"".join(parts)
@@ -599,7 +698,11 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
     logger.info(
         f"Pipelined receive: {num_layers} layers, {total_tokens} tokens, "
         f"dtype={'bf16' if dtype_flag == _DTYPE_BFLOAT16 else 'f16'}"
-        + (f", n_kv_heads={header_n_kv_heads}, head_dim={header_head_dim}" if header_n_kv_heads else "")
+        + (
+            f", n_kv_heads={header_n_kv_heads}, head_dim={header_head_dim}"
+            if header_n_kv_heads
+            else ""
+        )
     )
 
     # Pre-allocated buffers (lazily initialized on first chunk)
@@ -620,9 +723,7 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
             n_tokens_data = _recvall(conn, 4)
             n_tokens: int = struct.unpack("!I", n_tokens_data)[0]  # pyright: ignore[reportAny]
             tok_data = _recvall(conn, n_tokens * 4)
-            last_tokens = mx.array(
-                np.frombuffer(tok_data, dtype=np.int32).copy()
-            )
+            last_tokens = mx.array(np.frombuffer(tok_data, dtype=np.int32).copy())
             continue
 
         if frame_type == _FRAME_CHUNK:
@@ -631,7 +732,9 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
             chunk_index: int
             start_offset: int
             chunk_num_tokens: int
-            chunk_index, start_offset, chunk_num_tokens = struct.unpack("!III", chunk_hdr)  # pyright: ignore[reportAny]
+            chunk_index, start_offset, chunk_num_tokens = struct.unpack(  # pyright: ignore[reportAny]
+                "!III", chunk_hdr
+            )
 
             t_chunk_start = time.monotonic()
 
@@ -647,8 +750,12 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
                 v_len: int = struct.unpack("!I", v_len_data)[0]  # pyright: ignore[reportAny]
                 v_data = _recvall(conn, v_len)
 
-                k_np: np.ndarray[Any, Any] = np.frombuffer(k_data, dtype=np.float16).copy()
-                v_np: np.ndarray[Any, Any] = np.frombuffer(v_data, dtype=np.float16).copy()
+                k_np: np.ndarray[Any, Any] = np.frombuffer(
+                    k_data, dtype=np.float16
+                ).copy()
+                v_np: np.ndarray[Any, Any] = np.frombuffer(
+                    v_data, dtype=np.float16
+                ).copy()
                 chunk_layer_keys.append(k_np)
                 chunk_layer_values.append(v_np)
 
@@ -673,14 +780,20 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
                 flat_start = start_offset * head_dim_x_heads
                 flat_end = flat_start + chunk_elements
                 full_keys[layer_idx][flat_start:flat_end] = chunk_layer_keys[layer_idx]
-                full_values[layer_idx][flat_start:flat_end] = chunk_layer_values[layer_idx]
+                full_values[layer_idx][flat_start:flat_end] = chunk_layer_values[
+                    layer_idx
+                ]
 
             total_received_tokens += chunk_num_tokens
             t_chunk_end = time.monotonic()
-            chunk_size_mb = sum(
-                len(k) * 2 + len(v) * 2
-                for k, v in zip(chunk_layer_keys, chunk_layer_values, strict=True)
-            ) / 1024 / 1024
+            chunk_size_mb = (
+                sum(
+                    len(k) * 2 + len(v) * 2
+                    for k, v in zip(chunk_layer_keys, chunk_layer_values, strict=True)
+                )
+                / 1024
+                / 1024
+            )
             logger.info(
                 f"DISAGG_TIMING pipelined_chunk_recv_ms={(t_chunk_end - t_chunk_start) * 1000:.1f} "
                 f"chunk_index={chunk_index} chunk_tokens={chunk_num_tokens} "
@@ -715,8 +828,12 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
         k_full = full_keys[layer_idx][: total_received_tokens * head_dim_x_heads]
         v_full = full_values[layer_idx][: total_received_tokens * head_dim_x_heads]
 
-        k_shaped: np.ndarray[Any, Any] = k_full.reshape(1, n_kv_heads, total_received_tokens, head_dim)
-        v_shaped: np.ndarray[Any, Any] = v_full.reshape(1, n_kv_heads, total_received_tokens, head_dim)
+        k_shaped: np.ndarray[Any, Any] = k_full.reshape(
+            1, n_kv_heads, total_received_tokens, head_dim
+        )
+        v_shaped: np.ndarray[Any, Any] = v_full.reshape(
+            1, n_kv_heads, total_received_tokens, head_dim
+        )
 
         k_mx = mx.array(k_shaped)
         v_mx = mx.array(v_shaped)

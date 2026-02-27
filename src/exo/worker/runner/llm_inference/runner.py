@@ -42,10 +42,11 @@ from exo.shared.types.tasks import (
     Task,
     TaskId,
     TaskStatus,
+    TensorParallelDisaggPrefill,
     TextGeneration,
 )
 from exo.shared.types.text_generation import TextGenerationTaskParams
-from exo.shared.types.worker.instances import BoundInstance
+from exo.shared.types.worker.instances import BoundInstance, TensorPrefillDisaggInstance
 from exo.shared.types.worker.runner_response import (
     GenerationResponse,
     ToolCallItem,
@@ -492,6 +493,121 @@ def main(
                     current_status = RunnerReady()
                     logger.info("runner ready")
 
+                case TensorParallelDisaggPrefill(
+                    task_params=task_params,
+                    command_id=command_id,
+                    decode_node_host=decode_host,
+                    decode_node_port=decode_port,
+                ) if isinstance(current_status, RunnerReady):
+                    logger.info(
+                        f"received tensor-parallel disagg prefill request: {task}"
+                    )
+                    current_status = RunnerRunning()
+                    event_sender.send(
+                        RunnerStatusUpdated(
+                            runner_id=runner_id, runner_status=current_status
+                        )
+                    )
+                    event_sender.send(TaskAcknowledged(task_id=task.task_id))
+                    assert inference_model
+                    assert tokenizer
+                    assert group is not None, "TP prefill requires distributed group"
+
+                    try:
+                        from exo.worker.engines.mlx.cache import (
+                            make_kv_cache,
+                        )
+                        from exo.worker.engines.mlx.constants import (
+                            KV_BITS,
+                            KV_GROUP_SIZE,
+                        )
+                        from exo.worker.engines.mlx.kv_transfer import (
+                            gather_sharded_kv_cache,
+                            send_precomputed_kv_cache_sync,
+                        )
+
+                        prompt = apply_chat_template(tokenizer, task_params)
+
+                        # Run prefill through tensor-sharded model (both ranks process all tokens)
+                        caches = make_kv_cache(model=cast(Model, inference_model))
+                        t_prefill_start = time.monotonic()
+                        for _ in stream_generate(
+                            model=cast(Model, inference_model),
+                            tokenizer=tokenizer,
+                            prompt=prompt,
+                            max_tokens=1,
+                            prompt_cache=caches,
+                            kv_group_size=KV_GROUP_SIZE,
+                            kv_bits=KV_BITS,
+                        ):
+                            break
+
+                        t_prefill_end = time.monotonic()
+                        prefill_ms = (t_prefill_end - t_prefill_start) * 1000
+
+                        # Trim the generated token (same as disagg prefill)
+                        for c in caches:
+                            c.trim(2)  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
+
+                        num_tokens = caches[0].offset
+                        prefill_tps = (
+                            num_tokens / (prefill_ms / 1000) if prefill_ms > 0 else 0.0
+                        )
+                        logger.info(
+                            f"DISAGG_TIMING tp_prefill_ms={prefill_ms:.1f} "
+                            f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens}"
+                        )
+
+                        # All-gather KV cache heads across TP ranks
+                        t_gather_start = time.monotonic()
+                        gather_sharded_kv_cache(caches, group)
+                        t_gather_end = time.monotonic()
+                        logger.info(
+                            f"DISAGG_TIMING tp_kv_gather_ms={(t_gather_end - t_gather_start) * 1000:.1f}"
+                        )
+
+                        # Rank 0 sends full KV cache to decode node
+                        is_kv_sender = (
+                            isinstance(instance, TensorPrefillDisaggInstance)
+                            and bound_instance.bound_node_id
+                            == instance.kv_sender_node_id
+                        )
+                        if is_kv_sender:
+                            # Build last_tokens for decode (the last 2 prompt tokens)
+                            from exo.worker.engines.mlx.cache import encode_prompt
+
+                            all_prompt_tokens = encode_prompt(tokenizer, prompt)
+                            last_tokens = all_prompt_tokens[-2:]
+
+                            t_send_start = time.monotonic()
+                            send_precomputed_kv_cache_sync(
+                                host=decode_host,
+                                port=decode_port,
+                                cache=caches,
+                                last_tokens=last_tokens,
+                            )
+                            t_send_end = time.monotonic()
+                            logger.info(
+                                f"DISAGG_TIMING tp_kv_send_ms={(t_send_end - t_send_start) * 1000:.1f}"
+                            )
+
+                    except Exception as e:
+                        if device_rank == 0:
+                            event_sender.send(
+                                ChunkGenerated(
+                                    command_id=command_id,
+                                    chunk=ErrorChunk(
+                                        model=shard_metadata.model_card.model_id,
+                                        finish_reason="error",
+                                        error_message=str(e),
+                                    ),
+                                )
+                            )
+                        raise
+
+                    current_status = RunnerReady()
+                    logger.info("runner ready")
+
                 case DisaggDecode(
                     task_params=task_params,
                     command_id=command_id,
@@ -523,7 +639,9 @@ def main(
                         )
 
                         t_kv_wait_start = time.monotonic()
-                        received_caches, last_tokens = receive_kv_cache_auto_sync(kv_port)
+                        received_caches, last_tokens = receive_kv_cache_auto_sync(
+                            kv_port
+                        )
                         t_kv_wait_end = time.monotonic()
                         logger.info(
                             f"DISAGG_TIMING decode_kv_wait_ms={(t_kv_wait_end - t_kv_wait_start) * 1000:.1f} "

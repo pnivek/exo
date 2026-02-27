@@ -109,6 +109,22 @@ class DisaggDecode(BaseTask):  # emitted by Master
     error_message: str | None = Field(default=None)
 
 
+class TensorParallelDisaggPrefill(BaseTask):  # emitted by Master
+    """Run tensor-parallel prefill across multiple nodes, gather KV, send to decode node.
+
+    Dispatched to ALL prefill runners in the instance. Each runner determines
+    its role (kv_sender vs non-sender) at runtime by checking its bound_node_id.
+    """
+
+    command_id: CommandId
+    task_params: TextGenerationTaskParams
+    decode_node_host: str
+    decode_node_port: int = 52416
+
+    error_type: str | None = Field(default=None)
+    error_message: str | None = Field(default=None)
+
+
 Task = (
     CreateRunner
     | DownloadModel
@@ -122,4 +138,5 @@ Task = (
     | Shutdown
     | DisaggPrefill
     | DisaggDecode
+    | TensorParallelDisaggPrefill
 )

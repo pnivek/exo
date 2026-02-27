@@ -10,6 +10,7 @@ from exo.master.placement_utils import (
     get_mlx_jaccl_devices_matrix,
     get_mlx_ring_hosts_by_node,
     get_shard_assignments,
+    get_shard_assignments_for_tensor_parallel,
     get_smallest_cycles,
 )
 from exo.shared.models.model_cards import ModelCard, ModelId
@@ -42,9 +43,14 @@ from exo.shared.types.worker.instances import (
     InstanceMeta,
     MlxJacclInstance,
     MlxRingInstance,
+    TensorPrefillDisaggInstance,
 )
 from exo.shared.types.worker.runners import RunnerId, ShardAssignments
-from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
+from exo.shared.types.worker.shards import (
+    PipelineShardMetadata,
+    Sharding,
+    ShardMetadata,
+)
 
 
 def random_ephemeral_port() -> int:
@@ -200,6 +206,10 @@ def place_instance(
             raise ValueError(
                 "Disaggregated instances should use place_disaggregated_instance()"
             )
+        case InstanceMeta.TensorPrefillDisagg:
+            raise ValueError(
+                "TensorPrefillDisagg instances should use place_tensor_prefill_disagg_instance()"
+            )
 
     return target_instances
 
@@ -291,6 +301,121 @@ def place_disaggregated_instance(
         prefill_node_id=prefill_node_id,
         decode_node_id=decode_node_id,
         decode_node_host=decode_host,
+    )
+
+    return target_instances
+
+
+def place_tensor_prefill_disagg_instance(
+    model_card: ModelCard,
+    topology: Topology,
+    current_instances: Mapping[InstanceId, Instance],
+    node_identities: Mapping[NodeId, NodeIdentity],
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> dict[InstanceId, Instance]:
+    """Place a tensor-parallel prefill + disaggregated decode instance.
+
+    Finds all NVIDIA/CUDA nodes for tensor-parallel prefill (connected via RDMA)
+    and an Apple Silicon node for decode. Prefill runners get TensorShardMetadata,
+    the decode runner gets PipelineShardMetadata (independent, world_size=1).
+    """
+    prefill_node_ids: list[NodeId] = []
+    decode_node_id: NodeId | None = None
+
+    for node_id, identity in node_identities.items():
+        chip_lower = identity.chip_id.lower()
+        if "dgx-spark" in chip_lower or "cuda" in chip_lower or "nvidia" in chip_lower:
+            prefill_node_ids.append(node_id)
+        elif "apple" in chip_lower or chip_lower.startswith(("m3", "m4", "m2", "m1")):
+            decode_node_id = node_id
+
+    if len(prefill_node_ids) < 2:
+        raise ValueError(
+            f"TensorPrefillDisagg requires at least 2 NVIDIA/CUDA nodes, found {len(prefill_node_ids)}"
+        )
+    if decode_node_id is None:
+        raise ValueError("No decode node (Apple Silicon) found in cluster")
+
+    # Verify RDMA connectivity between prefill nodes
+    prefill_cycle = Cycle(node_ids=prefill_node_ids)
+    if not topology.is_rdma_cycle(prefill_cycle):
+        raise ValueError(
+            "TensorPrefillDisagg requires RDMA connectivity between all prefill nodes"
+        )
+
+    # Build jaccl config for prefill nodes
+    prefill_subgraph = topology.get_subgraph_from_nodes(prefill_node_ids)
+    jaccl_devices = get_mlx_jaccl_devices_matrix(prefill_node_ids, prefill_subgraph)
+    coordinator_port = random_ephemeral_port()
+    jaccl_coordinators = get_mlx_jaccl_coordinators(
+        coordinator=prefill_node_ids[0],
+        coordinator_port=coordinator_port,
+        cycle_digraph=prefill_subgraph,
+        node_network=node_network,
+    )
+
+    # Build shard assignments: tensor shards for prefill, pipeline shard for decode
+    tp_assignments = get_shard_assignments_for_tensor_parallel(
+        model_card, prefill_cycle
+    )
+
+    # Add decode runner with independent pipeline shard
+    decode_runner_id = RunnerId()
+    decode_shard = PipelineShardMetadata(
+        model_card=model_card,
+        device_rank=0,
+        world_size=1,
+        start_layer=0,
+        end_layer=model_card.n_layers,
+        n_layers=model_card.n_layers,
+    )
+
+    runner_to_shard: dict[RunnerId, ShardMetadata] = dict(
+        tp_assignments.runner_to_shard
+    )
+    runner_to_shard[decode_runner_id] = decode_shard
+
+    node_to_runner: dict[NodeId, RunnerId] = dict(tp_assignments.node_to_runner)
+    node_to_runner[decode_node_id] = decode_runner_id
+
+    shard_assignments = ShardAssignments(
+        model_id=model_card.model_id,
+        runner_to_shard=runner_to_shard,
+        node_to_runner=node_to_runner,
+    )
+
+    # Find decode node IP
+    decode_network = node_network.get(decode_node_id, NodeNetworkInfo())
+    decode_host: str | None = None
+    priority: dict[str, int] = {
+        "ethernet": 0,
+        "maybe_ethernet": 1,
+        "wifi": 2,
+        "unknown": 3,
+        "thunderbolt": 4,
+    }
+    for iface in sorted(
+        decode_network.interfaces,
+        key=lambda i: priority.get(i.interface_type, 3),
+    ):
+        if iface.ip_address and iface.ip_address != "127.0.0.1":
+            decode_host = iface.ip_address
+            break
+
+    if decode_host is None:
+        raise ValueError(f"Could not find IP address for decode node {decode_node_id}")
+
+    instance_id = InstanceId()
+    target_instances = dict(deepcopy(current_instances))
+    target_instances[instance_id] = TensorPrefillDisaggInstance(
+        instance_id=instance_id,
+        shard_assignments=shard_assignments,
+        prefill_node_ids=prefill_node_ids,
+        jaccl_devices=jaccl_devices,
+        jaccl_coordinators=jaccl_coordinators,
+        decode_node_id=decode_node_id,
+        decode_node_host=decode_host,
+        kv_sender_node_id=prefill_node_ids[0],
     )
 
     return target_instances

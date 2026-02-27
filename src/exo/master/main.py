@@ -11,6 +11,7 @@ from exo.master.placement import (
     get_transition_events,
     place_disaggregated_instance,
     place_instance,
+    place_tensor_prefill_disagg_instance,
 )
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_EVENT_LOG_DIR, EXO_TRACING_ENABLED
@@ -64,12 +65,16 @@ from exo.shared.types.tasks import (
     TaskStatus,
 )
 from exo.shared.types.tasks import (
+    TensorParallelDisaggPrefill as TensorParallelDisaggPrefillTask,
+)
+from exo.shared.types.tasks import (
     TextGeneration as TextGenerationTask,
 )
 from exo.shared.types.worker.instances import (
     DisaggregatedInstance,
     InstanceId,
     InstanceMeta,
+    TensorPrefillDisaggInstance,
 )
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.event_buffer import MultiSourceBuffer
@@ -173,7 +178,48 @@ class Master:
                                 available_instance_ids[0]
                             ]
 
-                            if isinstance(selected_instance, DisaggregatedInstance):
+                            if isinstance(
+                                selected_instance, TensorPrefillDisaggInstance
+                            ):
+                                # TP Disagg: create TP prefill task (dispatched to all prefill runners) + decode task
+                                prefill_task_id = TaskId()
+                                decode_task_id = TaskId()
+
+                                generated_events.append(
+                                    TaskCreated(
+                                        task_id=prefill_task_id,
+                                        task=TensorParallelDisaggPrefillTask(
+                                            task_id=prefill_task_id,
+                                            command_id=command.command_id,
+                                            instance_id=selected_instance.instance_id,
+                                            task_status=TaskStatus.Pending,
+                                            task_params=command.task_params,
+                                            decode_node_host=selected_instance.decode_node_host,
+                                            decode_node_port=selected_instance.kv_transfer_port,
+                                        ),
+                                    )
+                                )
+                                generated_events.append(
+                                    TaskCreated(
+                                        task_id=decode_task_id,
+                                        task=DisaggDecodeTask(
+                                            task_id=decode_task_id,
+                                            command_id=command.command_id,
+                                            instance_id=selected_instance.instance_id,
+                                            task_status=TaskStatus.Pending,
+                                            task_params=command.task_params,
+                                            kv_transfer_port=selected_instance.kv_transfer_port,
+                                        ),
+                                    )
+                                )
+
+                                self.command_task_mapping[command.command_id] = (
+                                    decode_task_id
+                                )
+                                self.disagg_prefill_task_mapping[command.command_id] = (
+                                    prefill_task_id
+                                )
+                            elif isinstance(selected_instance, DisaggregatedInstance):
                                 # Disaggregated: create prefill + decode tasks
                                 prefill_task_id = TaskId()
                                 decode_task_id = TaskId()
@@ -351,7 +397,18 @@ class Master:
                                 )
                             generated_events.extend(transition_events)
                         case PlaceInstance():
-                            if command.instance_meta == InstanceMeta.Disaggregated:
+                            if (
+                                command.instance_meta
+                                == InstanceMeta.TensorPrefillDisagg
+                            ):
+                                placement = place_tensor_prefill_disagg_instance(
+                                    command.model_card,
+                                    self.state.topology,
+                                    self.state.instances,
+                                    self.state.node_identities,
+                                    self.state.node_network,
+                                )
+                            elif command.instance_meta == InstanceMeta.Disaggregated:
                                 placement = place_disaggregated_instance(
                                     command.model_card,
                                     self.state.instances,

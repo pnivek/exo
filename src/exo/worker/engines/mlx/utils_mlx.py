@@ -45,6 +45,7 @@ from exo.shared.types.worker.instances import (
     DisaggregatedInstance,
     MlxJacclInstance,
     MlxRingInstance,
+    TensorPrefillDisaggInstance,
 )
 from exo.shared.types.worker.shards import (
     CfgShardMetadata,
@@ -151,6 +152,35 @@ def mlx_distributed_init(
             case DisaggregatedInstance():
                 # No distributed backend for disaggregated inference
                 return None
+
+            case TensorPrefillDisaggInstance(
+                jaccl_devices=jaccl_devices, jaccl_coordinators=jaccl_coordinators
+            ):
+                # Decode runner: no distributed backend
+                if not isinstance(bound_instance.bound_shard, TensorShardMetadata):
+                    return None
+                # Prefill runner: initialize jaccl (same as MlxJacclInstance)
+                assert all(
+                    jaccl_devices[i][i] is None for i in range(len(jaccl_devices))
+                )
+                coordination_file = (
+                    f"./hosts_{bound_instance.instance.instance_id}_{rank}.json"
+                )
+                jaccl_devices_json = json.dumps(jaccl_devices)
+
+                with open(coordination_file, "w") as f:
+                    _ = f.write(jaccl_devices_json)
+
+                jaccl_coordinator = jaccl_coordinators[bound_instance.bound_node_id]
+
+                logger.info(
+                    f"rank {rank} MLX_IBV_DEVICES: {coordination_file} with devices: {jaccl_devices_json}"
+                )
+                logger.info(f"rank {rank} MLX_JACCL_COORDINATOR: {jaccl_coordinator}")
+                os.environ["MLX_IBV_DEVICES"] = coordination_file
+                os.environ["MLX_RANK"] = str(rank)
+                os.environ["MLX_JACCL_COORDINATOR"] = jaccl_coordinator
+                group = mx.distributed.init(backend="jaccl", strict=True)
 
         logger.info(f"Rank {rank} mlx distributed initialization complete")
 

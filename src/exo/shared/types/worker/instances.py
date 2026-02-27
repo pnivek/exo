@@ -16,6 +16,7 @@ class InstanceMeta(str, Enum):
     MlxRing = "MlxRing"
     MlxJaccl = "MlxJaccl"
     Disaggregated = "Disaggregated"
+    TensorPrefillDisagg = "TensorPrefillDisagg"
 
 
 class BaseInstance(TaggedModel):
@@ -45,7 +46,29 @@ class DisaggregatedInstance(BaseInstance):
     kv_transfer_port: int = 52416
 
 
-Instance = MlxRingInstance | MlxJacclInstance | DisaggregatedInstance
+class TensorPrefillDisaggInstance(BaseInstance):
+    """Instance for tensor-parallel prefill across multiple nodes + disaggregated decode.
+
+    Multiple prefill nodes form a tensor-parallel group via jaccl/RDMA.
+    After prefill, rank 0 gathers the full KV cache and streams it to the
+    decode node using the existing KVPS pipelined protocol.
+    """
+
+    prefill_node_ids: list[NodeId]
+    jaccl_devices: list[list[str | None]]
+    jaccl_coordinators: dict[NodeId, str]
+    decode_node_id: NodeId
+    decode_node_host: str
+    kv_transfer_port: int = 52416
+    kv_sender_node_id: NodeId
+
+
+Instance = (
+    MlxRingInstance
+    | MlxJacclInstance
+    | DisaggregatedInstance
+    | TensorPrefillDisaggInstance
+)
 
 
 class BoundInstance(CamelCaseModel):
