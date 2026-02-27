@@ -388,11 +388,15 @@ def gather_sharded_kv_cache(
 
     Before gather: each rank has [1, n_kv_heads/world, seq_len, head_dim]
     After gather: each rank has  [1, n_kv_heads, seq_len, head_dim]
+
+    Uses c.state (not c.keys) to get only the valid data (trimmed to offset),
+    since the raw c.keys buffer may have extra allocated space with garbage.
     """
     for c in cache:
-        # keys/values shape: [1, n_kv_heads_per_rank, seq_len, head_dim]
-        full_k = mx.distributed.all_gather(c.keys, group=group)
-        full_v = mx.distributed.all_gather(c.values, group=group)
+        # c.state returns trimmed arrays: [1, n_kv_heads_per_rank, offset, head_dim]
+        state = c.state  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        full_k = mx.distributed.all_gather(state[0], group=group)  # pyright: ignore[reportUnknownArgumentType]
+        full_v = mx.distributed.all_gather(state[1], group=group)  # pyright: ignore[reportUnknownArgumentType]
         mx.eval(full_k, full_v)
         # all_gather concatenates along dim 0 → [world, n_kv_heads/world, seq, hd]
         # Reshape to [1, n_kv_heads, seq, hd]
