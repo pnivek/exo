@@ -537,7 +537,12 @@ def main(
                         prompt_tokens = all_prompt_tokens[:-1]
                         last_tokens = all_prompt_tokens[-2:]
 
-                        caches = make_kv_cache(model=cast(Model, inference_model))
+                        # Use plain KVCache for ALL layers (not model.make_cache())
+                        # to avoid RotatingKVCache which doesn't update offset
+                        # in its state setter, breaking all_gather
+                        from mlx_lm.models.cache import KVCache as PlainKVCache
+
+                        caches = [PlainKVCache() for _ in cast(Model, inference_model).layers]
                         sampler = make_sampler(
                             temp=task_params.temperature
                             if task_params.temperature is not None
@@ -564,7 +569,7 @@ def main(
 
                         # Trim the generated token (same as disagg prefill)
                         for c in caches:
-                            c.trim(2)  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
+                            c.trim(2)  # pyright: ignore[reportUnknownMemberType]
 
                         num_tokens = caches[0].offset
                         prefill_tps = (
