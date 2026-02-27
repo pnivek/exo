@@ -470,9 +470,7 @@ class API:
                     ]
                 )
         # Disaggregated placement (only makes sense with exactly 2 nodes)
-        instance_combinations.append(
-            (Sharding.Pipeline, InstanceMeta.Disaggregated, 1)
-        )
+        instance_combinations.append((Sharding.Pipeline, InstanceMeta.Disaggregated, 1))
 
         for sharding, instance_meta, min_nodes in instance_combinations:
             try:

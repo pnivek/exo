@@ -37,7 +37,7 @@ echo ""
 
 # Run a single trial — outputs "ttft_ms tps token_count" on stdout
 run_trial() {
-    python3 - "$API_URL" "$MODEL_ID" "$PROMPT" <<'PYEOF'
+  python3 - "$API_URL" "$MODEL_ID" "$PROMPT" <<'PYEOF'
 import json
 import sys
 import time
@@ -112,14 +112,14 @@ PYEOF
 # Extract a DISAGG_TIMING value from log lines.
 # Usage: extract_timing "$lines" "key_name"
 extract_timing() {
-    local lines="$1"
-    local key="$2"
-    echo "$lines" | grep -oP "${key}=\K[0-9.]+" | tail -1 || echo "0"
+  local lines="$1"
+  local key="$2"
+  echo "$lines" | grep -oP "${key}=\K[0-9.]+" | tail -1 || echo "0"
 }
 
 # Warmup
 echo "Warming up..."
-run_trial > /dev/null 2>&1 || true
+run_trial >/dev/null 2>&1 || true
 sleep 2
 echo ""
 
@@ -127,85 +127,115 @@ echo ""
 declare -a all_ttft all_prefill all_serialize all_net_send all_net_recv all_deserialize all_first_tok all_kv_size all_orchestration
 
 for i in $(seq 1 "$TRIALS"); do
-    echo "--- Trial $i/$TRIALS ---"
+  echo "--- Trial $i/$TRIALS ---"
 
-    # Record log file sizes before the trial so we only read new lines after
-    prefill_offset=$(ssh "$PREFILL_SSH" "wc -c < /tmp/exo.log" 2>/dev/null || echo "0")
-    decode_offset=$(ssh "$DECODE_SSH" "wc -c < /tmp/exo.log" 2>/dev/null || echo "0")
+  # Record log file sizes before the trial so we only read new lines after
+  prefill_offset=$(ssh "$PREFILL_SSH" "wc -c < /tmp/exo.log" 2>/dev/null || echo "0")
+  decode_offset=$(ssh "$DECODE_SSH" "wc -c < /tmp/exo.log" 2>/dev/null || echo "0")
 
-    # Run the request
-    result=$(run_trial 2>/dev/null) || { echo "FAILED"; continue; }
-    ttft=$(echo "$result" | awk '{print $1}')
-    tps=$(echo "$result" | awk '{print $2}')
-    tokens=$(echo "$result" | awk '{print $3}')
+  # Run the request
+  result=$(run_trial 2>/dev/null) || {
+    echo "FAILED"
+    continue
+  }
+  ttft=$(echo "$result" | awk '{print $1}')
+  tps=$(echo "$result" | awk '{print $2}')
+  tokens=$(echo "$result" | awk '{print $3}')
 
-    if [ "$ttft" = "ERROR" ]; then
-        echo "FAILED (no tokens)"
-        continue
-    fi
+  if [ "$ttft" = "ERROR" ]; then
+    echo "FAILED (no tokens)"
+    continue
+  fi
 
-    sleep 2  # Give logs time to flush
+  sleep 2 # Give logs time to flush
 
-    # Extract only NEW timing lines (after the byte offset recorded before this trial)
-    prefill_lines=$(ssh "$PREFILL_SSH" "tail -c +$((prefill_offset + 1)) /tmp/exo.log | grep DISAGG_TIMING" 2>/dev/null || echo "")
-    decode_lines=$(ssh "$DECODE_SSH" "tail -c +$((decode_offset + 1)) /tmp/exo.log | grep DISAGG_TIMING" 2>/dev/null || echo "")
+  # Extract only NEW timing lines (after the byte offset recorded before this trial)
+  prefill_lines=$(ssh "$PREFILL_SSH" "tail -c +$((prefill_offset + 1)) /tmp/exo.log | grep DISAGG_TIMING" 2>/dev/null || echo "")
+  decode_lines=$(ssh "$DECODE_SSH" "tail -c +$((decode_offset + 1)) /tmp/exo.log | grep DISAGG_TIMING" 2>/dev/null || echo "")
 
-    # Parse prefill node timings
-    prefill_ms=$(extract_timing "$prefill_lines" "prefill_compute_ms")
-    serialize_ms=$(extract_timing "$prefill_lines" "kv_serialize_ms")
-    net_send_ms=$(extract_timing "$prefill_lines" "kv_network_send_ms")
-    kv_size_mb=$(extract_timing "$prefill_lines" "kv_size_mb")
+  # Parse prefill node timings
+  prefill_ms=$(extract_timing "$prefill_lines" "prefill_compute_ms")
+  serialize_ms=$(extract_timing "$prefill_lines" "kv_serialize_ms")
+  net_send_ms=$(extract_timing "$prefill_lines" "kv_network_send_ms")
+  kv_size_mb=$(extract_timing "$prefill_lines" "kv_size_mb")
 
-    # Parse decode node timings
-    net_recv_ms=$(extract_timing "$decode_lines" "kv_network_recv_ms")
-    deserialize_ms=$(extract_timing "$decode_lines" "kv_deserialize_ms")
-    first_tok_ms=$(extract_timing "$decode_lines" "decode_first_token_ms")
+  # Parse decode node timings
+  net_recv_ms=$(extract_timing "$decode_lines" "kv_network_recv_ms")
+  deserialize_ms=$(extract_timing "$decode_lines" "kv_deserialize_ms")
+  first_tok_ms=$(extract_timing "$decode_lines" "decode_first_token_ms")
 
-    # Compute orchestration overhead
-    measured_phases=$(python3 -c "print($prefill_ms + $serialize_ms + $net_send_ms + $deserialize_ms + $first_tok_ms)")
-    orchestration=$(python3 -c "print(max(0, $ttft - $measured_phases))")
+  # Compute orchestration overhead
+  measured_phases=$(python3 -c "print($prefill_ms + $serialize_ms + $net_send_ms + $deserialize_ms + $first_tok_ms)")
+  orchestration=$(python3 -c "print(max(0, $ttft - $measured_phases))")
 
-    echo "  Client TTFT:      ${ttft} ms"
-    echo "  Prefill compute:  ${prefill_ms} ms"
-    echo "  KV serialize:     ${serialize_ms} ms"
-    echo "  KV network send:  ${net_send_ms} ms"
-    echo "  KV network recv:  ${net_recv_ms} ms"
-    echo "  KV deserialize:   ${deserialize_ms} ms"
-    echo "  Decode first tok: ${first_tok_ms} ms"
-    echo "  KV size:          ${kv_size_mb} MB"
-    echo "  Orchestration:    ${orchestration} ms"
-    echo "  Gen TPS:          ${tps} tok/s (${tokens} tokens)"
-    echo ""
+  echo "  Client TTFT:      ${ttft} ms"
+  echo "  Prefill compute:  ${prefill_ms} ms"
+  echo "  KV serialize:     ${serialize_ms} ms"
+  echo "  KV network send:  ${net_send_ms} ms"
+  echo "  KV network recv:  ${net_recv_ms} ms"
+  echo "  KV deserialize:   ${deserialize_ms} ms"
+  echo "  Decode first tok: ${first_tok_ms} ms"
+  echo "  KV size:          ${kv_size_mb} MB"
+  echo "  Orchestration:    ${orchestration} ms"
+  echo "  Gen TPS:          ${tps} tok/s (${tokens} tokens)"
+  echo ""
 
-    all_ttft+=("$ttft")
-    all_prefill+=("$prefill_ms")
-    all_serialize+=("$serialize_ms")
-    all_net_send+=("$net_send_ms")
-    all_net_recv+=("$net_recv_ms")
-    all_deserialize+=("$deserialize_ms")
-    all_first_tok+=("$first_tok_ms")
-    all_kv_size+=("$kv_size_mb")
-    all_orchestration+=("$orchestration")
+  all_ttft+=("$ttft")
+  all_prefill+=("$prefill_ms")
+  all_serialize+=("$serialize_ms")
+  all_net_send+=("$net_send_ms")
+  all_net_recv+=("$net_recv_ms")
+  all_deserialize+=("$deserialize_ms")
+  all_first_tok+=("$first_tok_ms")
+  all_kv_size+=("$kv_size_mb")
+  all_orchestration+=("$orchestration")
 done
 
 n=${#all_ttft[@]}
 if [ "$n" -eq 0 ]; then
-    echo "All trials failed."
-    exit 1
+  echo "All trials failed."
+  exit 1
 fi
 
 # Compute averages and 10GbE projection
 python3 - "$n" \
-    "$(IFS=,; echo "${all_ttft[*]}")" \
-    "$(IFS=,; echo "${all_prefill[*]}")" \
-    "$(IFS=,; echo "${all_serialize[*]}")" \
-    "$(IFS=,; echo "${all_net_send[*]}")" \
-    "$(IFS=,; echo "${all_net_recv[*]}")" \
-    "$(IFS=,; echo "${all_deserialize[*]}")" \
-    "$(IFS=,; echo "${all_first_tok[*]}")" \
-    "$(IFS=,; echo "${all_kv_size[*]}")" \
-    "$(IFS=,; echo "${all_orchestration[*]}")" \
-    <<'PYEOF'
+  "$(
+    IFS=,
+    echo "${all_ttft[*]}"
+  )" \
+  "$(
+    IFS=,
+    echo "${all_prefill[*]}"
+  )" \
+  "$(
+    IFS=,
+    echo "${all_serialize[*]}"
+  )" \
+  "$(
+    IFS=,
+    echo "${all_net_send[*]}"
+  )" \
+  "$(
+    IFS=,
+    echo "${all_net_recv[*]}"
+  )" \
+  "$(
+    IFS=,
+    echo "${all_deserialize[*]}"
+  )" \
+  "$(
+    IFS=,
+    echo "${all_first_tok[*]}"
+  )" \
+  "$(
+    IFS=,
+    echo "${all_kv_size[*]}"
+  )" \
+  "$(
+    IFS=,
+    echo "${all_orchestration[*]}"
+  )" \
+  <<'PYEOF'
 import sys
 
 n = int(sys.argv[1])

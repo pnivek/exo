@@ -459,7 +459,9 @@ class DownloadCoordinator:
                             await self.event_sender.send(
                                 NodeDownloadProgress(download_progress=path_completed)
                             )
-                            await anyio.sleep(0.05)  # Yield to prevent gossipsub queue flooding
+                            await anyio.sleep(
+                                0.05
+                            )  # Yield to prevent gossipsub queue flooding
 
                 logger.debug(
                     "DownloadCoordinator: Done emitting existing download progress."

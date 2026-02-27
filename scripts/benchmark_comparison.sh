@@ -34,21 +34,45 @@ DECODE_SSH=""
 COMBINE=false
 
 while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --config)   CONFIG="$2"; shift 2 ;;
-        --api)      API_URL="$2"; shift 2 ;;
-        --prefill-ssh) PREFILL_SSH="$2"; shift 2 ;;
-        --decode-ssh)  DECODE_SSH="$2"; shift 2 ;;
-        --model)    MODEL_ID="$2"; shift 2 ;;
-        --trials)   TRIALS="$2"; shift 2 ;;
-        --combine)  COMBINE=true; shift ;;
-        *) echo "Unknown argument: $1"; exit 1 ;;
-    esac
+  case "$1" in
+  --config)
+    CONFIG="$2"
+    shift 2
+    ;;
+  --api)
+    API_URL="$2"
+    shift 2
+    ;;
+  --prefill-ssh)
+    PREFILL_SSH="$2"
+    shift 2
+    ;;
+  --decode-ssh)
+    DECODE_SSH="$2"
+    shift 2
+    ;;
+  --model)
+    MODEL_ID="$2"
+    shift 2
+    ;;
+  --trials)
+    TRIALS="$2"
+    shift 2
+    ;;
+  --combine)
+    COMBINE=true
+    shift
+    ;;
+  *)
+    echo "Unknown argument: $1"
+    exit 1
+    ;;
+  esac
 done
 
 # ---------- Combine mode ----------
 if $COMBINE; then
-    python3 - "$RESULTS_DIR" <<'PYEOF'
+  python3 - "$RESULTS_DIR" <<'PYEOF'
 import json
 import sys
 import os
@@ -123,20 +147,20 @@ if 'disagg' in configs:
             print(f"| {l:<6} | {'':>7} | {'':>6} | {'':>11} | {'':>12} | {'':>8} | {'':>7} | {'':>4} |")
     print()
 PYEOF
-    exit 0
+  exit 0
 fi
 
 # ---------- Benchmark mode ----------
 if [ -z "$CONFIG" ] || [ -z "$API_URL" ]; then
-    echo "Usage: $0 --config <mac|spark|disagg> --api <URL> [--prefill-ssh SSH] [--decode-ssh SSH]"
-    exit 1
+  echo "Usage: $0 --config <mac|spark|disagg> --api <URL> [--prefill-ssh SSH] [--decode-ssh SSH]"
+  exit 1
 fi
 
 if [ "$CONFIG" = "disagg" ]; then
-    if [ -z "$PREFILL_SSH" ] || [ -z "$DECODE_SSH" ]; then
-        echo "Error: --prefill-ssh and --decode-ssh required for disagg config"
-        exit 1
-    fi
+  if [ -z "$PREFILL_SSH" ] || [ -z "$DECODE_SSH" ]; then
+    echo "Error: --prefill-ssh and --decode-ssh required for disagg config"
+    exit 1
+  fi
 fi
 
 echo "=== Comparison Benchmark: $CONFIG ==="
@@ -153,9 +177,9 @@ echo ""
 # Takes target_tokens and an optional trial index (0-based) to vary the prompt.
 # Returns the prompt string on stdout.
 generate_prompt() {
-    local target_tokens="$1"
-    local trial_idx="${2:-0}"
-    python3 -c "
+  local target_tokens="$1"
+  local trial_idx="${2:-0}"
+  python3 -c "
 import sys
 target = int('$target_tokens')
 trial_idx = int('$trial_idx')
@@ -182,9 +206,9 @@ print(prompt + suffix)
 # Run a single trial with a given prompt and timeout.
 # Outputs "ttft_ms tps token_count" on stdout.
 run_trial() {
-    local prompt="$1"
-    local timeout="$2"
-    python3 - "$API_URL" "$MODEL_ID" "$prompt" "$MAX_TOKENS" "$timeout" <<'PYEOF'
+  local prompt="$1"
+  local timeout="$2"
+  python3 - "$API_URL" "$MODEL_ID" "$prompt" "$MAX_TOKENS" "$timeout" <<'PYEOF'
 import json
 import sys
 import time
@@ -260,22 +284,22 @@ PYEOF
 
 # Extract a DISAGG_TIMING value from log lines.
 extract_timing() {
-    local lines="$1"
-    local key="$2"
-    echo "$lines" | grep -oP "${key}=\K[0-9.]+" | tail -1 || echo "0"
+  local lines="$1"
+  local key="$2"
+  echo "$lines" | grep -oP "${key}=\K[0-9.]+" | tail -1 || echo "0"
 }
 
 # Compute timeout for a given prompt length
 compute_timeout() {
-    local prompt_tokens="$1"
-    python3 -c "print(max(60, int($prompt_tokens / 20 + 60)))"
+  local prompt_tokens="$1"
+  python3 -c "print(max(60, int($prompt_tokens / 20 + 60)))"
 }
 
 # Initial warmup with shortest prompt (loads model into memory)
 echo "Warming up (model load)..."
 warmup_prompt=$(generate_prompt "${PROMPT_LENGTHS[0]}" 99)
 warmup_timeout=$(compute_timeout "${PROMPT_LENGTHS[0]}")
-run_trial "$warmup_prompt" "$warmup_timeout" > /dev/null 2>&1 || true
+run_trial "$warmup_prompt" "$warmup_timeout" >/dev/null 2>&1 || true
 sleep 2
 echo ""
 
@@ -283,108 +307,117 @@ echo ""
 json_results="{}"
 
 for prompt_len in "${PROMPT_LENGTHS[@]}"; do
-    echo "=== Prompt length: ~${prompt_len} tokens ==="
+  echo "=== Prompt length: ~${prompt_len} tokens ==="
 
-    timeout=$(compute_timeout "$prompt_len")
+  timeout=$(compute_timeout "$prompt_len")
 
-    # Per-context-length warmup (primes KV allocation at this size, uses unique prompt)
-    echo "  Warmup at ${prompt_len} tokens..."
-    warmup_prompt=$(generate_prompt "$prompt_len" 98)
-    run_trial "$warmup_prompt" "$timeout" > /dev/null 2>&1 || true
-    sleep 1
+  # Per-context-length warmup (primes KV allocation at this size, uses unique prompt)
+  echo "  Warmup at ${prompt_len} tokens..."
+  warmup_prompt=$(generate_prompt "$prompt_len" 98)
+  run_trial "$warmup_prompt" "$timeout" >/dev/null 2>&1 || true
+  sleep 1
 
-    ttft_sum=0
-    tps_sum=0
-    success=0
+  ttft_sum=0
+  tps_sum=0
+  success=0
 
-    # Phase accumulators for disagg
-    prefill_sum=0; ser_sum=0; net_sum=0; deser_sum=0; ftok_sum=0; orch_sum=0; kv_size_sum=0
+  # Phase accumulators for disagg
+  prefill_sum=0
+  ser_sum=0
+  net_sum=0
+  deser_sum=0
+  ftok_sum=0
+  orch_sum=0
+  kv_size_sum=0
 
-    for i in $(seq 1 "$TRIALS"); do
-        # Generate unique prompt per trial to avoid KV prefix cache hits
-        prompt=$(generate_prompt "$prompt_len" "$((i - 1))")
+  for i in $(seq 1 "$TRIALS"); do
+    # Generate unique prompt per trial to avoid KV prefix cache hits
+    prompt=$(generate_prompt "$prompt_len" "$((i - 1))")
 
-        echo -n "  Trial $i/$TRIALS ... "
+    echo -n "  Trial $i/$TRIALS ... "
 
-        # Record log offsets for disagg
-        if [ "$CONFIG" = "disagg" ]; then
-            prefill_offset=$(ssh "$PREFILL_SSH" "wc -c < /tmp/exo.log" 2>/dev/null || echo "0")
-            decode_offset=$(ssh "$DECODE_SSH" "wc -c < /tmp/exo.log" 2>/dev/null || echo "0")
-        fi
-
-        result=$(run_trial "$prompt" "$timeout" 2>/dev/null) || { echo "FAILED"; continue; }
-        ttft=$(echo "$result" | awk '{print $1}')
-        tps=$(echo "$result" | awk '{print $2}')
-        tokens=$(echo "$result" | awk '{print $3}')
-
-        if [ "$ttft" = "ERROR" ]; then
-            echo "FAILED (no tokens)"
-            continue
-        fi
-
-        echo "TTFT=${ttft}ms  TPS=${tps}  tokens=${tokens}"
-
-        ttft_sum=$(python3 -c "print($ttft_sum + $ttft)")
-        tps_sum=$(python3 -c "print($tps_sum + $tps)")
-        success=$((success + 1))
-
-        # Extract disagg timings
-        if [ "$CONFIG" = "disagg" ]; then
-            sleep 2  # Let logs flush
-
-            prefill_lines=$(ssh "$PREFILL_SSH" "tail -c +$((prefill_offset + 1)) /tmp/exo.log | grep DISAGG_TIMING" 2>/dev/null || echo "")
-            decode_lines=$(ssh "$DECODE_SSH" "tail -c +$((decode_offset + 1)) /tmp/exo.log | grep DISAGG_TIMING" 2>/dev/null || echo "")
-
-            # Support both pipelined and bulk timing keys
-            pipelined_total=$(extract_timing "$prefill_lines" "pipelined_total_ms")
-            pipelined_prefill=$(extract_timing "$prefill_lines" "pipelined_prefill_ms")
-
-            if [ "$(echo "$pipelined_total > 0" | bc -l 2>/dev/null || python3 -c "print(1 if $pipelined_total > 0 else 0)")" = "1" ]; then
-                # Pipelined mode — prefill and network overlap
-                prefill_ms=$pipelined_prefill
-                serialize_ms=0  # No separate serialization in pipelined mode
-                net_send_ms=$pipelined_total  # Total includes overlapped network
-                kv_size_mb=$(extract_timing "$prefill_lines" "chunk_mb")
-            else
-                # Bulk mode (legacy fallback)
-                prefill_ms=$(extract_timing "$prefill_lines" "prefill_compute_ms")
-                serialize_ms=$(extract_timing "$prefill_lines" "kv_serialize_ms")
-                net_send_ms=$(extract_timing "$prefill_lines" "kv_network_send_ms")
-                kv_size_mb=$(extract_timing "$prefill_lines" "kv_size_mb")
-            fi
-
-            deserialize_ms=$(extract_timing "$decode_lines" "kv_deserialize_ms")
-            first_tok_ms=$(extract_timing "$decode_lines" "decode_first_token_ms")
-
-            measured_phases=$(python3 -c "print($prefill_ms + $serialize_ms + $net_send_ms + $deserialize_ms + $first_tok_ms)")
-            orchestration=$(python3 -c "print(max(0, $ttft - $measured_phases))")
-
-            echo "    Phases: prefill=${prefill_ms} ser=${serialize_ms} net=${net_send_ms} deser=${deserialize_ms} ftok=${first_tok_ms} orch=${orchestration} kv=${kv_size_mb}MB"
-
-            prefill_sum=$(python3 -c "print($prefill_sum + $prefill_ms)")
-            ser_sum=$(python3 -c "print($ser_sum + $serialize_ms)")
-            net_sum=$(python3 -c "print($net_sum + $net_send_ms)")
-            deser_sum=$(python3 -c "print($deser_sum + $deserialize_ms)")
-            ftok_sum=$(python3 -c "print($ftok_sum + $first_tok_ms)")
-            orch_sum=$(python3 -c "print($orch_sum + $orchestration)")
-            kv_size_sum=$(python3 -c "print($kv_size_sum + $kv_size_mb)")
-        fi
-    done
-
-    if [ "$success" -eq 0 ]; then
-        echo "  All trials failed for ${prompt_len} tokens, skipping."
-        echo ""
-        continue
+    # Record log offsets for disagg
+    if [ "$CONFIG" = "disagg" ]; then
+      prefill_offset=$(ssh "$PREFILL_SSH" "wc -c < /tmp/exo.log" 2>/dev/null || echo "0")
+      decode_offset=$(ssh "$DECODE_SSH" "wc -c < /tmp/exo.log" 2>/dev/null || echo "0")
     fi
 
-    avg_ttft=$(python3 -c "print($ttft_sum / $success)")
-    avg_tps=$(python3 -c "print($tps_sum / $success)")
+    result=$(run_trial "$prompt" "$timeout" 2>/dev/null) || {
+      echo "FAILED"
+      continue
+    }
+    ttft=$(echo "$result" | awk '{print $1}')
+    tps=$(echo "$result" | awk '{print $2}')
+    tokens=$(echo "$result" | awk '{print $3}')
 
-    echo "  Avg: TTFT=$(python3 -c "print(f'{$avg_ttft:.1f}')")ms  TPS=$(python3 -c "print(f'{$avg_tps:.1f}')")  ($success/$TRIALS)"
+    if [ "$ttft" = "ERROR" ]; then
+      echo "FAILED (no tokens)"
+      continue
+    fi
 
-    # Build JSON entry for this prompt length
-    if [ "$CONFIG" = "disagg" ] && [ "$success" -gt 0 ]; then
-        phases_json=$(python3 -c "
+    echo "TTFT=${ttft}ms  TPS=${tps}  tokens=${tokens}"
+
+    ttft_sum=$(python3 -c "print($ttft_sum + $ttft)")
+    tps_sum=$(python3 -c "print($tps_sum + $tps)")
+    success=$((success + 1))
+
+    # Extract disagg timings
+    if [ "$CONFIG" = "disagg" ]; then
+      sleep 2 # Let logs flush
+
+      prefill_lines=$(ssh "$PREFILL_SSH" "tail -c +$((prefill_offset + 1)) /tmp/exo.log | grep DISAGG_TIMING" 2>/dev/null || echo "")
+      decode_lines=$(ssh "$DECODE_SSH" "tail -c +$((decode_offset + 1)) /tmp/exo.log | grep DISAGG_TIMING" 2>/dev/null || echo "")
+
+      # Support both pipelined and bulk timing keys
+      pipelined_total=$(extract_timing "$prefill_lines" "pipelined_total_ms")
+      pipelined_prefill=$(extract_timing "$prefill_lines" "pipelined_prefill_ms")
+
+      if [ "$(echo "$pipelined_total > 0" | bc -l 2>/dev/null || python3 -c "print(1 if $pipelined_total > 0 else 0)")" = "1" ]; then
+        # Pipelined mode — prefill and network overlap
+        prefill_ms=$pipelined_prefill
+        serialize_ms=0               # No separate serialization in pipelined mode
+        net_send_ms=$pipelined_total # Total includes overlapped network
+        kv_size_mb=$(extract_timing "$prefill_lines" "chunk_mb")
+      else
+        # Bulk mode (legacy fallback)
+        prefill_ms=$(extract_timing "$prefill_lines" "prefill_compute_ms")
+        serialize_ms=$(extract_timing "$prefill_lines" "kv_serialize_ms")
+        net_send_ms=$(extract_timing "$prefill_lines" "kv_network_send_ms")
+        kv_size_mb=$(extract_timing "$prefill_lines" "kv_size_mb")
+      fi
+
+      deserialize_ms=$(extract_timing "$decode_lines" "kv_deserialize_ms")
+      first_tok_ms=$(extract_timing "$decode_lines" "decode_first_token_ms")
+
+      measured_phases=$(python3 -c "print($prefill_ms + $serialize_ms + $net_send_ms + $deserialize_ms + $first_tok_ms)")
+      orchestration=$(python3 -c "print(max(0, $ttft - $measured_phases))")
+
+      echo "    Phases: prefill=${prefill_ms} ser=${serialize_ms} net=${net_send_ms} deser=${deserialize_ms} ftok=${first_tok_ms} orch=${orchestration} kv=${kv_size_mb}MB"
+
+      prefill_sum=$(python3 -c "print($prefill_sum + $prefill_ms)")
+      ser_sum=$(python3 -c "print($ser_sum + $serialize_ms)")
+      net_sum=$(python3 -c "print($net_sum + $net_send_ms)")
+      deser_sum=$(python3 -c "print($deser_sum + $deserialize_ms)")
+      ftok_sum=$(python3 -c "print($ftok_sum + $first_tok_ms)")
+      orch_sum=$(python3 -c "print($orch_sum + $orchestration)")
+      kv_size_sum=$(python3 -c "print($kv_size_sum + $kv_size_mb)")
+    fi
+  done
+
+  if [ "$success" -eq 0 ]; then
+    echo "  All trials failed for ${prompt_len} tokens, skipping."
+    echo ""
+    continue
+  fi
+
+  avg_ttft=$(python3 -c "print($ttft_sum / $success)")
+  avg_tps=$(python3 -c "print($tps_sum / $success)")
+
+  echo "  Avg: TTFT=$(python3 -c "print(f'{$avg_ttft:.1f}')")ms  TPS=$(python3 -c "print(f'{$avg_tps:.1f}')")  ($success/$TRIALS)"
+
+  # Build JSON entry for this prompt length
+  if [ "$CONFIG" = "disagg" ] && [ "$success" -gt 0 ]; then
+    phases_json=$(python3 -c "
 import json
 s = $success
 print(json.dumps({
@@ -397,7 +430,7 @@ print(json.dumps({
     'kv_size_mb': $kv_size_sum / s,
 }))
 ")
-        json_results=$(python3 -c "
+    json_results=$(python3 -c "
 import json
 r = json.loads('''$json_results''')
 r['$prompt_len'] = {
@@ -408,8 +441,8 @@ r['$prompt_len'] = {
 }
 print(json.dumps(r))
 ")
-    else
-        json_results=$(python3 -c "
+  else
+    json_results=$(python3 -c "
 import json
 r = json.loads('''$json_results''')
 r['$prompt_len'] = {
@@ -419,14 +452,14 @@ r['$prompt_len'] = {
 }
 print(json.dumps(r))
 ")
-    fi
+  fi
 
-    echo ""
+  echo ""
 done
 
 # Save results
 output_file="${RESULTS_DIR}/bench_${CONFIG}.json"
-echo "$json_results" | python3 -m json.tool > "$output_file"
+echo "$json_results" | python3 -m json.tool >"$output_file"
 echo "Results saved to $output_file"
 echo ""
 echo "Run all configs, then combine:"

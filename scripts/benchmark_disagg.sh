@@ -33,7 +33,7 @@ echo ""
 
 # Run a single trial — outputs "ttft_ms tps token_count" on stdout
 run_trial() {
-    python3 - "$API_URL" "$MODEL_ID" "$PROMPT" <<'PYEOF'
+  python3 - "$API_URL" "$MODEL_ID" "$PROMPT" <<'PYEOF'
 import json
 import sys
 import time
@@ -107,7 +107,7 @@ PYEOF
 
 # Warmup
 echo "Warming up..."
-run_trial > /dev/null 2>&1 || true
+run_trial >/dev/null 2>&1 || true
 echo ""
 
 # Collect results
@@ -117,29 +117,32 @@ tokens_sum=0
 success=0
 
 for i in $(seq 1 "$TRIALS"); do
-    echo -n "Trial $i/$TRIALS ... "
-    result=$(run_trial 2>/dev/null) || { echo "FAILED"; continue; }
-    ttft=$(echo "$result" | awk '{print $1}')
-    tps=$(echo "$result" | awk '{print $2}')
-    tokens=$(echo "$result" | awk '{print $3}')
+  echo -n "Trial $i/$TRIALS ... "
+  result=$(run_trial 2>/dev/null) || {
+    echo "FAILED"
+    continue
+  }
+  ttft=$(echo "$result" | awk '{print $1}')
+  tps=$(echo "$result" | awk '{print $2}')
+  tokens=$(echo "$result" | awk '{print $3}')
 
-    if [ "$ttft" = "ERROR" ]; then
-        echo "FAILED (no tokens)"
-        continue
-    fi
+  if [ "$ttft" = "ERROR" ]; then
+    echo "FAILED (no tokens)"
+    continue
+  fi
 
-    echo "TTFT=${ttft}ms  TPS=${tps}  tokens=${tokens}"
-    ttft_sum=$(python3 -c "print($ttft_sum + $ttft)")
-    tps_sum=$(python3 -c "print($tps_sum + $tps)")
-    tokens_sum=$((tokens_sum + tokens))
-    success=$((success + 1))
+  echo "TTFT=${ttft}ms  TPS=${tps}  tokens=${tokens}"
+  ttft_sum=$(python3 -c "print($ttft_sum + $ttft)")
+  tps_sum=$(python3 -c "print($tps_sum + $tps)")
+  tokens_sum=$((tokens_sum + tokens))
+  success=$((success + 1))
 done
 
 echo ""
 
 if [ "$success" -eq 0 ]; then
-    echo "All trials failed."
-    exit 1
+  echo "All trials failed."
+  exit 1
 fi
 
 avg_ttft=$(python3 -c "print(f'{$ttft_sum / $success:.1f}')")

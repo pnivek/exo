@@ -514,7 +514,10 @@ def main(
                     assert group is not None, "TP prefill requires distributed group"
 
                     try:
+                        from mlx_lm.sample_utils import make_sampler
+
                         from exo.worker.engines.mlx.cache import (
+                            encode_prompt,
                             make_kv_cache,
                         )
                         from exo.worker.engines.mlx.constants import (
@@ -527,15 +530,29 @@ def main(
                         )
 
                         prompt = apply_chat_template(tokenizer, task_params)
+                        all_prompt_tokens = encode_prompt(tokenizer, prompt)
+
+                        # Match the single-Spark disagg path exactly:
+                        # prefill all tokens except the last, then trim(2) after generation
+                        prompt_tokens = all_prompt_tokens[:-1]
+                        last_tokens = all_prompt_tokens[-2:]
+
+                        caches = make_kv_cache(model=cast(Model, inference_model))
+                        sampler = make_sampler(
+                            temp=task_params.temperature
+                            if task_params.temperature is not None
+                            else 0.7,
+                        )
 
                         # Run prefill through tensor-sharded model (both ranks process all tokens)
-                        caches = make_kv_cache(model=cast(Model, inference_model))
+                        # Note: group is already baked into the model by tensor_auto_parallel()
                         t_prefill_start = time.monotonic()
                         for _ in stream_generate(
                             model=cast(Model, inference_model),
                             tokenizer=tokenizer,
-                            prompt=prompt,
+                            prompt=prompt_tokens,
                             max_tokens=1,
+                            sampler=sampler,
                             prompt_cache=caches,
                             kv_group_size=KV_GROUP_SIZE,
                             kv_bits=KV_BITS,
@@ -573,12 +590,6 @@ def main(
                             == instance.kv_sender_node_id
                         )
                         if is_kv_sender:
-                            # Build last_tokens for decode (the last 2 prompt tokens)
-                            from exo.worker.engines.mlx.cache import encode_prompt
-
-                            all_prompt_tokens = encode_prompt(tokenizer, prompt)
-                            last_tokens = all_prompt_tokens[-2:]
-
                             t_send_start = time.monotonic()
                             send_precomputed_kv_cache_sync(
                                 host=decode_host,
