@@ -49,14 +49,14 @@ class DisaggregatedInstance(BaseInstance):
 class TensorPrefillDisaggInstance(BaseInstance):
     """Instance for tensor-parallel prefill across multiple nodes + disaggregated decode.
 
-    Multiple prefill nodes form a tensor-parallel group via jaccl/RDMA.
+    Multiple prefill nodes form a tensor-parallel group via NCCL.
     After prefill, rank 0 gathers the full KV cache and streams it to the
     decode node using the existing KVPS pipelined protocol.
     """
 
     prefill_node_ids: list[NodeId]
-    jaccl_devices: list[list[str | None]]
-    jaccl_coordinators: dict[NodeId, str]
+    nccl_host_ip: str
+    nccl_port: int
     decode_node_id: NodeId
     decode_node_host: str
     kv_transfer_port: int = 52416

@@ -154,33 +154,23 @@ def mlx_distributed_init(
                 return None
 
             case TensorPrefillDisaggInstance(
-                jaccl_devices=jaccl_devices, jaccl_coordinators=jaccl_coordinators
+                nccl_host_ip=nccl_host_ip,
+                nccl_port=nccl_port,
+                prefill_node_ids=prefill_node_ids,
             ):
                 # Decode runner: no distributed backend
                 if not isinstance(bound_instance.bound_shard, TensorShardMetadata):
                     return None
-                # Prefill runner: initialize jaccl (same as MlxJacclInstance)
-                assert all(
-                    jaccl_devices[i][i] is None for i in range(len(jaccl_devices))
-                )
-                coordination_file = (
-                    f"./hosts_{bound_instance.instance.instance_id}_{rank}.json"
-                )
-                jaccl_devices_json = json.dumps(jaccl_devices)
-
-                with open(coordination_file, "w") as f:
-                    _ = f.write(jaccl_devices_json)
-
-                jaccl_coordinator = jaccl_coordinators[bound_instance.bound_node_id]
-
+                # Prefill runner: initialize NCCL
+                world_size = len(prefill_node_ids)
                 logger.info(
-                    f"rank {rank} MLX_IBV_DEVICES: {coordination_file} with devices: {jaccl_devices_json}"
+                    f"rank {rank} NCCL init: host={nccl_host_ip}:{nccl_port} world_size={world_size}"
                 )
-                logger.info(f"rank {rank} MLX_JACCL_COORDINATOR: {jaccl_coordinator}")
-                os.environ["MLX_IBV_DEVICES"] = coordination_file
+                os.environ["NCCL_HOST_IP"] = nccl_host_ip
+                os.environ["NCCL_PORT"] = str(nccl_port)
                 os.environ["MLX_RANK"] = str(rank)
-                os.environ["MLX_JACCL_COORDINATOR"] = jaccl_coordinator
-                group = mx.distributed.init(backend="jaccl", strict=True)
+                os.environ["MLX_WORLD_SIZE"] = str(world_size)
+                group = mx.distributed.init(backend="nccl", strict=True)
 
         logger.info(f"Rank {rank} mlx distributed initialization complete")
 

@@ -336,58 +336,24 @@ def place_tensor_prefill_disagg_instance(
     if decode_node_id is None:
         raise ValueError("No decode node (Apple Silicon) found in cluster")
 
-    # Verify all prefill nodes have RDMA-capable interfaces and build jaccl config
-    prefill_rdma: dict[NodeId, str] = {}  # node_id -> rdma_device_name
-    for node_id in prefill_node_ids:
-        network = node_network.get(node_id, NodeNetworkInfo())
-        for iface in network.interfaces:
-            if iface.rdma_device_name is not None:
-                prefill_rdma[node_id] = iface.rdma_device_name
-                break
-
-    missing_rdma = [nid for nid in prefill_node_ids if nid not in prefill_rdma]
-    if missing_rdma:
-        raise ValueError(
-            f"TensorPrefillDisagg requires RDMA on all prefill nodes. "
-            f"Nodes without RDMA: {[str(nid)[:20] for nid in missing_rdma]}"
-        )
-
-    # Build jaccl devices matrix from RDMA device names
-    # For RoCE, the device name (e.g. "rocep1s0f0") is what MLX jaccl needs
-    num_prefill = len(prefill_node_ids)
-    jaccl_devices: list[list[str | None]] = [
-        [None for _ in range(num_prefill)] for _ in range(num_prefill)
-    ]
-    for i in range(num_prefill):
-        for j in range(num_prefill):
-            if i != j:
-                jaccl_devices[i][j] = prefill_rdma[prefill_node_ids[i]]
-
-    # Build jaccl coordinators: rank 0 listens, others connect to rank 0's WiFi IP
-    coordinator_port = random_ephemeral_port()
+    # Find routable IP for NCCL bootstrap (rank 0 coordinator)
+    nccl_port = random_ephemeral_port()
     coordinator_node = prefill_node_ids[0]
-    jaccl_coordinators: dict[NodeId, str] = {}
-    coordinator_ip: str | None = None
+    nccl_host_ip: str | None = None
     coordinator_network = node_network.get(coordinator_node, NodeNetworkInfo())
     for iface in coordinator_network.interfaces:
         if (
             iface.ip_address
             and iface.ip_address not in ("127.0.0.1", "::1")
-            and not iface.ip_address.startswith("169.254.")
             and not iface.ip_address.startswith("172.")
             and not iface.ip_address.startswith("fe80:")
         ):
-            coordinator_ip = iface.ip_address
+            nccl_host_ip = iface.ip_address
             break
-    if coordinator_ip is None:
+    if nccl_host_ip is None:
         raise ValueError(
             f"Could not find routable IP for coordinator node {coordinator_node}"
         )
-    for node_id in prefill_node_ids:
-        if node_id == coordinator_node:
-            jaccl_coordinators[node_id] = f"0.0.0.0:{coordinator_port}"
-        else:
-            jaccl_coordinators[node_id] = f"{coordinator_ip}:{coordinator_port}"
 
     # Build shard assignments: tensor shards for prefill, pipeline shard for decode
     prefill_cycle = Cycle(node_ids=prefill_node_ids)
@@ -447,8 +413,8 @@ def place_tensor_prefill_disagg_instance(
         instance_id=instance_id,
         shard_assignments=shard_assignments,
         prefill_node_ids=prefill_node_ids,
-        jaccl_devices=jaccl_devices,
-        jaccl_coordinators=jaccl_coordinators,
+        nccl_host_ip=nccl_host_ip,
+        nccl_port=nccl_port,
         decode_node_id=decode_node_id,
         decode_node_host=decode_host,
         kv_sender_node_id=prefill_node_ids[0],
