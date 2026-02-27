@@ -336,25 +336,61 @@ def place_tensor_prefill_disagg_instance(
     if decode_node_id is None:
         raise ValueError("No decode node (Apple Silicon) found in cluster")
 
-    # Verify RDMA connectivity between prefill nodes
-    prefill_cycle = Cycle(node_ids=prefill_node_ids)
-    if not topology.is_rdma_cycle(prefill_cycle):
+    # Verify all prefill nodes have RDMA-capable interfaces and build jaccl config
+    prefill_rdma: dict[NodeId, str] = {}  # node_id -> rdma_device_name
+    for node_id in prefill_node_ids:
+        network = node_network.get(node_id, NodeNetworkInfo())
+        for iface in network.interfaces:
+            if iface.rdma_device_name is not None:
+                prefill_rdma[node_id] = iface.rdma_device_name
+                break
+
+    missing_rdma = [nid for nid in prefill_node_ids if nid not in prefill_rdma]
+    if missing_rdma:
         raise ValueError(
-            "TensorPrefillDisagg requires RDMA connectivity between all prefill nodes"
+            f"TensorPrefillDisagg requires RDMA on all prefill nodes. "
+            f"Nodes without RDMA: {[str(nid)[:20] for nid in missing_rdma]}"
         )
 
-    # Build jaccl config for prefill nodes
-    prefill_subgraph = topology.get_subgraph_from_nodes(prefill_node_ids)
-    jaccl_devices = get_mlx_jaccl_devices_matrix(prefill_node_ids, prefill_subgraph)
+    # Build jaccl devices matrix from RDMA device names
+    # For RoCE, the device name (e.g. "rocep1s0f0") is what MLX jaccl needs
+    num_prefill = len(prefill_node_ids)
+    jaccl_devices: list[list[str | None]] = [
+        [None for _ in range(num_prefill)] for _ in range(num_prefill)
+    ]
+    for i in range(num_prefill):
+        for j in range(num_prefill):
+            if i != j:
+                jaccl_devices[i][j] = prefill_rdma[prefill_node_ids[i]]
+
+    # Build jaccl coordinators: rank 0 listens, others connect to rank 0's WiFi IP
     coordinator_port = random_ephemeral_port()
-    jaccl_coordinators = get_mlx_jaccl_coordinators(
-        coordinator=prefill_node_ids[0],
-        coordinator_port=coordinator_port,
-        cycle_digraph=prefill_subgraph,
-        node_network=node_network,
-    )
+    coordinator_node = prefill_node_ids[0]
+    jaccl_coordinators: dict[NodeId, str] = {}
+    coordinator_ip: str | None = None
+    coordinator_network = node_network.get(coordinator_node, NodeNetworkInfo())
+    for iface in coordinator_network.interfaces:
+        if (
+            iface.ip_address
+            and iface.ip_address not in ("127.0.0.1", "::1")
+            and not iface.ip_address.startswith("169.254.")
+            and not iface.ip_address.startswith("172.")
+            and not iface.ip_address.startswith("fe80:")
+        ):
+            coordinator_ip = iface.ip_address
+            break
+    if coordinator_ip is None:
+        raise ValueError(
+            f"Could not find routable IP for coordinator node {coordinator_node}"
+        )
+    for node_id in prefill_node_ids:
+        if node_id == coordinator_node:
+            jaccl_coordinators[node_id] = f"0.0.0.0:{coordinator_port}"
+        else:
+            jaccl_coordinators[node_id] = f"{coordinator_ip}:{coordinator_port}"
 
     # Build shard assignments: tensor shards for prefill, pipeline shard for decode
+    prefill_cycle = Cycle(node_ids=prefill_node_ids)
     tp_assignments = get_shard_assignments_for_tensor_parallel(
         model_card, prefill_cycle
     )
