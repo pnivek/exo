@@ -869,14 +869,26 @@ def _wrap_stream_generate(
 
 @cache
 def get_gpt_oss_encoding():
-    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-    return encoding
+    try:
+        encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        return encoding
+    except Exception as exc:
+        logger.warning(
+            f"Failed to load Harmony encoding (vocab download failed?): {exc}. "
+            "Falling back to raw token passthrough for gpt-oss models."
+        )
+        return None
 
 
 def parse_gpt_oss(
     responses: Generator[GenerationResponse],
 ) -> Generator[GenerationResponse | ToolCallResponse]:
     encoding = get_gpt_oss_encoding()
+    if encoding is None:
+        # Harmony encoding unavailable — pass tokens through unmodified.
+        # Tool calls and thinking channels won't be parsed but generation still works.
+        yield from responses
+        return
     stream = StreamableParser(encoding, role=Role.ASSISTANT)
     thinking = False
     current_tool_name: str | None = None
