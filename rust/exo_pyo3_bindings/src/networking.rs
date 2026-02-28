@@ -200,7 +200,14 @@ async fn networking_task(
             message = to_task_rx.recv() => {
                 // handle closed channel
                 let Some(message) = message else {
-                    log::info!("RUST: channel closed");
+                    log::info!("RUST: channel closed, forgetting senders to avoid PyO3 waker panic");
+                    // SAFETY: These senders have Python AsyncioWaker-backed receivers.
+                    // Dropping them on a tokio thread triggers wake_by_ref() which panics
+                    // because the GIL isn't held. Forgetting them leaks the sender but
+                    // prevents the panic. The receivers are cleaned up when Python GC
+                    // collects the PyNetworkingHandle.
+                    std::mem::forget(connection_update_tx);
+                    std::mem::forget(gossipsub_message_tx);
                     break;
                 };
 
