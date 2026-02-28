@@ -132,6 +132,7 @@ class RunnerSupervisor:
 
         logger.critical("Runner process didn't respond to SIGTERM, killing")
         self.runner_process.kill()
+        self.runner_process.join(2)  # reap to prevent zombie
 
     async def start_task(self, task: Task):
         if task.task_id in self.pending:

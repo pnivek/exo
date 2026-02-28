@@ -1,3 +1,4 @@
+import atexit
 import os
 from pathlib import Path
 
@@ -61,6 +62,17 @@ def entrypoint(
 ) -> None:
     global logger
     logger = _logger
+
+    def _cleanup_gpu() -> None:
+        """Release GPU memory on runner exit (runs even on unhandled exceptions)."""
+        try:
+            import mlx.core as mx  # noqa: PLC0415
+
+            mx.clear_cache()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_gpu)
 
     _ensure_tiktoken_vocab_cached()
 

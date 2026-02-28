@@ -1,4 +1,5 @@
 import argparse
+import atexit
 import multiprocessing as mp
 import os
 import resource
@@ -290,6 +291,18 @@ def main():
     elif args.fast_synch is False:
         os.environ["EXO_FAST_SYNCH"] = "off"
         logger.info("FAST_SYNCH forced OFF")
+
+    def _kill_child_processes() -> None:
+        """Force-kill any surviving runner subprocesses on exit.
+
+        Ensures GPU memory is released even if shutdown() was never called
+        (e.g. SIGKILL on parent, unhandled exception, or daemon process orphaning).
+        """
+        for child in mp.active_children():
+            child.kill()
+            child.join(1)
+
+    atexit.register(_kill_child_processes)
 
     node = anyio.run(Node.create, args)
     try:
