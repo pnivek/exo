@@ -262,8 +262,8 @@ with urllib.request.urlopen(req, timeout=timeout) as resp:
             if not choices:
                 continue
             delta = choices[0].get("delta", {})
-            content = delta.get("content", "")
-            reasoning = delta.get("reasoning_content", "")
+            content = delta.get("content") or ""
+            reasoning = delta.get("reasoning_content") or ""
             if content or reasoning:
                 if t_first is None:
                     t_first = time.monotonic()

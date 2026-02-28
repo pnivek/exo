@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import anyio
+from anyio import BrokenResourceError
 from loguru import logger
 
 from exo.master.event_log import DiskEventLog
@@ -480,28 +481,39 @@ class Master:
                                 await self._send_event(IndexedEvent(idx=i, event=event))
                     for event in generated_events:
                         await self.event_sender.send(event)
+                except BrokenResourceError:
+                    logger.warning(
+                        "Event sender closed (likely master shutdown during election)"
+                    )
+                    return
                 except ValueError as e:
                     logger.opt(exception=e).warning("Error in command processor")
 
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands
     async def _plan(self) -> None:
         while True:
-            # kill broken instances
-            connected_node_ids = set(self.state.topology.list_nodes())
-            for instance_id, instance in self.state.instances.items():
-                for node_id in instance.shard_assignments.node_to_runner:
-                    if node_id not in connected_node_ids:
-                        await self.event_sender.send(
-                            InstanceDeleted(instance_id=instance_id)
-                        )
-                        break
+            try:
+                # kill broken instances
+                connected_node_ids = set(self.state.topology.list_nodes())
+                for instance_id, instance in self.state.instances.items():
+                    for node_id in instance.shard_assignments.node_to_runner:
+                        if node_id not in connected_node_ids:
+                            await self.event_sender.send(
+                                InstanceDeleted(instance_id=instance_id)
+                            )
+                            break
 
-            # time out dead nodes
-            for node_id, time in self.state.last_seen.items():
-                now = datetime.now(tz=timezone.utc)
-                if now - time > timedelta(seconds=30):
-                    logger.info(f"Manually removing node {node_id} due to inactivity")
-                    await self.event_sender.send(NodeTimedOut(node_id=node_id))
+                # time out dead nodes
+                for node_id, time in self.state.last_seen.items():
+                    now = datetime.now(tz=timezone.utc)
+                    if now - time > timedelta(seconds=30):
+                        logger.info(
+                            f"Manually removing node {node_id} due to inactivity"
+                        )
+                        await self.event_sender.send(NodeTimedOut(node_id=node_id))
+            except BrokenResourceError:
+                logger.warning("Event sender closed in plan loop")
+                return
 
             await anyio.sleep(10)
 

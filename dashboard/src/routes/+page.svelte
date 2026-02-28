@@ -2621,9 +2621,7 @@
 
     if (hasMultiNode) {
       // Heterogeneous cluster: prefer disaggregated (PD split)
-      const disagg = valid.filter(
-        (p) => p.instance_meta === "Disaggregated",
-      );
+      const disagg = valid.filter((p) => p.instance_meta === "Disaggregated");
       if (disagg.length > 0) return disagg[0];
 
       // Multi-node with RDMA: prefer Jaccl + Tensor with most nodes (fastest TPS)
@@ -5585,59 +5583,61 @@
                 <div class="mt-3 space-y-3 pl-1" in:fade={{ duration: 150 }}>
                   <!-- Sharding Strategy (hidden for disaggregated) -->
                   {#if selectedInstanceType !== "Disaggregated"}
-                  <div>
-                    <div class="text-xs text-white/50 font-mono mb-2">
-                      Sharding Strategy:
-                    </div>
-                    <div class="flex gap-2">
-                      <button
-                        onclick={() => {
-                          selectedSharding = "Pipeline";
-                          saveLaunchDefaults();
-                        }}
-                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedSharding ===
-                        'Pipeline'
-                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
-                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
-                      >
-                        <span
-                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedSharding ===
+                    <div>
+                      <div class="text-xs text-white/50 font-mono mb-2">
+                        Sharding Strategy:
+                      </div>
+                      <div class="flex gap-2">
+                        <button
+                          onclick={() => {
+                            selectedSharding = "Pipeline";
+                            saveLaunchDefaults();
+                          }}
+                          class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedSharding ===
                           'Pipeline'
-                            ? 'border-exo-yellow'
-                            : 'border-exo-medium-gray'}"
+                            ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                            : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
                         >
-                          {#if selectedSharding === "Pipeline"}
-                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
-                            ></span>
-                          {/if}
-                        </span>
-                        Pipeline
-                      </button>
-                      <button
-                        onclick={() => {
-                          selectedSharding = "Tensor";
-                          saveLaunchDefaults();
-                        }}
-                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedSharding ===
-                        'Tensor'
-                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
-                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
-                      >
-                        <span
-                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedSharding ===
+                          <span
+                            class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedSharding ===
+                            'Pipeline'
+                              ? 'border-exo-yellow'
+                              : 'border-exo-medium-gray'}"
+                          >
+                            {#if selectedSharding === "Pipeline"}
+                              <span
+                                class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                              ></span>
+                            {/if}
+                          </span>
+                          Pipeline
+                        </button>
+                        <button
+                          onclick={() => {
+                            selectedSharding = "Tensor";
+                            saveLaunchDefaults();
+                          }}
+                          class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedSharding ===
                           'Tensor'
-                            ? 'border-exo-yellow'
-                            : 'border-exo-medium-gray'}"
+                            ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                            : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
                         >
-                          {#if selectedSharding === "Tensor"}
-                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
-                            ></span>
-                          {/if}
-                        </span>
-                        Tensor
-                      </button>
+                          <span
+                            class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedSharding ===
+                            'Tensor'
+                              ? 'border-exo-yellow'
+                              : 'border-exo-medium-gray'}"
+                          >
+                            {#if selectedSharding === "Tensor"}
+                              <span
+                                class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                              ></span>
+                            {/if}
+                          </span>
+                          Tensor
+                        </button>
+                      </div>
                     </div>
-                  </div>
                   {/if}
 
                   <!-- Interconnect -->
@@ -5720,61 +5720,61 @@
 
                   <!-- Minimum Devices (hidden for disaggregated) -->
                   {#if selectedInstanceType !== "Disaggregated"}
-                  <div>
-                    <div class="text-xs text-white/50 font-mono mb-2">
-                      Minimum Devices:
-                    </div>
-                    <!-- Discrete slider track with drag support -->
-                    <!-- svelte-ignore a11y_no_static_element_interactions -->
-                    <div
-                      bind:this={sliderTrackElement}
-                      class="relative h-16 cursor-pointer select-none px-2 pr-6"
-                      onmousedown={handleSliderMouseDown}
-                      ontouchstart={handleSliderTouchStart}
-                    >
-                      <!-- Track background -->
+                    <div>
+                      <div class="text-xs text-white/50 font-mono mb-2">
+                        Minimum Devices:
+                      </div>
+                      <!-- Discrete slider track with drag support -->
+                      <!-- svelte-ignore a11y_no_static_element_interactions -->
                       <div
-                        class="absolute top-6 left-0 right-0 h-2 bg-exo-medium-gray/50 rounded-full"
-                      ></div>
-                      <!-- Active track (fills up to selected) -->
-                      {#if availableMinNodes > 1}
+                        bind:this={sliderTrackElement}
+                        class="relative h-16 cursor-pointer select-none px-2 pr-6"
+                        onmousedown={handleSliderMouseDown}
+                        ontouchstart={handleSliderTouchStart}
+                      >
+                        <!-- Track background -->
                         <div
-                          class="absolute top-6 left-0 h-2 bg-white/30 rounded-full transition-all pointer-events-none"
-                          style="width: {((selectedMinNodes - 1) /
-                            (availableMinNodes - 1)) *
-                            100}%"
+                          class="absolute top-6 left-0 right-0 h-2 bg-exo-medium-gray/50 rounded-full"
                         ></div>
-                      {/if}
-                      <!-- Dots and labels for each device count -->
-                      {#each Array.from({ length: availableMinNodes }, (_, i) => i + 1) as n}
-                        {@const isValid = validMinNodeCounts().has(n)}
-                        {@const isSelected = selectedMinNodes === n}
-                        {@const position =
-                          availableMinNodes > 1
-                            ? ((n - 1) / (availableMinNodes - 1)) * 100
-                            : 50}
-                        <div
-                          class="absolute flex flex-col items-center pointer-events-none"
-                          style="left: {position}%; top: 0; transform: translateX(-50%);"
-                        >
-                          <span
-                            class="rounded-full transition-all {isSelected
-                              ? 'w-6 h-6 bg-exo-yellow shadow-[0_0_10px_rgba(255,215,0,0.6)]'
-                              : isValid
-                                ? 'w-4 h-4 bg-exo-light-gray/70 mt-1'
-                                : 'w-3 h-3 bg-exo-medium-gray/50 mt-1.5'}"
-                          ></span>
-                          <span
-                            class="text-sm font-mono mt-1.5 tabular-nums transition-colors {isSelected
-                              ? 'text-exo-yellow font-bold'
-                              : isValid
-                                ? 'text-white/70'
-                                : 'text-white/30'}">{n}</span
+                        <!-- Active track (fills up to selected) -->
+                        {#if availableMinNodes > 1}
+                          <div
+                            class="absolute top-6 left-0 h-2 bg-white/30 rounded-full transition-all pointer-events-none"
+                            style="width: {((selectedMinNodes - 1) /
+                              (availableMinNodes - 1)) *
+                              100}%"
+                          ></div>
+                        {/if}
+                        <!-- Dots and labels for each device count -->
+                        {#each Array.from({ length: availableMinNodes }, (_, i) => i + 1) as n}
+                          {@const isValid = validMinNodeCounts().has(n)}
+                          {@const isSelected = selectedMinNodes === n}
+                          {@const position =
+                            availableMinNodes > 1
+                              ? ((n - 1) / (availableMinNodes - 1)) * 100
+                              : 50}
+                          <div
+                            class="absolute flex flex-col items-center pointer-events-none"
+                            style="left: {position}%; top: 0; transform: translateX(-50%);"
                           >
-                        </div>
-                      {/each}
+                            <span
+                              class="rounded-full transition-all {isSelected
+                                ? 'w-6 h-6 bg-exo-yellow shadow-[0_0_10px_rgba(255,215,0,0.6)]'
+                                : isValid
+                                  ? 'w-4 h-4 bg-exo-light-gray/70 mt-1'
+                                  : 'w-3 h-3 bg-exo-medium-gray/50 mt-1.5'}"
+                            ></span>
+                            <span
+                              class="text-sm font-mono mt-1.5 tabular-nums transition-colors {isSelected
+                                ? 'text-exo-yellow font-bold'
+                                : isValid
+                                  ? 'text-white/70'
+                                  : 'text-white/30'}">{n}</span
+                            >
+                          </div>
+                        {/each}
+                      </div>
                     </div>
-                  </div>
                   {/if}
                 </div>
               {/if}
