@@ -3,7 +3,7 @@ import resource
 import time
 from collections.abc import Generator
 from functools import cache
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import mlx.core as mx
 from mlx_lm.generate import stream_generate
@@ -675,40 +675,70 @@ def main(
                         max_tokens = task_params.max_output_tokens or MAX_TOKENS
 
                         t_decode_start = time.monotonic()
-                        t_first_token: float | None = None
-                        for _completion_tokens, out in enumerate(
-                            stream_generate(
-                                model=cast(Model, inference_model),
-                                tokenizer=tokenizer,
-                                prompt=last_tokens,
-                                max_tokens=max_tokens,
-                                sampler=sampler,
-                                prompt_cache=received_caches,
-                                prefill_step_size=1,
-                                kv_group_size=KV_GROUP_SIZE,
-                                kv_bits=KV_BITS,
-                            ),
-                            start=1,
-                        ):
-                            if t_first_token is None:
-                                t_first_token = time.monotonic()
-                                logger.info(
-                                    f"DISAGG_TIMING decode_first_token_ms={(t_first_token - t_decode_start) * 1000:.1f}"
-                                )
+
+                        raw_stream = stream_generate(
+                            model=cast(Model, inference_model),
+                            tokenizer=tokenizer,
+                            prompt=last_tokens,
+                            max_tokens=max_tokens,
+                            sampler=sampler,
+                            prompt_cache=received_caches,
+                            prefill_step_size=1,
+                            kv_group_size=KV_GROUP_SIZE,
+                            kv_bits=KV_BITS,
+                        )
+                        gen: Generator[GenerationResponse | ToolCallResponse, None, None] = (
+                            _wrap_stream_generate(raw_stream, t_decode_start)
+                        )
+
+                        # Apply model-specific parsing (same as TextGeneration path)
+                        if tokenizer.has_thinking:
+                            gen = parse_thinking_models(gen, tokenizer, starts_in_thinking=False)
+                        if isinstance(inference_model, GptOssModel):
+                            gen = parse_gpt_oss(gen)
+                        elif isinstance(inference_model, DeepseekV32Model):
+                            gen = parse_deepseek_v32(gen)
+
+                        for response in gen:
                             if device_rank == 0:
-                                event_sender.send(
-                                    ChunkGenerated(
-                                        command_id=command_id,
-                                        chunk=TokenChunk(
-                                            model=shard_metadata.model_card.model_id,
-                                            text=out.text,
-                                            token_id=out.token,
-                                            usage=None,
-                                            finish_reason=out.finish_reason,  # pyright: ignore[reportArgumentType]
-                                        ),
-                                    )
-                                )
-                            if out.finish_reason is not None:
+                                match response:
+                                    case GenerationResponse() if response.finish_reason == "error":
+                                        event_sender.send(
+                                            ChunkGenerated(
+                                                command_id=command_id,
+                                                chunk=ErrorChunk(
+                                                    error_message=response.text,
+                                                    model=shard_metadata.model_card.model_id,
+                                                ),
+                                            )
+                                        )
+                                    case GenerationResponse():
+                                        assert response.finish_reason not in ("error", "tool_calls", "function_call")
+                                        event_sender.send(
+                                            ChunkGenerated(
+                                                command_id=command_id,
+                                                chunk=TokenChunk(
+                                                    model=shard_metadata.model_card.model_id,
+                                                    text=response.text,
+                                                    token_id=response.token,
+                                                    usage=response.usage,
+                                                    finish_reason=response.finish_reason,
+                                                    is_thinking=response.is_thinking,
+                                                ),
+                                            )
+                                        )
+                                    case ToolCallResponse():
+                                        event_sender.send(
+                                            ChunkGenerated(
+                                                command_id=command_id,
+                                                chunk=ToolCallChunk(
+                                                    tool_calls=response.tool_calls,
+                                                    model=shard_metadata.model_card.model_id,
+                                                    usage=response.usage,
+                                                ),
+                                            )
+                                        )
+                            if isinstance(response, GenerationResponse) and response.finish_reason is not None:
                                 break
 
                     except Exception as e:
@@ -765,6 +795,29 @@ def main(
 
             if isinstance(current_status, RunnerShutdown):
                 break
+
+
+def _wrap_stream_generate(
+    raw_stream: Generator[Any, None, None],
+    t_decode_start: float,
+) -> Generator[GenerationResponse, None, None]:
+    """Wrap raw mlx_lm stream_generate output into GenerationResponse objects.
+
+    Also logs first-token timing for disaggregated decode.
+    """
+    t_first_token: float | None = None
+    for out in raw_stream:  # pyright: ignore[reportAny]
+        if t_first_token is None:
+            t_first_token = time.monotonic()
+            logger.info(
+                f"DISAGG_TIMING decode_first_token_ms={(t_first_token - t_decode_start) * 1000:.1f}"
+            )
+        yield GenerationResponse(
+            text=out.text,  # pyright: ignore[reportAny]
+            token=out.token,  # pyright: ignore[reportAny]
+            finish_reason=out.finish_reason,  # pyright: ignore[reportAny]
+            usage=None,
+        )
 
 
 @cache
