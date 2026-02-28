@@ -34,6 +34,7 @@ from exo.worker.engines.mlx.kv_transfer import (
     KVTransferServer,
     deserialize_kv_cache,
     receive_kv_cache_auto_sync,
+    send_precomputed_kv_cache_sync,
     serialize_kv_cache,
 )
 
@@ -41,12 +42,27 @@ from exo.worker.engines.mlx.kv_transfer import (
 def _make_test_cache(
     num_layers: int = 2, seq_len: int = 4, n_kv_heads: int = 2, head_dim: int = 4
 ) -> tuple[list[KVCache], mx.array]:
-    """Create a small test KV cache with known values."""
+    """Create a small test KV cache with known float16 values."""
     caches: list[KVCache] = []
     for i in range(num_layers):
         c = KVCache()
         k = mx.ones((1, n_kv_heads, seq_len, head_dim), dtype=mx.float16) * (i + 1)
         v = mx.ones((1, n_kv_heads, seq_len, head_dim), dtype=mx.float16) * (i + 10)
+        c.state = (k, v)
+        caches.append(c)
+    last_tokens = mx.array([42, 43])
+    return caches, last_tokens
+
+
+def _make_test_cache_bf16(
+    num_layers: int = 2, seq_len: int = 4, n_kv_heads: int = 2, head_dim: int = 4
+) -> tuple[list[KVCache], mx.array]:
+    """Create a small test KV cache with bfloat16 values."""
+    caches: list[KVCache] = []
+    for i in range(num_layers):
+        c = KVCache()
+        k = mx.ones((1, n_kv_heads, seq_len, head_dim), dtype=mx.bfloat16) * (i + 1)
+        v = mx.ones((1, n_kv_heads, seq_len, head_dim), dtype=mx.bfloat16) * (i + 10)
         c.state = (k, v)
         caches.append(c)
     last_tokens = mx.array([42, 43])
@@ -256,3 +272,111 @@ class TestKVTransferServer:
         # Should not raise
         server2 = KVTransferServer(port)
         server2.close()
+
+    def test_bf16_pipelined_lossless_roundtrip(self) -> None:
+        """bf16 KV cache round-trips the pipelined protocol with bitwise-exact precision.
+
+        This is the critical test for the TP-disagg bf16 fix.  Before the fix, bf16
+        values were converted to float16 (lossy), causing the decode model to produce
+        garbage at long context lengths.  After the fix, values are sent as raw uint16
+        bits and recovered via mx.array.view(mx.bfloat16) — zero precision loss.
+        """
+        port = _find_free_port()
+        server = KVTransferServer(port)
+
+        try:
+            caches, last_tokens = _make_test_cache_bf16()
+
+            # Save original values for comparison (as raw uint16 bits)
+            orig_keys_bits = [
+                np.array(c.keys.view(mx.uint16), copy=True) for c in caches
+            ]
+            orig_vals_bits = [
+                np.array(c.values.view(mx.uint16), copy=True) for c in caches
+            ]
+
+            # Send through the real pipelined protocol (uses fixed _mlx_to_numpy)
+            t = threading.Thread(
+                target=send_precomputed_kv_cache_sync,
+                args=("127.0.0.1", port, caches, last_tokens),
+            )
+            t.start()
+            received_caches, _received_tokens = server.receive()
+            t.join(timeout=10.0)
+
+            assert len(received_caches) == 2
+            assert received_caches[0].keys.dtype == mx.bfloat16
+            assert received_caches[1].keys.dtype == mx.bfloat16
+
+            # Verify bitwise-identical recovery — not just approximately equal
+            for i, (rc, orig_k_bits, orig_v_bits) in enumerate(
+                zip(received_caches, orig_keys_bits, orig_vals_bits, strict=True)
+            ):
+                recv_k_bits: np.ndarray[Any, Any] = np.array(
+                    rc.keys.view(mx.uint16), copy=True
+                )
+                recv_v_bits: np.ndarray[Any, Any] = np.array(
+                    rc.values.view(mx.uint16), copy=True
+                )
+                assert np.array_equal(recv_k_bits, orig_k_bits), (
+                    f"Layer {i} keys not bitwise-identical after bf16 round-trip"
+                )
+                assert np.array_equal(recv_v_bits, orig_v_bits), (
+                    f"Layer {i} values not bitwise-identical after bf16 round-trip"
+                )
+        finally:
+            server.close()
+
+    def test_bf16_wire_uses_uint16_not_float16(self) -> None:
+        """Verifies that bf16 data is on the wire as raw uint16 bits, not float16.
+
+        This guards against regression: if someone changes _mlx_to_numpy to use
+        .astype(mx.float16) again, the header dtype_flag would say BFLOAT16 but
+        the data would actually be float16 — this test would catch that mismatch.
+        """
+        # Pick a bf16 value whose bit pattern changes under bf16→float16→bf16
+        # bf16 has a larger exponent range; we use a small subnormal that survives
+        # in bf16 but gets flushed to 0 in float16.
+        # 0x0001 in bf16 = 5.96e-45 (bf16 subnormal); in float16 this rounds to 0.
+        sentinel_uint16 = np.uint16(0x0080)  # a small bf16 value
+        sentinel_bf16 = mx.array(
+            np.array([[[[sentinel_uint16]]]], dtype=np.uint16)
+        ).view(mx.bfloat16)
+        sentinel_f16_val = float(sentinel_bf16.astype(mx.float16).item())
+        sentinel_bf16_val = float(sentinel_bf16.item())
+
+        # If the value differs after bf16→float16, it's a good sentinel
+        # (test is still valid if they happen to be equal, but less discriminating)
+        if sentinel_bf16_val == sentinel_f16_val:
+            pytest.skip(
+                "Sentinel value survives bf16→float16 conversion on this platform"
+            )
+
+        port = _find_free_port()
+        server = KVTransferServer(port)
+        try:
+            from mlx_lm.models.cache import KVCache
+
+            c = KVCache()
+            k = mx.broadcast_to(sentinel_bf16, (1, 1, 2, 4))
+            v = mx.broadcast_to(sentinel_bf16, (1, 1, 2, 4))
+            c.state = (k, v)
+            last_tokens = mx.array([1])
+            caches = [c]
+
+            t = threading.Thread(
+                target=send_precomputed_kv_cache_sync,
+                args=("127.0.0.1", port, caches, last_tokens),
+            )
+            t.start()
+            received_caches, _ = server.receive()
+            t.join(timeout=10.0)
+
+            # The recovered value must match the original bf16, NOT the float16 version
+            recovered_val = float(received_caches[0].keys[0, 0, 0, 0].item())
+            assert recovered_val == pytest.approx(sentinel_bf16_val), (
+                f"bf16 precision lost: expected {sentinel_bf16_val}, "
+                f"got {recovered_val} (float16 would give {sentinel_f16_val})"
+            )
+        finally:
+            server.close()

@@ -47,9 +47,15 @@ _DTYPE_BFLOAT16 = 0x01
 
 
 def _mlx_to_numpy(arr: mx.array) -> "np.ndarray[Any, Any]":
-    """Convert an MLX array to numpy, handling bfloat16 which numpy doesn't support."""
+    """Convert an MLX array to numpy, handling bfloat16 which numpy doesn't support.
+
+    For bfloat16 arrays we bitcast to uint16 (same 2 bytes, zero precision loss)
+    rather than converting to float16 (lossy — incompatible exponent range).
+    The receiver counterpart uses np.frombuffer(data, dtype=np.uint16) and then
+    mx.array(...).view(mx.bfloat16) to recover the exact original values.
+    """
     if arr.dtype == mx.bfloat16:
-        return np.array(arr.astype(mx.float16), copy=False)
+        return np.array(arr.view(mx.uint16), copy=False)
     return np.array(arr, copy=False)
 
 
@@ -699,6 +705,8 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
         header_n_kv_heads, header_head_dim = struct.unpack("!II", extra)  # pyright: ignore[reportAny]
 
     target_dtype = mx.bfloat16 if dtype_flag == _DTYPE_BFLOAT16 else mx.float16
+    # bf16 is sent as raw uint16 bits (lossless bitcast); f16 as native float16
+    wire_np_dtype = np.uint16 if dtype_flag == _DTYPE_BFLOAT16 else np.float16
     logger.info(
         f"Pipelined receive: {num_layers} layers, {total_tokens} tokens, "
         f"dtype={'bf16' if dtype_flag == _DTYPE_BFLOAT16 else 'f16'}"
@@ -755,10 +763,10 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
                 v_data = _recvall(conn, v_len)
 
                 k_np: np.ndarray[Any, Any] = np.frombuffer(
-                    k_data, dtype=np.float16
+                    k_data, dtype=wire_np_dtype
                 ).copy()
                 v_np: np.ndarray[Any, Any] = np.frombuffer(
-                    v_data, dtype=np.float16
+                    v_data, dtype=wire_np_dtype
                 ).copy()
                 chunk_layer_keys.append(k_np)
                 chunk_layer_values.append(v_np)
@@ -768,11 +776,11 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
                 elements_per_array = len(chunk_layer_keys[0])
                 head_dim_x_heads = elements_per_array // chunk_num_tokens
                 full_keys = [
-                    np.zeros(head_dim_x_heads * total_tokens, dtype=np.float16)
+                    np.zeros(head_dim_x_heads * total_tokens, dtype=wire_np_dtype)
                     for _ in range(num_layers)
                 ]
                 full_values = [
-                    np.zeros(head_dim_x_heads * total_tokens, dtype=np.float16)
+                    np.zeros(head_dim_x_heads * total_tokens, dtype=wire_np_dtype)
                     for _ in range(num_layers)
                 ]
 
@@ -841,9 +849,13 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
 
         k_mx = mx.array(k_shaped)
         v_mx = mx.array(v_shaped)
-        if target_dtype == mx.bfloat16:
-            k_mx = k_mx.astype(mx.bfloat16)
-            v_mx = v_mx.astype(mx.bfloat16)
+        if dtype_flag == _DTYPE_BFLOAT16:
+            # Bitcast uint16 bits back to bfloat16 — exact lossless recovery
+            k_mx = k_mx.view(mx.bfloat16)
+            v_mx = v_mx.view(mx.bfloat16)
+        elif target_dtype == mx.float16 and k_mx.dtype != mx.float16:
+            k_mx = k_mx.astype(mx.float16)
+            v_mx = v_mx.astype(mx.float16)
 
         cache_entry.state = (k_mx, v_mx)
         cache_entry.offset = total_received_tokens
