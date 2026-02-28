@@ -7,10 +7,9 @@ from exo_pyo3_bindings import Keypair, NetworkingHandle, NoPeersSubscribedToTopi
 @pytest.mark.asyncio
 async def test_sleep_on_multiple_items() -> None:
     print("PYTHON: starting handle")
-    h = NetworkingHandle(Keypair.generate_ed25519())
+    h = NetworkingHandle(Keypair.generate())
 
-    ct = asyncio.create_task(_await_cons(h))
-    mt = asyncio.create_task(_await_msg(h))
+    rt = asyncio.create_task(_await_recv(h))
 
     # sleep for 4 ticks
     for i in range(4):
@@ -22,13 +21,7 @@ async def test_sleep_on_multiple_items() -> None:
             print("caught it", e)
 
 
-async def _await_cons(h: NetworkingHandle):
+async def _await_recv(h: NetworkingHandle):
     while True:
-        c = await h.connection_update_recv()
-        print(f"PYTHON: connection update: {c}")
-
-
-async def _await_msg(h: NetworkingHandle):
-    while True:
-        m = await h.gossipsub_recv()
-        print(f"PYTHON: message: {m}")
+        msg = await h.recv()
+        print(f"PYTHON: received: {msg}")

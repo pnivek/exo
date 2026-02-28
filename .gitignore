@@ -3,6 +3,8 @@ digest.txt
 
 # python
 **/__pycache__
+venv/
+.venv/
 
 # nix
 .direnv/
@@ -38,3 +40,6 @@ bench/**/*.json
 
 # tmp
 tmp/models
+
+# playwright MCP logs
+.playwright-mcp/

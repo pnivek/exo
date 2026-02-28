@@ -8,7 +8,6 @@ from types import TracebackType
 from typing import Any, Self
 
 from anyio import (
-    CapacityLimiter,
     ClosedResourceError,
     EndOfStream,
     WouldBlock,
@@ -126,9 +125,7 @@ class MpSender[T]:
             self._state.buffer.put(item, block=True)
 
     async def send_async(self, item: T) -> None:
-        await to_thread.run_sync(
-            self.send, item, limiter=CapacityLimiter(1), abandon_on_cancel=True
-        )
+        await to_thread.run_sync(self.send, item, abandon_on_cancel=False)
 
     def close(self) -> None:
         if not self._state.closed.is_set():
@@ -204,10 +201,31 @@ class MpReceiver[T]:
                 raise EndOfStream from None
             return item
 
+    def _receive_with_timeout(self, timeout: float = 1.0) -> T:
+        """Like receive() but with a timeout. Raises WouldBlock on timeout."""
+        try:
+            return self.receive_nowait()
+        except WouldBlock:
+            try:
+                item = self._state.buffer.get(timeout=timeout)
+            except Empty:
+                raise WouldBlock from None
+            except (TypeError, OSError):
+                raise ClosedResourceError from None
+            if isinstance(item, _MpEndOfStream):
+                self.close()
+                raise EndOfStream from None
+            return item
+
     async def receive_async(self) -> T:
-        return await to_thread.run_sync(
-            self.receive, limiter=CapacityLimiter(1), abandon_on_cancel=True
-        )
+        while True:
+            try:
+                return await to_thread.run_sync(
+                    self._receive_with_timeout, abandon_on_cancel=False
+                )
+            except WouldBlock:
+                # Timed out waiting for data — yield control and retry
+                continue
 
     def close(self) -> None:
         if not self._state.closed.is_set():

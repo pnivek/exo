@@ -21,13 +21,17 @@ def entrypoint(
     global logger
     logger = _logger
 
-    fast_synch_override = os.environ.get("EXO_FAST_SYNCH")
-    if fast_synch_override != "off":
-        os.environ["MLX_METAL_FAST_SYNCH"] = "1"
-    else:
-        os.environ["MLX_METAL_FAST_SYNCH"] = "0"
+    import mlx.core as mx
 
-    logger.info(f"Fast synch flag: {os.environ['MLX_METAL_FAST_SYNCH']}")
+    if mx.metal.is_available():
+        fast_synch_override = os.environ.get("EXO_FAST_SYNCH")
+        if fast_synch_override != "off":
+            os.environ["MLX_METAL_FAST_SYNCH"] = "1"
+        else:
+            os.environ["MLX_METAL_FAST_SYNCH"] = "0"
+        logger.info(f"Fast synch flag: {os.environ['MLX_METAL_FAST_SYNCH']}")
+    else:
+        logger.info("Metal not available, skipping MLX_METAL_FAST_SYNCH")
 
     # Import main after setting global logger - this lets us just import logger from this module
     try:

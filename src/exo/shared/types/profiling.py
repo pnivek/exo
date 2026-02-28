@@ -73,6 +73,7 @@ class NetworkInterfaceInfo(CamelCaseModel):
     name: str
     ip_address: str
     interface_type: InterfaceType = "unknown"
+    rdma_device_name: str | None = None
 
 
 class NodeIdentity(CamelCaseModel):
