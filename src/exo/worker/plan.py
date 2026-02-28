@@ -7,6 +7,8 @@ from exo.shared.types.tasks import (
     CancelTask,
     ConnectToGroup,
     CreateRunner,
+    DisaggDecode,
+    DisaggPrefill,
     DownloadModel,
     ImageEdits,
     ImageGeneration,
@@ -16,6 +18,7 @@ from exo.shared.types.tasks import (
     Task,
     TaskId,
     TaskStatus,
+    TensorParallelDisaggPrefill,
     TextGeneration,
 )
 from exo.shared.types.worker.downloads import (
@@ -24,7 +27,13 @@ from exo.shared.types.worker.downloads import (
     DownloadOngoing,
     DownloadProgress,
 )
-from exo.shared.types.worker.instances import BoundInstance, Instance, InstanceId
+from exo.shared.types.worker.instances import (
+    BoundInstance,
+    DisaggregatedInstance,
+    Instance,
+    InstanceId,
+    TensorPrefillDisaggInstance,
+)
 from exo.shared.types.worker.runners import (
     RunnerConnected,
     RunnerConnecting,
@@ -38,6 +47,7 @@ from exo.shared.types.worker.runners import (
     RunnerStatus,
     RunnerWarmingUp,
 )
+from exo.shared.types.worker.shards import TensorShardMetadata
 from exo.worker.runner.runner_supervisor import RunnerSupervisor
 
 
@@ -150,13 +160,35 @@ def _init_distributed_backend(
         if is_single_node_instance:
             continue
 
+        # Disaggregated runners are independent — no distributed backend needed
+        if isinstance(instance, DisaggregatedInstance):
+            continue
+
+        # TensorPrefillDisagg: decode runner skips distributed init, prefill runners connect
+        if isinstance(instance, TensorPrefillDisaggInstance) and not isinstance(
+            runner.bound_instance.bound_shard, TensorShardMetadata
+        ):
+            # This is the decode runner — skip distributed init
+            continue
+
         runner_is_idle = isinstance(runner.status, RunnerIdle)
+
+        # TensorPrefillDisagg uses NCCL which handles its own rank coordination.
+        # All prefill runners can start ConnectToGroup immediately — NCCL bootstrap
+        # has a built-in timeout for rank synchronization.
+        if isinstance(instance, TensorPrefillDisaggInstance):
+            if runner_is_idle:
+                return ConnectToGroup(instance_id=instance.instance_id)
+            continue
+
+        peer_runner_ids = list(shard_assignments.runner_to_shard.keys())
+
         all_runners_connecting = all(
             isinstance(
                 all_runners.get(global_runner_id),
                 (RunnerConnecting, RunnerIdle),
             )
-            for global_runner_id in shard_assignments.runner_to_shard
+            for global_runner_id in peer_runner_ids
         )
 
         if not (runner_is_idle and all_runners_connecting):
@@ -176,7 +208,7 @@ def _init_distributed_backend(
         # Rank = n-1
         connecting_rank_ready = device_rank == world_size - 1 and all(
             isinstance(all_runners.get(global_runner_id, None), RunnerConnecting)
-            for global_runner_id in shard_assignments.runner_to_shard
+            for global_runner_id in peer_runner_ids
             if global_runner_id != runner_id
         )
 
@@ -210,17 +242,38 @@ def _load_model(
             continue
 
         is_single_node_instance = len(instance.shard_assignments.runner_to_shard) == 1
-        if is_single_node_instance and isinstance(runner.status, RunnerIdle):
+        is_independent = is_single_node_instance or isinstance(
+            instance, DisaggregatedInstance
+        )
+
+        # TensorPrefillDisagg: decode runner loads independently, prefill runners coordinate
+        is_tp_disagg_decode = isinstance(
+            instance, TensorPrefillDisaggInstance
+        ) and not isinstance(runner.bound_instance.bound_shard, TensorShardMetadata)
+
+        if (is_independent or is_tp_disagg_decode) and isinstance(
+            runner.status, RunnerIdle
+        ):
             return LoadModel(instance_id=instance.instance_id)
 
         is_runner_waiting = isinstance(runner.status, RunnerConnected)
+
+        # For TensorPrefillDisagg, only check peer prefill runners for model load coordination
+        if isinstance(instance, TensorPrefillDisaggInstance):
+            peer_runner_ids = [
+                rid
+                for rid, shard in shard_assignments.runner_to_shard.items()
+                if isinstance(shard, TensorShardMetadata)
+            ]
+        else:
+            peer_runner_ids = list(shard_assignments.runner_to_shard.keys())
 
         all_ready_for_model = all(
             isinstance(
                 all_runners.get(global_runner_id, None),
                 (RunnerConnected, RunnerLoading, RunnerLoaded),
             )
-            for global_runner_id in shard_assignments.runner_to_shard
+            for global_runner_id in peer_runner_ids
         )
 
         if is_runner_waiting and all_ready_for_model:
@@ -243,8 +296,32 @@ def _ready_to_warmup(
 
         is_runner_loaded = isinstance(runner.status, RunnerLoaded)
 
+        # Disaggregated runners warm up independently
+        if isinstance(instance, DisaggregatedInstance):
+            if is_runner_loaded:
+                return StartWarmup(instance_id=instance.instance_id)
+            continue
+
+        # TensorPrefillDisagg: decode runner warms up independently
+        if isinstance(instance, TensorPrefillDisaggInstance) and not isinstance(
+            shard, TensorShardMetadata
+        ):
+            if is_runner_loaded:
+                return StartWarmup(instance_id=instance.instance_id)
+            continue
+
         assert device_rank < world_size
         assert device_rank >= 0
+
+        # For TensorPrefillDisagg, only check peer prefill runners
+        if isinstance(instance, TensorPrefillDisaggInstance):
+            peer_runner_ids = [
+                rid
+                for rid, s in shard_assignments.runner_to_shard.items()
+                if isinstance(s, TensorShardMetadata)
+            ]
+        else:
+            peer_runner_ids = list(shard_assignments.runner_to_shard.keys())
 
         # Rank != 0
         accepting_ranks_ready = device_rank > 0 and all(
@@ -252,13 +329,13 @@ def _ready_to_warmup(
                 all_runners.get(global_runner_id, None),
                 (RunnerLoaded, RunnerWarmingUp),
             )
-            for global_runner_id in shard_assignments.runner_to_shard
+            for global_runner_id in peer_runner_ids
         )
 
         # Rank = 0
         connecting_rank_ready = device_rank == 0 and all(
             isinstance(all_runners.get(global_runner_id, None), RunnerWarmingUp)
-            for global_runner_id in shard_assignments.runner_to_shard
+            for global_runner_id in peer_runner_ids
             if global_runner_id != runner_id
         )
 
@@ -277,7 +354,17 @@ def _pending_tasks(
     for task in tasks.values():
         # for now, just forward chat completions
         # TODO(ciaran): do this better!
-        if not isinstance(task, (TextGeneration, ImageGeneration, ImageEdits)):
+        if not isinstance(
+            task,
+            (
+                TextGeneration,
+                ImageGeneration,
+                ImageEdits,
+                DisaggPrefill,
+                DisaggDecode,
+                TensorParallelDisaggPrefill,
+            ),
+        ):
             continue
         if task.task_status not in (TaskStatus.Pending, TaskStatus.Running):
             continue
@@ -294,15 +381,61 @@ def _pending_tasks(
             if task.instance_id != runner.bound_instance.instance.instance_id:
                 continue
 
+            # Route disaggregated tasks to the correct runner
+            instance = runner.bound_instance.instance
+            if isinstance(instance, DisaggregatedInstance):
+                node_id = runner.bound_instance.bound_node_id
+                if (
+                    isinstance(task, DisaggPrefill)
+                    and node_id != instance.prefill_node_id
+                ):
+                    continue
+                if (
+                    isinstance(task, DisaggDecode)
+                    and node_id != instance.decode_node_id
+                ):
+                    continue
+
+            # Route TensorPrefillDisagg tasks to the correct runners
+            if isinstance(instance, TensorPrefillDisaggInstance):
+                node_id = runner.bound_instance.bound_node_id
+                is_prefill_node = node_id in instance.prefill_node_ids
+                if (
+                    isinstance(task, TensorParallelDisaggPrefill)
+                    and not is_prefill_node
+                ):
+                    continue
+                if (
+                    isinstance(task, DisaggDecode)
+                    and node_id != instance.decode_node_id
+                ):
+                    continue
+
             # the task status _should_ be set to completed by the LAST runner
             # it is currently set by the first
             # this is definitely a hack
             if task.task_id in runner.completed:
                 continue
 
+            # For TensorPrefillDisagg, check only peer runners for readiness
+            if isinstance(instance, TensorPrefillDisaggInstance):
+                if isinstance(task, TensorParallelDisaggPrefill):
+                    peer_runner_ids = [
+                        rid
+                        for rid, s in instance.shard_assignments.runner_to_shard.items()
+                        if isinstance(s, TensorShardMetadata)
+                    ]
+                else:
+                    # DisaggDecode only needs the decode runner to be ready
+                    peer_runner_ids = [runner.bound_instance.bound_runner_id]
+            else:
+                peer_runner_ids = list(
+                    runner.bound_instance.instance.shard_assignments.runner_to_shard.keys()
+                )
+
             if isinstance(runner.status, RunnerReady) and all(
                 isinstance(all_runners[global_runner_id], (RunnerReady, RunnerRunning))
-                for global_runner_id in runner.bound_instance.instance.shard_assignments.runner_to_shard
+                for global_runner_id in peer_runner_ids
             ):
                 return task
 

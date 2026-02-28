@@ -6,6 +6,7 @@ from exo.shared.types.memory import Memory
 from exo.shared.types.tasks import BaseTask, TaskId
 from exo.shared.types.worker.instances import (
     BoundInstance,
+    DisaggregatedInstance,
     Instance,
     InstanceId,
     MlxRingInstance,
@@ -94,4 +95,33 @@ def get_bound_mlx_ring_instance(
     )
     return BoundInstance(
         instance=instance, bound_runner_id=runner_id, bound_node_id=node_id
+    )
+
+
+def get_disaggregated_instance(
+    instance_id: InstanceId,
+    model_id: ModelId,
+    prefill_node_id: NodeId,
+    decode_node_id: NodeId,
+    prefill_runner_id: RunnerId,
+    decode_runner_id: RunnerId,
+) -> DisaggregatedInstance:
+    prefill_shard = get_pipeline_shard_metadata(model_id=model_id, device_rank=0)
+    decode_shard = get_pipeline_shard_metadata(model_id=model_id, device_rank=0)
+    return DisaggregatedInstance(
+        instance_id=instance_id,
+        shard_assignments=get_shard_assignments(
+            model_id,
+            node_to_runner={
+                prefill_node_id: prefill_runner_id,
+                decode_node_id: decode_runner_id,
+            },
+            runner_to_shard={
+                prefill_runner_id: prefill_shard,
+                decode_runner_id: decode_shard,
+            },
+        ),
+        prefill_node_id=prefill_node_id,
+        decode_node_id=decode_node_id,
+        decode_node_host="192.168.1.100",
     )

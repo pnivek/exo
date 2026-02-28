@@ -827,7 +827,7 @@
     return model.tasks.includes("ImageToImage");
   }
   let selectedSharding = $state<"Pipeline" | "Tensor">("Pipeline");
-  type InstanceMeta = "MlxRing" | "MlxJaccl";
+  type InstanceMeta = "MlxRing" | "MlxJaccl" | "Disaggregated";
 
   // Launch defaults persistence
   const LAUNCH_DEFAULTS_KEY = "exo-launch-defaults-v2";
@@ -873,7 +873,11 @@
     // Apply sharding and instance type unconditionally
     selectedSharding = defaults.sharding;
     selectedInstanceType =
-      defaults.instanceType === "MlxRing" ? "MlxRing" : "MlxJaccl";
+      defaults.instanceType === "Disaggregated"
+        ? "Disaggregated"
+        : defaults.instanceType === "MlxJaccl"
+          ? "MlxJaccl"
+          : "MlxRing";
 
     // Apply minNodes if valid (between 1 and maxNodes)
     if (
@@ -1969,6 +1973,9 @@
     let instanceType = "Unknown";
     if (instanceTag === "MlxRingInstance") instanceType = "MLX Ring";
     else if (instanceTag === "MlxJacclInstance") instanceType = "MLX RDMA";
+    else if (instanceTag === "DisaggregatedInstance") instanceType = "PD Split";
+    else if (instanceTag === "TensorPrefillDisaggInstance")
+      instanceType = "TP PD Split";
 
     const inst = instance as {
       shardAssignments?: {
@@ -2613,6 +2620,12 @@
     const hasMultiNode = valid.some((p) => getPreviewNodeCount(p) > 1);
 
     if (hasMultiNode) {
+      // Heterogeneous cluster: prefer disaggregated (PD split)
+      const disagg = valid.filter(
+        (p) => p.instance_meta === "Disaggregated",
+      );
+      if (disagg.length > 0) return disagg[0];
+
       // Multi-node with RDMA: prefer Jaccl + Tensor with most nodes (fastest TPS)
       const jacclTensor = valid
         .filter(
@@ -5570,7 +5583,8 @@
 
               {#if showAdvancedOptions}
                 <div class="mt-3 space-y-3 pl-1" in:fade={{ duration: 150 }}>
-                  <!-- Sharding Strategy -->
+                  <!-- Sharding Strategy (hidden for disaggregated) -->
+                  {#if selectedInstanceType !== "Disaggregated"}
                   <div>
                     <div class="text-xs text-white/50 font-mono mb-2">
                       Sharding Strategy:
@@ -5624,6 +5638,7 @@
                       </button>
                     </div>
                   </div>
+                  {/if}
 
                   <!-- Interconnect -->
                   <div>
@@ -5677,10 +5692,34 @@
                         </span>
                         RDMA (Fast)
                       </button>
+                      <button
+                        onclick={() => {
+                          selectedInstanceType = "Disaggregated";
+                          saveLaunchDefaults();
+                        }}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
+                        'Disaggregated'
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedInstanceType ===
+                          'Disaggregated'
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if selectedInstanceType === "Disaggregated"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        PD Split
+                      </button>
                     </div>
                   </div>
 
-                  <!-- Minimum Devices -->
+                  <!-- Minimum Devices (hidden for disaggregated) -->
+                  {#if selectedInstanceType !== "Disaggregated"}
                   <div>
                     <div class="text-xs text-white/50 font-mono mb-2">
                       Minimum Devices:
@@ -5736,6 +5775,7 @@
                       {/each}
                     </div>
                   </div>
+                  {/if}
                 </div>
               {/if}
             </div>

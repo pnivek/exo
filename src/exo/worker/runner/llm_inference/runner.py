@@ -3,9 +3,10 @@ import resource
 import time
 from collections.abc import Generator
 from functools import cache
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import mlx.core as mx
+from mlx_lm.generate import stream_generate
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.gpt_oss import Model as GptOssModel
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -34,16 +35,19 @@ from exo.shared.types.events import (
 from exo.shared.types.mlx import Model
 from exo.shared.types.tasks import (
     ConnectToGroup,
+    DisaggDecode,
+    DisaggPrefill,
     LoadModel,
     Shutdown,
     StartWarmup,
     Task,
     TaskId,
     TaskStatus,
+    TensorParallelDisaggPrefill,
     TextGeneration,
 )
 from exo.shared.types.text_generation import TextGenerationTaskParams
-from exo.shared.types.worker.instances import BoundInstance
+from exo.shared.types.worker.instances import BoundInstance, TensorPrefillDisaggInstance
 from exo.shared.types.worker.runner_response import (
     GenerationResponse,
     ToolCallItem,
@@ -424,6 +428,349 @@ def main(
                     current_status = RunnerReady()
                     logger.info("runner ready")
 
+                case DisaggPrefill(
+                    task_params=task_params,
+                    command_id=command_id,
+                    decode_node_host=decode_host,
+                    decode_node_port=decode_port,
+                ) if isinstance(current_status, RunnerReady):
+                    logger.info(f"received disaggregated prefill request: {task}")
+                    current_status = RunnerRunning()
+                    event_sender.send(
+                        RunnerStatusUpdated(
+                            runner_id=runner_id, runner_status=current_status
+                        )
+                    )
+                    event_sender.send(TaskAcknowledged(task_id=task.task_id))
+                    assert inference_model
+                    assert tokenizer
+
+                    try:
+                        from mlx_lm.sample_utils import make_sampler
+
+                        from exo.worker.engines.mlx.cache import (
+                            encode_prompt,
+                            make_kv_cache,
+                        )
+                        from exo.worker.engines.mlx.kv_transfer import (
+                            send_kv_cache_pipelined_sync,
+                        )
+
+                        prompt = apply_chat_template(tokenizer, task_params)
+                        all_prompt_tokens = encode_prompt(tokenizer, prompt)
+
+                        caches = make_kv_cache(model=cast(Model, inference_model))
+                        sampler = make_sampler(
+                            temp=task_params.temperature
+                            if task_params.temperature is not None
+                            else 0.7,
+                        )
+
+                        last_tokens = all_prompt_tokens[-2:]
+                        t_pipelined_start = time.monotonic()
+                        prefill_tps, num_tokens = send_kv_cache_pipelined_sync(
+                            host=decode_host,
+                            port=decode_port,
+                            model=cast(Model, inference_model),
+                            tokenizer=tokenizer,
+                            prompt_tokens=all_prompt_tokens[:-1],
+                            last_tokens=last_tokens,
+                            cache=caches,
+                            sampler=sampler,
+                        )
+                        t_pipelined_end = time.monotonic()
+                        logger.info(
+                            f"DISAGG_TIMING pipelined_total_ms={(t_pipelined_end - t_pipelined_start) * 1000:.1f} "
+                            f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens}"
+                        )
+
+                    except Exception as e:
+                        if device_rank == 0:
+                            event_sender.send(
+                                ChunkGenerated(
+                                    command_id=command_id,
+                                    chunk=ErrorChunk(
+                                        model=model_id,
+                                        finish_reason="error",
+                                        error_message=str(e),
+                                    ),
+                                )
+                            )
+                        raise
+
+                    current_status = RunnerReady()
+                    logger.info("runner ready")
+
+                case TensorParallelDisaggPrefill(
+                    task_params=task_params,
+                    command_id=command_id,
+                    decode_node_host=decode_host,
+                    decode_node_port=decode_port,
+                ) if isinstance(current_status, RunnerReady):
+                    logger.info(
+                        f"received tensor-parallel disagg prefill request: {task}"
+                    )
+                    current_status = RunnerRunning()
+                    event_sender.send(
+                        RunnerStatusUpdated(
+                            runner_id=runner_id, runner_status=current_status
+                        )
+                    )
+                    event_sender.send(TaskAcknowledged(task_id=task.task_id))
+                    assert inference_model
+                    assert tokenizer
+                    assert group is not None, "TP prefill requires distributed group"
+
+                    try:
+                        from mlx_lm.sample_utils import make_sampler
+
+                        from exo.worker.engines.mlx.cache import (
+                            encode_prompt,
+                            make_kv_cache,
+                        )
+                        from exo.worker.engines.mlx.constants import (
+                            KV_BITS,
+                            KV_GROUP_SIZE,
+                        )
+                        from exo.worker.engines.mlx.kv_transfer import (
+                            gather_sharded_kv_cache,
+                            send_precomputed_kv_cache_sync,
+                        )
+
+                        prompt = apply_chat_template(tokenizer, task_params)
+                        all_prompt_tokens = encode_prompt(tokenizer, prompt)
+
+                        prompt_tokens = all_prompt_tokens[:-1]
+                        last_tokens = all_prompt_tokens[-2:]
+
+                        from mlx_lm.models.cache import KVCache as PlainKVCache
+
+                        caches = [
+                            PlainKVCache() for _ in cast(Model, inference_model).layers
+                        ]
+                        sampler = make_sampler(
+                            temp=task_params.temperature
+                            if task_params.temperature is not None
+                            else 0.7,
+                        )
+
+                        t_prefill_start = time.monotonic()
+                        for _ in stream_generate(
+                            model=cast(Model, inference_model),
+                            tokenizer=tokenizer,
+                            prompt=prompt_tokens,
+                            max_tokens=1,
+                            sampler=sampler,
+                            prompt_cache=caches,
+                            kv_group_size=KV_GROUP_SIZE,
+                            kv_bits=KV_BITS,
+                        ):
+                            break
+
+                        t_prefill_end = time.monotonic()
+                        prefill_ms = (t_prefill_end - t_prefill_start) * 1000
+
+                        for c in caches:
+                            c.trim(2)
+
+                        num_tokens = caches[0].offset
+                        prefill_tps = (
+                            num_tokens / (prefill_ms / 1000) if prefill_ms > 0 else 0.0
+                        )
+                        logger.info(
+                            f"DISAGG_TIMING tp_prefill_ms={prefill_ms:.1f} "
+                            f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens}"
+                        )
+
+                        t_gather_start = time.monotonic()
+                        gather_sharded_kv_cache(caches, group)
+                        t_gather_end = time.monotonic()
+                        logger.info(
+                            f"DISAGG_TIMING tp_kv_gather_ms={(t_gather_end - t_gather_start) * 1000:.1f}"
+                        )
+
+                        is_kv_sender = (
+                            isinstance(instance, TensorPrefillDisaggInstance)
+                            and bound_instance.bound_node_id
+                            == instance.kv_sender_node_id
+                        )
+                        if is_kv_sender:
+                            t_send_start = time.monotonic()
+                            send_precomputed_kv_cache_sync(
+                                host=decode_host,
+                                port=decode_port,
+                                cache=caches,
+                                last_tokens=last_tokens,
+                            )
+                            t_send_end = time.monotonic()
+                            logger.info(
+                                f"DISAGG_TIMING tp_kv_send_ms={(t_send_end - t_send_start) * 1000:.1f}"
+                            )
+
+                    except Exception as e:
+                        if device_rank == 0:
+                            event_sender.send(
+                                ChunkGenerated(
+                                    command_id=command_id,
+                                    chunk=ErrorChunk(
+                                        model=model_id,
+                                        finish_reason="error",
+                                        error_message=str(e),
+                                    ),
+                                )
+                            )
+                        raise
+
+                    current_status = RunnerReady()
+                    logger.info("runner ready")
+
+                case DisaggDecode(
+                    task_params=task_params,
+                    command_id=command_id,
+                    kv_transfer_port=kv_port,
+                ) if isinstance(current_status, RunnerReady):
+                    logger.info(
+                        f"received disaggregated decode request, waiting for KV cache on port {kv_port}"
+                    )
+                    current_status = RunnerRunning()
+                    event_sender.send(
+                        RunnerStatusUpdated(
+                            runner_id=runner_id, runner_status=current_status
+                        )
+                    )
+                    event_sender.send(TaskAcknowledged(task_id=task.task_id))
+                    assert inference_model
+                    assert tokenizer
+
+                    try:
+                        from mlx_lm.sample_utils import make_sampler
+
+                        from exo.worker.engines.mlx.constants import (
+                            KV_BITS,
+                            KV_GROUP_SIZE,
+                            MAX_TOKENS,
+                        )
+                        from exo.worker.engines.mlx.kv_transfer import (
+                            receive_kv_cache_auto_sync,
+                        )
+
+                        t_kv_wait_start = time.monotonic()
+                        received_caches, last_tokens = receive_kv_cache_auto_sync(
+                            kv_port
+                        )
+                        t_kv_wait_end = time.monotonic()
+                        logger.info(
+                            f"DISAGG_TIMING decode_kv_wait_ms={(t_kv_wait_end - t_kv_wait_start) * 1000:.1f} "
+                            f"layers={len(received_caches)}"
+                        )
+
+                        sampler = make_sampler(
+                            temp=task_params.temperature
+                            if task_params.temperature is not None
+                            else 0.7,
+                            top_p=task_params.top_p
+                            if task_params.top_p is not None
+                            else 1.0,
+                        )
+                        max_tokens = task_params.max_output_tokens or MAX_TOKENS
+
+                        t_decode_start = time.monotonic()
+
+                        raw_stream = stream_generate(
+                            model=cast(Model, inference_model),
+                            tokenizer=tokenizer,
+                            prompt=last_tokens,
+                            max_tokens=max_tokens,
+                            sampler=sampler,
+                            prompt_cache=received_caches,
+                            prefill_step_size=1,
+                            kv_group_size=KV_GROUP_SIZE,
+                            kv_bits=KV_BITS,
+                        )
+                        gen: Generator[
+                            GenerationResponse | ToolCallResponse, None, None
+                        ] = _wrap_stream_generate(raw_stream, t_decode_start)
+
+                        if tokenizer.has_thinking:
+                            gen = parse_thinking_models(
+                                gen, tokenizer, starts_in_thinking=False
+                            )
+                        if isinstance(inference_model, GptOssModel):
+                            gen = parse_gpt_oss(gen)
+                        elif (
+                            isinstance(inference_model, DeepseekV32Model)
+                            and "deepseek" in model_id.normalize().lower()
+                        ):
+                            gen = parse_deepseek_v32(gen)
+
+                        for response in gen:
+                            if device_rank == 0:
+                                match response:
+                                    case GenerationResponse() if (
+                                        response.finish_reason == "error"
+                                    ):
+                                        event_sender.send(
+                                            ChunkGenerated(
+                                                command_id=command_id,
+                                                chunk=ErrorChunk(
+                                                    error_message=response.text,
+                                                    model=model_id,
+                                                ),
+                                            )
+                                        )
+                                    case GenerationResponse():
+                                        assert response.finish_reason not in (
+                                            "error",
+                                            "tool_calls",
+                                            "function_call",
+                                        )
+                                        event_sender.send(
+                                            ChunkGenerated(
+                                                command_id=command_id,
+                                                chunk=TokenChunk(
+                                                    model=model_id,
+                                                    text=response.text,
+                                                    token_id=response.token,
+                                                    usage=response.usage,
+                                                    finish_reason=response.finish_reason,
+                                                    is_thinking=response.is_thinking,
+                                                ),
+                                            )
+                                        )
+                                    case ToolCallResponse():
+                                        event_sender.send(
+                                            ChunkGenerated(
+                                                command_id=command_id,
+                                                chunk=ToolCallChunk(
+                                                    tool_calls=response.tool_calls,
+                                                    model=model_id,
+                                                    usage=response.usage,
+                                                ),
+                                            )
+                                        )
+                            if (
+                                isinstance(response, GenerationResponse)
+                                and response.finish_reason is not None
+                            ):
+                                break
+
+                    except Exception as e:
+                        if device_rank == 0:
+                            event_sender.send(
+                                ChunkGenerated(
+                                    command_id=command_id,
+                                    chunk=ErrorChunk(
+                                        model=model_id,
+                                        finish_reason="error",
+                                        error_message=str(e),
+                                    ),
+                                )
+                            )
+                        raise
+
+                    current_status = RunnerReady()
+                    logger.info("runner ready")
+
                 case Shutdown():
                     current_status = RunnerShuttingDown()
                     logger.info("runner shutting down")
@@ -461,6 +808,29 @@ def main(
 
             if isinstance(current_status, RunnerShutdown):
                 break
+
+
+def _wrap_stream_generate(
+    raw_stream: Generator[Any, None, None],
+    t_decode_start: float,
+) -> Generator[GenerationResponse, None, None]:
+    """Wrap raw mlx_lm stream_generate output into GenerationResponse objects.
+
+    Also logs first-token timing for disaggregated decode.
+    """
+    t_first_token: float | None = None
+    for out in raw_stream:  # pyright: ignore[reportAny]
+        if t_first_token is None:
+            t_first_token = time.monotonic()
+            logger.info(
+                f"DISAGG_TIMING decode_first_token_ms={(t_first_token - t_decode_start) * 1000:.1f}"
+            )
+        yield GenerationResponse(
+            text=out.text,  # pyright: ignore[reportAny]
+            token=out.token,  # pyright: ignore[reportAny]
+            finish_reason=out.finish_reason,  # pyright: ignore[reportAny]
+            usage=None,
+        )
 
 
 @cache

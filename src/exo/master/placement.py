@@ -10,9 +10,10 @@ from exo.master.placement_utils import (
     get_mlx_jaccl_devices_matrix,
     get_mlx_ring_hosts_by_node,
     get_shard_assignments,
+    get_shard_assignments_for_tensor_parallel,
     get_smallest_cycles,
 )
-from exo.shared.models.model_cards import ModelId
+from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.shared.topology import Topology
 from exo.shared.types.commands import (
     CancelDownload,
@@ -29,20 +30,27 @@ from exo.shared.types.events import (
     TaskStatusUpdated,
 )
 from exo.shared.types.memory import Memory
-from exo.shared.types.profiling import MemoryUsage, NodeNetworkInfo
+from exo.shared.types.profiling import MemoryUsage, NodeIdentity, NodeNetworkInfo
 from exo.shared.types.tasks import Task, TaskId, TaskStatus
 from exo.shared.types.worker.downloads import (
     DownloadOngoing,
     DownloadProgress,
 )
 from exo.shared.types.worker.instances import (
+    DisaggregatedInstance,
     Instance,
     InstanceId,
     InstanceMeta,
     MlxJacclInstance,
     MlxRingInstance,
+    TensorPrefillDisaggInstance,
 )
-from exo.shared.types.worker.shards import Sharding
+from exo.shared.types.worker.runners import RunnerId, ShardAssignments
+from exo.shared.types.worker.shards import (
+    PipelineShardMetadata,
+    Sharding,
+    ShardMetadata,
+)
 
 
 def random_ephemeral_port() -> int:
@@ -194,6 +202,223 @@ def place_instance(
                 hosts_by_node=hosts_by_node,
                 ephemeral_port=ephemeral_port,
             )
+        case InstanceMeta.Disaggregated:
+            raise ValueError(
+                "Disaggregated instances should use place_disaggregated_instance()"
+            )
+        case InstanceMeta.TensorPrefillDisagg:
+            raise ValueError(
+                "TensorPrefillDisagg instances should use place_tensor_prefill_disagg_instance()"
+            )
+
+    return target_instances
+
+
+def place_disaggregated_instance(
+    model_card: ModelCard,
+    current_instances: Mapping[InstanceId, Instance],
+    node_identities: Mapping[NodeId, NodeIdentity],
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> dict[InstanceId, Instance]:
+    """Place a disaggregated prefill/decode instance across two nodes.
+
+    Identifies prefill node (DGX Spark / CUDA) and decode node (Apple Silicon)
+    from node identities. Both runners load the full model independently.
+    """
+    prefill_node_id: NodeId | None = None
+    decode_node_id: NodeId | None = None
+    non_apple_nodes: list[NodeId] = []
+
+    for node_id, identity in node_identities.items():
+        chip_lower = identity.chip_id.lower()
+        if "dgx-spark" in chip_lower or "cuda" in chip_lower or "nvidia" in chip_lower:
+            prefill_node_id = node_id
+        elif "apple" in chip_lower or chip_lower.startswith(("m3", "m4", "m2", "m1")):
+            decode_node_id = node_id
+        else:
+            non_apple_nodes.append(node_id)
+
+    # Fall back: use the first non-Apple node as prefill (e.g. Linux with unknown chip)
+    if prefill_node_id is None and len(non_apple_nodes) == 1:
+        prefill_node_id = non_apple_nodes[0]
+
+    if prefill_node_id is None:
+        raise ValueError("No prefill node (DGX Spark / CUDA) found in cluster")
+    if decode_node_id is None:
+        raise ValueError("No decode node (Apple Silicon) found in cluster")
+
+    # Find decode node IP (prefer ethernet)
+    decode_network = node_network.get(decode_node_id, NodeNetworkInfo())
+    decode_host: str | None = None
+    priority: dict[str, int] = {
+        "ethernet": 0,
+        "maybe_ethernet": 1,
+        "wifi": 2,
+        "unknown": 3,
+        "thunderbolt": 4,
+    }
+    for iface in sorted(
+        decode_network.interfaces,
+        key=lambda i: priority.get(i.interface_type, 3),
+    ):
+        if iface.ip_address and iface.ip_address != "127.0.0.1":
+            decode_host = iface.ip_address
+            break
+
+    if decode_host is None:
+        raise ValueError(f"Could not find IP address for decode node {decode_node_id}")
+
+    # Both runners get the full model (independent, no distributed comm)
+    prefill_runner_id = RunnerId()
+    decode_runner_id = RunnerId()
+
+    full_shard = PipelineShardMetadata(
+        model_card=model_card,
+        device_rank=0,
+        world_size=1,
+        start_layer=0,
+        end_layer=model_card.n_layers,
+        n_layers=model_card.n_layers,
+    )
+
+    shard_assignments = ShardAssignments(
+        model_id=model_card.model_id,
+        runner_to_shard={
+            prefill_runner_id: full_shard,
+            decode_runner_id: full_shard,
+        },
+        node_to_runner={
+            prefill_node_id: prefill_runner_id,
+            decode_node_id: decode_runner_id,
+        },
+    )
+
+    instance_id = InstanceId()
+    target_instances = dict(deepcopy(current_instances))
+    target_instances[instance_id] = DisaggregatedInstance(
+        instance_id=instance_id,
+        shard_assignments=shard_assignments,
+        prefill_node_id=prefill_node_id,
+        decode_node_id=decode_node_id,
+        decode_node_host=decode_host,
+    )
+
+    return target_instances
+
+
+def place_tensor_prefill_disagg_instance(
+    model_card: ModelCard,
+    topology: Topology,
+    current_instances: Mapping[InstanceId, Instance],
+    node_identities: Mapping[NodeId, NodeIdentity],
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> dict[InstanceId, Instance]:
+    """Place a tensor-parallel prefill + disaggregated decode instance.
+
+    Finds all NVIDIA/CUDA nodes for tensor-parallel prefill (connected via RDMA)
+    and an Apple Silicon node for decode. Prefill runners get TensorShardMetadata,
+    the decode runner gets PipelineShardMetadata (independent, world_size=1).
+    """
+    prefill_node_ids: list[NodeId] = []
+    decode_node_id: NodeId | None = None
+
+    for node_id, identity in node_identities.items():
+        chip_lower = identity.chip_id.lower()
+        if "dgx-spark" in chip_lower or "cuda" in chip_lower or "nvidia" in chip_lower:
+            prefill_node_ids.append(node_id)
+        elif "apple" in chip_lower or chip_lower.startswith(("m3", "m4", "m2", "m1")):
+            decode_node_id = node_id
+
+    if len(prefill_node_ids) < 2:
+        raise ValueError(
+            f"TensorPrefillDisagg requires at least 2 NVIDIA/CUDA nodes, found {len(prefill_node_ids)}"
+        )
+    if decode_node_id is None:
+        raise ValueError("No decode node (Apple Silicon) found in cluster")
+
+    # Find routable IP for NCCL bootstrap (rank 0 coordinator)
+    nccl_port = random_ephemeral_port()
+    coordinator_node = prefill_node_ids[0]
+    nccl_host_ip: str | None = None
+    coordinator_network = node_network.get(coordinator_node, NodeNetworkInfo())
+    for iface in coordinator_network.interfaces:
+        if (
+            iface.ip_address
+            and iface.ip_address not in ("127.0.0.1", "::1")
+            and not iface.ip_address.startswith("172.")
+            and not iface.ip_address.startswith("fe80:")
+        ):
+            nccl_host_ip = iface.ip_address
+            break
+    if nccl_host_ip is None:
+        raise ValueError(
+            f"Could not find routable IP for coordinator node {coordinator_node}"
+        )
+
+    # Build shard assignments: tensor shards for prefill, pipeline shard for decode
+    prefill_cycle = Cycle(node_ids=prefill_node_ids)
+    tp_assignments = get_shard_assignments_for_tensor_parallel(
+        model_card, prefill_cycle
+    )
+
+    # Add decode runner with independent pipeline shard
+    decode_runner_id = RunnerId()
+    decode_shard = PipelineShardMetadata(
+        model_card=model_card,
+        device_rank=0,
+        world_size=1,
+        start_layer=0,
+        end_layer=model_card.n_layers,
+        n_layers=model_card.n_layers,
+    )
+
+    runner_to_shard: dict[RunnerId, ShardMetadata] = dict(
+        tp_assignments.runner_to_shard
+    )
+    runner_to_shard[decode_runner_id] = decode_shard
+
+    node_to_runner: dict[NodeId, RunnerId] = dict(tp_assignments.node_to_runner)
+    node_to_runner[decode_node_id] = decode_runner_id
+
+    shard_assignments = ShardAssignments(
+        model_id=model_card.model_id,
+        runner_to_shard=runner_to_shard,
+        node_to_runner=node_to_runner,
+    )
+
+    # Find decode node IP
+    decode_network = node_network.get(decode_node_id, NodeNetworkInfo())
+    decode_host: str | None = None
+    priority: dict[str, int] = {
+        "ethernet": 0,
+        "maybe_ethernet": 1,
+        "wifi": 2,
+        "unknown": 3,
+        "thunderbolt": 4,
+    }
+    for iface in sorted(
+        decode_network.interfaces,
+        key=lambda i: priority.get(i.interface_type, 3),
+    ):
+        if iface.ip_address and iface.ip_address != "127.0.0.1":
+            decode_host = iface.ip_address
+            break
+
+    if decode_host is None:
+        raise ValueError(f"Could not find IP address for decode node {decode_node_id}")
+
+    instance_id = InstanceId()
+    target_instances = dict(deepcopy(current_instances))
+    target_instances[instance_id] = TensorPrefillDisaggInstance(
+        instance_id=instance_id,
+        shard_assignments=shard_assignments,
+        prefill_node_ids=prefill_node_ids,
+        nccl_host_ip=nccl_host_ip,
+        nccl_port=nccl_port,
+        decode_node_id=decode_node_id,
+        decode_node_host=decode_host,
+        kv_sender_node_id=prefill_node_ids[0],
+    )
 
     return target_instances
 

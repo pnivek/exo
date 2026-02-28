@@ -2,7 +2,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -44,8 +43,10 @@ from exo.shared.types.mlx import Model
 from exo.shared.types.text_generation import TextGenerationTaskParams
 from exo.shared.types.worker.instances import (
     BoundInstance,
+    DisaggregatedInstance,
     MlxJacclInstance,
     MlxRingInstance,
+    TensorPrefillDisaggInstance,
 )
 from exo.shared.types.worker.shards import (
     CfgShardMetadata,
@@ -92,20 +93,21 @@ class HostList(RootModel[list[str]]):
 
 def mlx_distributed_init(
     bound_instance: BoundInstance,
-) -> Group:
+) -> Group | None:
     """
     Initialize MLX distributed.
     """
     rank = bound_instance.bound_shard.device_rank
     logger.info(f"Starting initialization for rank {rank}")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        coordination_file = str(
-            Path(tmpdir) / f"hosts_{bound_instance.instance.instance_id}_{rank}.json"
-        )
+    coordination_file = None
+    try:
         # TODO: singleton instances
         match bound_instance.instance:
             case MlxRingInstance(hosts_by_node=hosts_by_node, ephemeral_port=_):
+                coordination_file = (
+                    f"./hosts_{bound_instance.instance.instance_id}_{rank}.json"
+                )
                 hosts_for_node = hosts_by_node[bound_instance.bound_node_id]
                 hosts_json = HostList.from_hosts(hosts_for_node).model_dump_json()
 
@@ -128,6 +130,9 @@ def mlx_distributed_init(
                     jaccl_devices[i][i] is None for i in range(len(jaccl_devices))
                 )
                 # Use RDMA connectivity matrix
+                coordination_file = (
+                    f"./hosts_{bound_instance.instance.instance_id}_{rank}.json"
+                )
                 jaccl_devices_json = json.dumps(jaccl_devices)
 
                 with open(coordination_file, "w") as f:
@@ -144,14 +149,41 @@ def mlx_distributed_init(
                 os.environ["MLX_JACCL_COORDINATOR"] = jaccl_coordinator
                 group = mx.distributed.init(backend="jaccl", strict=True)
 
+            case DisaggregatedInstance():
+                # No distributed backend for disaggregated inference
+                return None
+
+            case TensorPrefillDisaggInstance(
+                nccl_host_ip=nccl_host_ip,
+                nccl_port=nccl_port,
+                prefill_node_ids=prefill_node_ids,
+            ):
+                # Decode runner: no distributed backend
+                if not isinstance(bound_instance.bound_shard, TensorShardMetadata):
+                    return None
+                # Prefill runner: initialize NCCL
+                world_size = len(prefill_node_ids)
+                logger.info(
+                    f"rank {rank} NCCL init: host={nccl_host_ip}:{nccl_port} world_size={world_size}"
+                )
+                os.environ["NCCL_HOST_IP"] = nccl_host_ip
+                os.environ["NCCL_PORT"] = str(nccl_port)
+                os.environ["MLX_RANK"] = str(rank)
+                os.environ["MLX_WORLD_SIZE"] = str(world_size)
+                group = mx.distributed.init(backend="nccl", strict=True)
+
         logger.info(f"Rank {rank} mlx distributed initialization complete")
 
         return group
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            if coordination_file:
+                os.remove(coordination_file)
 
 
 def initialize_mlx(
     bound_instance: BoundInstance,
-) -> Group:
+) -> Group | None:
     # should we unseed it?
     # TODO: pass in seed from params
     mx.random.seed(42)
@@ -206,8 +238,6 @@ def load_mlx_items(
         )
 
     set_wired_limit_for_model(get_weights_size(bound_instance.bound_shard))
-
-    mx.clear_cache()
 
     return cast(Model, model), tokenizer
 

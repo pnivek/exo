@@ -46,6 +46,10 @@ from exo.master.adapters.responses import (
 )
 from exo.master.event_log import DiskEventLog
 from exo.master.image_store import ImageStore
+from exo.master.placement import (
+    place_disaggregated_instance,
+    place_tensor_prefill_disagg_instance,
+)
 from exo.master.placement import place_instance as get_instance_placements
 from exo.shared.apply import apply
 from exo.shared.constants import (
@@ -399,18 +403,34 @@ class API:
         model_card = await ModelCard.load(model_id)
 
         try:
-            placements = get_instance_placements(
-                PlaceInstance(
-                    model_card=model_card,
-                    sharding=sharding,
-                    instance_meta=instance_meta,
-                    min_nodes=min_nodes,
-                ),
-                node_memory=self.state.node_memory,
-                node_network=self.state.node_network,
-                topology=self.state.topology,
-                current_instances=self.state.instances,
-            )
+            if instance_meta == InstanceMeta.Disaggregated:
+                placements = place_disaggregated_instance(
+                    model_card,
+                    current_instances=self.state.instances,
+                    node_identities=self.state.node_identities,
+                    node_network=self.state.node_network,
+                )
+            elif instance_meta == InstanceMeta.TensorPrefillDisagg:
+                placements = place_tensor_prefill_disagg_instance(
+                    model_card,
+                    topology=self.state.topology,
+                    current_instances=self.state.instances,
+                    node_identities=self.state.node_identities,
+                    node_network=self.state.node_network,
+                )
+            else:
+                placements = get_instance_placements(
+                    PlaceInstance(
+                        model_card=model_card,
+                        sharding=sharding,
+                        instance_meta=instance_meta,
+                        min_nodes=min_nodes,
+                    ),
+                    node_memory=self.state.node_memory,
+                    node_network=self.state.node_network,
+                    topology=self.state.topology,
+                    current_instances=self.state.instances,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
