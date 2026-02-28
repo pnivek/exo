@@ -71,11 +71,6 @@ def entrypoint(
 
     import mlx.core as mx
 
-    # Increase CUDA graph cache to avoid thrashing during TP prefill with large prompts
-    if not mx.metal.is_available() and "MLX_CUDA_GRAPH_CACHE_SIZE" not in os.environ:
-        os.environ["MLX_CUDA_GRAPH_CACHE_SIZE"] = "2000"
-        logger.info("Set MLX_CUDA_GRAPH_CACHE_SIZE=2000")
-
     if mx.metal.is_available():
         fast_synch_override = os.environ.get("EXO_FAST_SYNCH")
         if fast_synch_override != "off":

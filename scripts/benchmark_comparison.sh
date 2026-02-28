@@ -23,7 +23,7 @@ set -euo pipefail
 MODEL_ID="mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
 TRIALS=3
 PROMPT_LENGTHS=(45 512 2048 8192 16384 32768)
-MAX_TOKENS=200
+MAX_TOKENS=500
 RESULTS_DIR="/tmp"
 
 # Parse arguments
