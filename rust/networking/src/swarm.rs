@@ -4,7 +4,7 @@ use crate::swarm::transport::tcp_transport;
 use crate::{alias, discovery};
 pub use behaviour::{Behaviour, BehaviourEvent};
 use futures_lite::{Stream, StreamExt};
-use libp2p::{PeerId, SwarmBuilder, gossipsub, identity, swarm::SwarmEvent};
+use libp2p::{Multiaddr, PeerId, SwarmBuilder, gossipsub, identity, swarm::SwarmEvent};
 use tokio::sync::{mpsc, oneshot};
 
 /// The current version of the network: this prevents devices running different versions of the
@@ -32,6 +32,10 @@ pub enum ToSwarm {
         topic: String,
         data: Vec<u8>,
         result_sender: oneshot::Sender<Result<gossipsub::MessageId, gossipsub::PublishError>>,
+    },
+    Dial {
+        addr: Multiaddr,
+        result_sender: oneshot::Sender<Result<(), String>>,
     },
 }
 pub enum FromSwarm {
@@ -110,6 +114,13 @@ fn on_message(swarm: &mut libp2p::Swarm<Behaviour>, message: ToSwarm) {
                 .behaviour_mut()
                 .gossipsub
                 .publish(gossipsub::IdentTopic::new(topic), data);
+            _ = result_sender.send(result);
+        }
+        ToSwarm::Dial {
+            addr,
+            result_sender,
+        } => {
+            let result = swarm.dial(addr).map_err(|e| e.to_string());
             _ = result_sender.send(result);
         }
     }

@@ -256,6 +256,27 @@ impl PyNetworkingHandle {
             .map_err(|_| PyErr::receiver_channel_closed())
     }
 
+    /// Dial a peer at a specific multiaddr (e.g. "/ip4/192.168.0.114/tcp/49382").
+    async fn dial_peer(&self, addr: String) -> PyResult<()> {
+        let (tx, rx) = oneshot::channel();
+        let multiaddr: libp2p::Multiaddr = addr
+            .parse()
+            .map_err(|e| PyRuntimeError::new_err(format!("Invalid multiaddr: {e}")))?;
+
+        self.to_swarm
+            .send_py(ToSwarm::Dial {
+                addr: multiaddr,
+                result_sender: tx,
+            })
+            .allow_threads_py()
+            .await?;
+
+        rx.allow_threads_py()
+            .await
+            .map_err(|_| PyErr::receiver_channel_closed())?
+            .map_err(|e| PyRuntimeError::new_err(format!("Dial failed: {e}")))
+    }
+
     /// Publishes a message with multiple topics to the `GossipSub` network.
     ///
     /// If no peers are found that subscribe to this topic, throws `NoPeersSubscribedToTopicError` exception.

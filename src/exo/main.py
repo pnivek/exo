@@ -40,6 +40,7 @@ class Node:
 
     node_id: NodeId
     offline: bool
+    dial_addrs: list[str] = field(default_factory=list)
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
 
     @classmethod
@@ -134,6 +135,7 @@ class Node:
             api,
             node_id,
             args.offline,
+            args.dial,
         )
 
     async def run(self):
@@ -152,6 +154,19 @@ class Node:
             if self.api:
                 tg.start_soon(self.api.run)
             tg.start_soon(self._elect_loop)
+            if self.dial_addrs:
+                tg.start_soon(self._dial_peers)
+
+    async def _dial_peers(self):
+        # Wait briefly for the router/swarm to start listening
+        await anyio.sleep(2)
+        for addr in self.dial_addrs:
+            try:
+                logger.info(f"Dialing peer at {addr}")
+                await self.router._net.dial_peer(addr)  # pyright: ignore[reportPrivateUsage]
+                logger.info(f"Dial initiated for {addr}")
+            except Exception as e:
+                logger.error(f"Failed to dial {addr}: {e}")
 
     def shutdown(self):
         # if this is our second call to shutdown, just sys.exit
@@ -299,6 +314,7 @@ class Args(CamelCaseModel):
     no_downloads: bool = False
     offline: bool = os.getenv("EXO_OFFLINE", "false").lower() == "true"
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
+    dial: list[str] = []
 
     @classmethod
     def parse(cls) -> Self:
@@ -364,6 +380,12 @@ class Args(CamelCaseModel):
             action="store_false",
             dest="fast_synch",
             help="Force MLX FAST_SYNCH off",
+        )
+        parser.add_argument(
+            "--dial",
+            action="append",
+            default=[],
+            help="Dial a peer at a specific multiaddr (e.g. /ip4/192.168.0.114/tcp/49382). Can be specified multiple times.",
         )
 
         args = parser.parse_args()

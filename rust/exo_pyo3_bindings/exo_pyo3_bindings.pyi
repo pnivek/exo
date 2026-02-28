@@ -58,8 +58,12 @@ class NetworkingHandle:
     async def gossipsub_publish(self, topic: builtins.str, data: bytes) -> None:
         r"""
         Publishes a message with multiple topics to the `GossipSub` network.
-        
+
         If no peers are found that subscribe to this topic, throws `NoPeersSubscribedToTopicError` exception.
+        """
+    async def dial_peer(self, addr: builtins.str) -> None:
+        r"""
+        Dial a peer at a specific multiaddr (e.g. "/ip4/192.168.0.114/tcp/49382").
         """
     async def recv(self) -> PyFromSwarm: ...
 
