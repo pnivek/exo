@@ -47,7 +47,11 @@ from exo.shared.types.tasks import (
     TextGeneration,
 )
 from exo.shared.types.text_generation import TextGenerationTaskParams
-from exo.shared.types.worker.instances import BoundInstance, TensorPrefillDisaggInstance
+from exo.shared.types.worker.instances import (
+    BoundInstance,
+    DisaggregatedInstance,
+    TensorPrefillDisaggInstance,
+)
 from exo.shared.types.worker.runner_response import (
     GenerationResponse,
     ToolCallItem,
@@ -118,6 +122,7 @@ def main(
     group = None
     kv_prefix_cache: KVPrefixCache | None = None
     check_for_cancel_every: int | None = None
+    kv_transfer_server = None  # persistent KV receiver for disagg decode
 
     current_status: RunnerStatus = RunnerIdle()
     logger.info("runner created")
@@ -253,6 +258,27 @@ def main(
                     logger.info(
                         f"runner initialized in {time.time() - setup_start_time} seconds"
                     )
+
+                    # Start persistent KV transfer server for disagg decode runners.
+                    # The server binds once and stays listening across requests,
+                    # so the prefill node can always connect immediately.
+                    if isinstance(
+                        instance, (DisaggregatedInstance, TensorPrefillDisaggInstance)
+                    ):
+                        from exo.worker.engines.mlx.kv_transfer import (
+                            KV_TRANSFER_PORT,
+                            KVTransferServer,
+                        )
+
+                        is_decode_runner = isinstance(
+                            instance, DisaggregatedInstance
+                        ) and (bound_instance.bound_node_id == instance.decode_node_id)
+                        is_tp_decode_runner = isinstance(
+                            instance, TensorPrefillDisaggInstance
+                        ) and (bound_instance.bound_node_id == instance.decode_node_id)
+                        if is_decode_runner or is_tp_decode_runner:
+                            kv_transfer_server = KVTransferServer(KV_TRANSFER_PORT)
+
                     current_status = RunnerReady()
                     logger.info("runner ready")
                 case TextGeneration(task_params=task_params, command_id=command_id) if (
@@ -651,13 +677,18 @@ def main(
                             MAX_TOKENS,
                         )
                         from exo.worker.engines.mlx.kv_transfer import (
+                            KVTransferServer,
                             receive_kv_cache_auto_sync,
                         )
 
                         t_kv_wait_start = time.monotonic()
-                        received_caches, last_tokens = receive_kv_cache_auto_sync(
-                            kv_port
-                        )
+                        if kv_transfer_server is not None:
+                            received_caches, last_tokens = kv_transfer_server.receive()
+                        else:
+                            # Fallback for unexpected cases
+                            received_caches, last_tokens = receive_kv_cache_auto_sync(
+                                kv_port
+                            )
                         t_kv_wait_end = time.monotonic()
                         logger.info(
                             f"DISAGG_TIMING decode_kv_wait_ms={(t_kv_wait_end - t_kv_wait_start) * 1000:.1f} "
@@ -774,6 +805,9 @@ def main(
                 case Shutdown():
                     current_status = RunnerShuttingDown()
                     logger.info("runner shutting down")
+                    if kv_transfer_server is not None:
+                        kv_transfer_server.close()
+                        kv_transfer_server = None
                     if not TYPE_CHECKING:
                         del inference_model, tokenizer, group
                         mx.clear_cache()

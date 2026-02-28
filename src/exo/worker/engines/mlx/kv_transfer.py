@@ -11,6 +11,7 @@ Supports two protocols:
 """
 
 import asyncio
+import contextlib
 import queue
 import socket
 import struct
@@ -922,55 +923,79 @@ async def receive_kv_cache_auto(port: int) -> tuple[list[KVCache], mx.array]:
     return caches, last_tokens
 
 
-def receive_kv_cache_auto_sync(port: int) -> tuple[list[KVCache], mx.array]:
-    """Synchronous auto-detecting receiver using raw sockets.
+class KVTransferServer:
+    """Persistent TCP server for receiving KV caches across multiple requests.
 
-    Listens for one connection, reads the first 4 bytes to detect protocol:
-    - b"KVPS" → pipelined protocol (raw socket frames)
-    - otherwise → bulk protocol (8-byte length + NPZ blob)
+    Binds the port once at construction and accepts connections on each
+    ``receive()`` call.  This eliminates the race between prefill sender
+    and decode receiver that occurred when a fresh server was created per
+    request — the port is always listening.
     """
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind(("0.0.0.0", port))
-    server_sock.listen(1)
-    logger.info(f"KV cache transfer server listening on port {port} (auto-detect)")
 
-    conn, addr = server_sock.accept()  # pyright: ignore[reportAny]
-    logger.info(f"KV transfer connection from {addr}")
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind(("0.0.0.0", port))
+        self._server.listen(1)
+        logger.info(f"KV transfer server listening on port {port} (persistent)")
 
+    def receive(self) -> tuple[list[KVCache], mx.array]:
+        """Block until a prefill node connects and sends a KV cache."""
+        conn, addr = self._server.accept()  # pyright: ignore[reportAny]
+        logger.info(f"KV transfer connection from {addr}")
+        try:
+            return _receive_one_connection(conn)
+        finally:
+            conn.close()
+
+    def close(self) -> None:
+        with contextlib.suppress(OSError):
+            self._server.close()
+        logger.info(f"KV transfer server on port {self.port} closed")
+
+
+def _receive_one_connection(
+    conn: socket.socket,
+) -> tuple[list[KVCache], mx.array]:
+    """Auto-detect protocol and receive a KV cache from an accepted connection."""
+    magic_or_header = _recvall(conn, 4)
+
+    if magic_or_header == _MAGIC:
+        return _receive_pipelined(conn)
+
+    # Bulk protocol — first 4 bytes are the high half of an 8-byte length
+    rest = _recvall(conn, 4)
+    length_bytes = magic_or_header + rest
+    length: int = struct.unpack("!Q", length_bytes)[0]  # pyright: ignore[reportAny]
+    kv_size_mb = length / 1024 / 1024
+    logger.info(f"Receiving KV cache (bulk): {kv_size_mb:.1f} MB")
+
+    t_recv_start = time.monotonic()
+    data = _recvall(conn, length)
+    t_recv_end = time.monotonic()
+    recv_ms = (t_recv_end - t_recv_start) * 1000
+    logger.info(
+        f"DISAGG_TIMING kv_network_recv_ms={recv_ms:.1f} kv_size_mb={kv_size_mb:.2f}"
+    )
+
+    t_deser_start = time.monotonic()
+    caches, last_tokens = deserialize_kv_cache(data)
+    t_deser_end = time.monotonic()
+    logger.info(
+        f"DISAGG_TIMING kv_deserialize_ms={(t_deser_end - t_deser_start) * 1000:.1f}"
+    )
+    return caches, last_tokens
+
+
+def receive_kv_cache_auto_sync(port: int) -> tuple[list[KVCache], mx.array]:
+    """One-shot synchronous receiver (legacy convenience wrapper).
+
+    Creates a throwaway server, accepts one connection, and closes.
+    Prefer ``KVTransferServer`` for production use.
+    """
+    server = KVTransferServer(port)
     try:
-        # Read first 4 bytes to detect protocol
-        magic_or_header = _recvall(conn, 4)
-
-        if magic_or_header == _MAGIC:
-            # Pipelined protocol
-            result = _receive_pipelined(conn)
-        else:
-            # Bulk protocol — first 4 bytes are the high half of an 8-byte length
-            rest = _recvall(conn, 4)
-            length_bytes = magic_or_header + rest
-            length: int = struct.unpack("!Q", length_bytes)[0]  # pyright: ignore[reportAny]
-            kv_size_mb = length / 1024 / 1024
-            logger.info(f"Receiving KV cache (bulk): {kv_size_mb:.1f} MB")
-
-            t_recv_start = time.monotonic()
-            data = _recvall(conn, length)
-            t_recv_end = time.monotonic()
-            recv_ms = (t_recv_end - t_recv_start) * 1000
-            logger.info(
-                f"DISAGG_TIMING kv_network_recv_ms={recv_ms:.1f} "
-                f"kv_size_mb={kv_size_mb:.2f}"
-            )
-
-            t_deser_start = time.monotonic()
-            caches, last_tokens = deserialize_kv_cache(data)
-            t_deser_end = time.monotonic()
-            logger.info(
-                f"DISAGG_TIMING kv_deserialize_ms={(t_deser_end - t_deser_start) * 1000:.1f}"
-            )
-            result = caches, last_tokens
+        return server.receive()
     finally:
-        conn.close()
-        server_sock.close()
-
-    return result
+        server.close()
