@@ -246,7 +246,7 @@
     const sizeScale =
       numNodes === 1 ? 1 : Math.max(0.6, 1 - (numNodes - 1) * 0.1);
     const baseNodeRadius = isMinimized
-      ? Math.max(36, Math.min(60, minDimension * 0.22))
+      ? Math.max(28, Math.min(48, minDimension * 0.16))
       : Math.min(120, minDimension * 0.2);
     const nodeRadius = baseNodeRadius * sizeScale;
 
@@ -270,8 +270,8 @@
     const showCompactLabels = !isMinimized && numNodes > 4;
 
     // Add padding for labels (top/bottom)
-    const topPadding = 80; // Space for "NETWORK TOPOLOGY" label and node names
-    const bottomPadding = 80; // Space for stats and bottom label
+    const topPadding = isMinimized ? 30 : 80; // Space for "NETWORK TOPOLOGY" label and node names
+    const bottomPadding = isMinimized ? 25 : 80; // Space for stats and bottom label
     const safeCenterY = topPadding + (height - topPadding - bottomPadding) / 2;
 
     // Calculate node positions
@@ -291,15 +291,16 @@
         const result: { id: string; data: NodeInfo; x: number; y: number }[] =
           [];
 
+        const maxSpacing = isMinimized ? nodeRadius * 3 : nodeRadius * 3.5;
         leftIds.forEach((id, i) => {
-          const spacing = Math.min(nodeRadius * 3.5, (height - topPadding - bottomPadding) / Math.max(leftIds.length + 1, 2));
+          const spacing = Math.min(maxSpacing, (height - topPadding - bottomPadding) / Math.max(leftIds.length + 1, 2));
           const totalH = (leftIds.length - 1) * spacing;
           const y = safeCenterY - totalH / 2 + i * spacing;
           result.push({ id, data: nodes[id], x: leftX, y });
         });
 
         rightIds.forEach((id, i) => {
-          const spacing = Math.min(nodeRadius * 3.5, (height - topPadding - bottomPadding) / Math.max(rightIds.length + 1, 2));
+          const spacing = Math.min(maxSpacing, (height - topPadding - bottomPadding) / Math.max(rightIds.length + 1, 2));
           const totalH = (rightIds.length - 1) * spacing;
           const y = safeCenterY - totalH / 2 + i * spacing;
           result.push({ id, data: nodes[id], x: rightX, y });
@@ -424,12 +425,12 @@
               .attr("stroke", acRgba(0.3))
               .attr("stroke-width", 1)
               .attr("stroke-dasharray", "3,2");
-            // NCCL label
+            // NCCL label — positioned just left of the connecting edge
             svg
               .append("text")
-              .attr("x", (p1.x + p2.x) / 2 - nodeRadius * 0.7)
+              .attr("x", Math.min(p1.x, p2.x) - nodeRadius * 0.15)
               .attr("y", (p1.y + p2.y) / 2)
-              .attr("text-anchor", "middle")
+              .attr("text-anchor", "end")
               .attr("dominant-baseline", "middle")
               .attr("font-size", isMinimized ? 7 : 9)
               .attr("font-family", "SF Mono, monospace")
@@ -490,36 +491,38 @@
           .text("KV TRANSFER");
       }
 
-      // PREFILL / DECODE group labels
-      if (leftIds.length > 0) {
-        const topLeftY = Math.min(
-          ...leftIds.map((id) => positionById[id]?.y ?? 0),
-        );
-        svg
-          .append("text")
-          .attr("x", positionById[leftIds[0]]?.x ?? 0)
-          .attr("y", topLeftY - nodeRadius * 0.8 - 12)
-          .attr("text-anchor", "middle")
-          .attr("font-size", isMinimized ? 8 : 11)
-          .attr("font-family", "SF Mono, monospace")
-          .attr("fill", acRgba(0.7))
-          .attr("letter-spacing", "0.15em")
-          .text("PREFILL");
-      }
-      if (rightIds.length > 0) {
-        const topRightY = Math.min(
-          ...rightIds.map((id) => positionById[id]?.y ?? 0),
-        );
-        svg
-          .append("text")
-          .attr("x", positionById[rightIds[0]]?.x ?? 0)
-          .attr("y", topRightY - nodeRadius * 0.8 - 12)
-          .attr("text-anchor", "middle")
-          .attr("font-size", isMinimized ? 8 : 11)
-          .attr("font-family", "SF Mono, monospace")
-          .attr("fill", acRgba(0.7))
-          .attr("letter-spacing", "0.15em")
-          .text("DECODE");
+      // PREFILL / DECODE group labels (skip in minimized — saves vertical space)
+      if (!isMinimized) {
+        if (leftIds.length > 0) {
+          const topLeftY = Math.min(
+            ...leftIds.map((id) => positionById[id]?.y ?? 0),
+          );
+          svg
+            .append("text")
+            .attr("x", positionById[leftIds[0]]?.x ?? 0)
+            .attr("y", topLeftY - nodeRadius * 0.8 - 12)
+            .attr("text-anchor", "middle")
+            .attr("font-size", 11)
+            .attr("font-family", "SF Mono, monospace")
+            .attr("fill", acRgba(0.7))
+            .attr("letter-spacing", "0.15em")
+            .text("PREFILL");
+        }
+        if (rightIds.length > 0) {
+          const topRightY = Math.min(
+            ...rightIds.map((id) => positionById[id]?.y ?? 0),
+          );
+          svg
+            .append("text")
+            .attr("x", positionById[rightIds[0]]?.x ?? 0)
+            .attr("y", topRightY - nodeRadius * 0.8 - 12)
+            .attr("text-anchor", "middle")
+            .attr("font-size", 11)
+            .attr("font-family", "SF Mono, monospace")
+            .attr("fill", acRgba(0.7))
+            .attr("letter-spacing", "0.15em")
+            .text("DECODE");
+        }
       }
 
       // Still collect IP labels from edges
@@ -617,8 +620,8 @@
       }
     });
 
-    // Render debug labels at viewport edges/corners
-    if (debugEdgeLabels && debugEdgeLabels.length > 0) {
+    // Render debug labels at viewport edges/corners (hide in minimized mode — they eat too much space)
+    if (!isMinimized && debugEdgeLabels && debugEdgeLabels.length > 0) {
       const fontSize = isMinimized ? 10 : 12;
       const lineHeight = fontSize + 4;
       const padding = 10;
@@ -1284,7 +1287,7 @@
         const fontSize = 8;
 
         // Friendly name (shortened) above icon
-        const nameY = nodeInfo.y - iconBaseHeight / 2 - 14;
+        const nameY = nodeInfo.y - iconBaseHeight / 2 - 10;
         const shortName =
           friendlyName.length > 12
             ? friendlyName.slice(0, 10) + ".."
@@ -1300,27 +1303,17 @@
           .attr("font-family", "SF Mono, Monaco, monospace")
           .text(shortName);
 
-        // Memory info below icon - used in grey, total in yellow (same as main topology)
-        const infoY = nodeInfo.y + iconBaseHeight / 2 + 18;
-        const memTextMini = nodeG
+        // Memory info below icon — compact percentage in minimized mode
+        const infoY = nodeInfo.y + iconBaseHeight / 2 + 14;
+        nodeG
           .append("text")
           .attr("x", nodeInfo.x)
           .attr("y", infoY)
           .attr("text-anchor", "middle")
           .attr("font-size", fontSize * 0.85)
-          .attr("font-family", "SF Mono, Monaco, monospace");
-        memTextMini
-          .append("tspan")
-          .attr("fill", acRgba(0.9))
-          .text(`${formatBytes(ramUsed)}`);
-        memTextMini
-          .append("tspan")
-          .attr("fill", "rgba(179,179,179,0.9)")
-          .text(`/${formatBytes(ramTotal)}`);
-        memTextMini
-          .append("tspan")
-          .attr("fill", "rgba(179,179,179,0.7)")
-          .text(` (${ramUsagePercent.toFixed(0)}%)`);
+          .attr("font-family", "SF Mono, Monaco, monospace")
+          .attr("fill", acRgba(0.8))
+          .text(`${formatBytes(ramUsed)}/${formatBytes(ramTotal)} (${ramUsagePercent.toFixed(0)}%)`);
       }
 
       // Debug mode: Show TB bridge and RDMA status
