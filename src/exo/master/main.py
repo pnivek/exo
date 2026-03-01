@@ -1,3 +1,4 @@
+import time
 from datetime import datetime, timedelta, timezone
 
 import anyio
@@ -110,6 +111,9 @@ class Master:
         self._event_log = DiskEventLog(EXO_EVENT_LOG_DIR / "master")
         self._pending_traces: dict[TaskId, dict[int, list[TraceEventData]]] = {}
         self._expected_ranks: dict[TaskId, set[int]] = {}
+        # Deduplication: track last processed time per (node_id, info_type) to throttle NodeGatheredInfo
+        self._last_gathered_info: dict[tuple[str, str], float] = {}
+        self._gathered_info_cooldown: float = 5.0  # seconds
 
     async def run(self):
         logger.info("Starting Master")
@@ -532,6 +536,16 @@ class Master:
                     if isinstance(event, TracesCollected):
                         await self._handle_traces_collected(event)
                         continue
+
+                    # Deduplicate NodeGatheredInfo: skip if same (node, info_type) was processed recently
+                    if isinstance(event, NodeGatheredInfo):
+                        info_type_name = type(event.info).__name__
+                        dedup_key = (event.node_id, info_type_name)
+                        now_mono = time.monotonic()
+                        last_time = self._last_gathered_info.get(dedup_key, 0.0)
+                        if now_mono - last_time < self._gathered_info_cooldown:
+                            continue
+                        self._last_gathered_info[dedup_key] = now_mono
 
                     logger.debug(f"Master indexing event: {str(event)[:100]}")
                     indexed = IndexedEvent(event=event, idx=len(self._event_log))
