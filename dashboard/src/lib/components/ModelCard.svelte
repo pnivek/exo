@@ -278,7 +278,7 @@
     const iconSize = numNodes === 1 ? 50 : 36;
     const topoWidth = 260;
     const topoHeight =
-      numNodes === 1 ? 90 : numNodes === 2 ? 140 : numNodes * 65 + 20;
+      numNodes === 1 ? 90 : numNodes === 2 ? 140 : numNodes * 75 + 20;
     const centerX = topoWidth / 2;
     const centerY = topoHeight / 2;
     const radius =
@@ -355,7 +355,7 @@
     if (isDisaggRuntime && leftArray.length > 0 && rightArray.length > 0) {
       const leftX = topoWidth * 0.25;
       const rightX = topoWidth * 0.75;
-      const spacing = 75;
+      const spacing = 90;
 
       const buildGroup = (
         group: typeof nodeArray,
