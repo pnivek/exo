@@ -153,10 +153,12 @@ fn filter_swarm_event(event: SwarmEvent<BehaviourEvent>) -> Option<FromSwarm> {
     }
 }
 
-/// Create and configure a swarm which listens to all ports on OS
+/// Create and configure a swarm which listens on all interfaces.
+/// If `port` is 0, the OS assigns a random available port.
 pub fn create_swarm(
     keypair: identity::Keypair,
     from_client: mpsc::Receiver<ToSwarm>,
+    port: u16,
 ) -> alias::AnyResult<Swarm> {
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -164,8 +166,8 @@ pub fn create_swarm(
         .with_behaviour(Behaviour::new)?
         .build();
 
-    // Listen on all interfaces and whatever port the OS assigns
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    let addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{port}").parse()?;
+    swarm.listen_on(addr)?;
     Ok(Swarm { swarm, from_client })
 }
 

@@ -49,7 +49,7 @@ class Node:
         keypair = get_node_id_keypair()
         node_id = NodeId(keypair.to_node_id())
         session_id = SessionId(master_node_id=node_id, election_clock=0)
-        router = Router.create(keypair)
+        router = Router.create(keypair, listen_port=args.listen_port)
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
         await router.register_topic(topics.COMMANDS)
@@ -162,12 +162,27 @@ class Node:
         # Wait briefly for the router/swarm to start listening
         await anyio.sleep(2)
         for addr in self.dial_addrs:
-            try:
-                logger.info(f"Dialing peer at {addr}")
-                await self.router._net.dial_peer(addr)  # pyright: ignore[reportPrivateUsage]
-                logger.info(f"Dial initiated for {addr}")
-            except Exception as e:
-                logger.error(f"Failed to dial {addr}: {e}")
+            max_retries = 5
+            base_delay = 2.0
+            for attempt in range(max_retries):
+                try:
+                    logger.info(
+                        f"Dialing peer at {addr} (attempt {attempt + 1}/{max_retries})"
+                    )
+                    await self.router._net.dial_peer(addr)  # pyright: ignore[reportPrivateUsage]
+                    logger.info(f"Dial initiated for {addr}")
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (1 << attempt)
+                        logger.warning(
+                            f"Failed to dial {addr}: {e} — retrying in {delay:.0f}s"
+                        )
+                        await anyio.sleep(delay)
+                    else:
+                        logger.error(
+                            f"Failed to dial {addr} after {max_retries} attempts: {e}"
+                        )
 
     def shutdown(self):
         # if this is our second call to shutdown, just sys.exit
@@ -327,6 +342,7 @@ class Args(CamelCaseModel):
     no_downloads: bool = False
     offline: bool = os.getenv("EXO_OFFLINE", "false").lower() == "true"
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
+    listen_port: int = 0  # 0 = OS-assigned random port
     dial: list[str] = []
 
     @classmethod
@@ -393,6 +409,13 @@ class Args(CamelCaseModel):
             action="store_false",
             dest="fast_synch",
             help="Force MLX FAST_SYNCH off",
+        )
+        parser.add_argument(
+            "--listen-port",
+            type=int,
+            default=0,
+            dest="listen_port",
+            help="Fixed libp2p listen port (default: 0 = OS-assigned random port). Use a fixed port to avoid the port-discovery dance when dialing peers.",
         )
         parser.add_argument(
             "--dial",

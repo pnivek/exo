@@ -342,6 +342,7 @@ class API:
         self.app.get("/ollama/api/version")(self.ollama_version)
 
         self.app.get("/state")(lambda: self.state)
+        self.app.get("/health")(self.health_check)
         self.app.get("/events")(self.stream_events)
         self.app.post("/download/start")(self.start_download)
         self.app.delete("/download/{node_id}/{model_id:path}")(self.delete_download)
@@ -352,6 +353,19 @@ class API:
         self.app.get("/v1/traces/{task_id}/raw")(self.get_trace_raw)
         self.app.get("/onboarding")(self.get_onboarding)
         self.app.post("/onboarding")(self.complete_onboarding)
+
+    async def health_check(self) -> JSONResponse:
+        """Health check endpoint. Returns 200 when the API is ready to serve requests."""
+        node_count = len(list(self.state.topology.list_nodes()))
+        is_healthy = not self.paused
+        return JSONResponse(
+            {
+                "status": "ok" if is_healthy else "paused",
+                "node_count": node_count,
+                "paused": self.paused,
+            },
+            status_code=200 if is_healthy else 503,
+        )
 
     async def place_instance(self, payload: PlaceInstanceParams):
         command = PlaceInstance(
