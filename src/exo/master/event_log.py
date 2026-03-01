@@ -111,6 +111,8 @@ class DiskEventLog:
         self._cache_offset(target_idx, f.tell())
 
     def append(self, event: Event) -> None:
+        if self._file.closed:
+            return
         packed = _serialize_event(event)
         self._file.write(len(packed).to_bytes(_HEADER_SIZE, byteorder="big"))
         self._file.write(packed)
@@ -120,6 +122,9 @@ class DiskEventLog:
         """Yield events from index start (inclusive) to end (exclusive)."""
         end = min(end, self._count)
         if start < 0 or end < 0 or start >= end:
+            return
+
+        if self._file.closed or not self._active_path.exists():
             return
 
         self._file.flush()
@@ -138,6 +143,8 @@ class DiskEventLog:
     def read_all(self) -> Iterator[Event]:
         """Yield all events from the log one at a time."""
         if self._count == 0:
+            return
+        if self._file.closed or not self._active_path.exists():
             return
         self._file.flush()
         with open(self._active_path, "rb") as f:
