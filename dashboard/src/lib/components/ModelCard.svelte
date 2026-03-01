@@ -278,7 +278,7 @@
     const iconSize = numNodes === 1 ? 50 : 36;
     const topoWidth = 260;
     const topoHeight =
-      numNodes === 1 ? 90 : numNodes === 2 ? 140 : numNodes * 50 + 20;
+      numNodes === 1 ? 90 : numNodes === 2 ? 140 : numNodes * 65 + 20;
     const centerX = topoWidth / 2;
     const centerY = topoHeight / 2;
     const radius =
@@ -355,7 +355,7 @@
     if (isDisaggRuntime && leftArray.length > 0 && rightArray.length > 0) {
       const leftX = topoWidth * 0.25;
       const rightX = topoWidth * 0.75;
-      const spacing = 55;
+      const spacing = 75;
 
       const buildGroup = (
         group: typeof nodeArray,
@@ -652,37 +652,43 @@
     </div>
 
     <!-- Configuration Badge -->
-    <div class="flex items-center gap-1.5 mb-2">
-      <span
-        class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
-        title={sharding === "Pipeline"
-          ? "Pipeline: splits model into sequential stages across devices. Lower network overhead."
-          : "Tensor: splits each layer across devices. Best with high-bandwidth connections (Thunderbolt)."}
-      >
-        {runtime === "TensorPrefillDisagg" ? "Tensor Parallel" : sharding}
-      </span>
-      <span
-        class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
-        title={runtime === "MlxRing"
-          ? "Ring: standard networking. Works over any connection (Wi-Fi, Ethernet, Thunderbolt)."
-          : runtime === "MlxJaccl"
-            ? "RDMA: direct memory access over Thunderbolt. Significantly faster for multi-device inference."
-            : runtime === "Disaggregated"
-              ? "KV Transfer: streams KV cache from CUDA prefill to Metal decode."
-              : runtime === "TensorPrefillDisagg"
-                ? "NCCL: tensor-parallel prefill across multiple CUDA devices."
-                : ""}
-      >
-        {runtime === "MlxRing"
-          ? "MLX Ring"
-          : runtime === "MlxJaccl"
-            ? "MLX RDMA"
-            : runtime === "Disaggregated"
-              ? "KV Transfer"
-              : runtime === "TensorPrefillDisagg"
-                ? "NCCL"
-                : runtime}
-      </span>
+    <div class="flex items-center gap-1.5 mb-2 flex-wrap">
+      {#if runtime === "Disaggregated"}
+        <span
+          class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
+          title="Single Prefill: one CUDA device runs all prefill layers, full model loaded independently."
+        >Single Prefill</span>
+        <span
+          class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
+          title="KV Stream: streams KV cache from CUDA prefill to Metal decode."
+        >KV Stream</span>
+      {:else if runtime === "TensorPrefillDisagg"}
+        <span
+          class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
+          title="Tensor Prefill: prefill layers split across multiple CUDA devices via tensor parallelism."
+        >Tensor Prefill</span>
+        <span
+          class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
+          title="KV Stream: streams KV cache from CUDA prefill to Metal decode."
+        >KV Stream</span>
+        <span
+          class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
+          title="NCCL: NVIDIA Collective Communications Library for inter-GPU tensor exchange."
+        >NCCL</span>
+      {:else}
+        <span
+          class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
+          title={sharding === "Pipeline"
+            ? "Pipeline: splits model into sequential stages across devices. Lower network overhead."
+            : "Tensor: splits each layer across devices. Best with high-bandwidth connections (Thunderbolt)."}
+        >{sharding}</span>
+        <span
+          class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
+          title={runtime === "MlxRing"
+            ? "Ring: standard networking. Works over any connection (Wi-Fi, Ethernet, Thunderbolt)."
+            : "RDMA: direct memory access over Thunderbolt. Significantly faster for multi-device inference."}
+        >{runtime === "MlxRing" ? "MLX Ring" : "MLX RDMA"}</span>
+      {/if}
     </div>
 
     <!-- Download Status -->
@@ -776,34 +782,37 @@
               <!-- KV TRANSFER label -->
               <text
                 x={(arrowStartX + arrowEndX) / 2}
-                y={arrowY - 6}
+                y={arrowY - 7}
                 text-anchor="middle"
-                font-size="6"
+                font-size="7"
                 font-family="SF Mono, Monaco, monospace"
                 fill={acRgba(0.5)}
-              >KV TRANSFER</text>
+                letter-spacing="0.05em"
+              >KV STREAM</text>
 
               <!-- NCCL link between CUDA nodes (if TP) -->
               {#if 'hasNcclGroup' in preview && preview.hasNcclGroup}
                 {@const cudaNodes = preview.nodes.filter((n) => isNvidiaNode(n.id))}
+                {@const hexEdge = cudaNodes[0]?.iconSize * 0.5 ?? 16}
                 {#each cudaNodes.slice(0, -1) as node, i}
                   {@const nextNode = cudaNodes[i + 1]}
                   <line
                     x1={node.x}
-                    y1={node.y + 16}
+                    y1={node.y + hexEdge}
                     x2={nextNode.x}
-                    y2={nextNode.y - 16}
+                    y2={nextNode.y - hexEdge}
                     stroke={acRgba(0.3)}
                     stroke-width="1"
                     stroke-dasharray="3,2"
                   />
                   <text
-                    x={node.x - 22}
+                    x={node.x + 12}
                     y={(node.y + nextNode.y) / 2}
-                    text-anchor="end"
-                    font-size="5"
+                    text-anchor="middle"
+                    dominant-baseline="middle"
+                    font-size="7"
                     font-family="SF Mono, Monaco, monospace"
-                    fill={acRgba(0.4)}
+                    fill={acRgba(0.5)}
                   >NCCL</text>
                 {/each}
               {/if}

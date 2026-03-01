@@ -269,9 +269,10 @@
     const showFullLabels = !isMinimized && numNodes <= 4;
     const showCompactLabels = !isMinimized && numNodes > 4;
 
-    // Add padding for labels (top/bottom)
-    const topPadding = isMinimized ? 30 : 80; // Space for "NETWORK TOPOLOGY" label and node names
-    const bottomPadding = isMinimized ? 25 : 80; // Space for stats and bottom label
+    // Add padding for labels (top/bottom) — flow layout needs less since PREFILL/DECODE labels are compact
+    const isFlow = layoutMode === "flow" && flowGroups;
+    const topPadding = isMinimized ? 30 : isFlow ? 50 : 80;
+    const bottomPadding = isMinimized ? 25 : isFlow ? 40 : 80;
     const safeCenterY = topPadding + (height - topPadding - bottomPadding) / 2;
 
     // Calculate node positions
@@ -286,21 +287,21 @@
         );
         rightIds.push(...unassigned);
 
-        const leftX = width * 0.35;
-        const rightX = width * 0.65;
+        const leftX = isMinimized ? width * 0.25 : width * 0.35;
+        const rightX = isMinimized ? width * 0.75 : width * 0.65;
         const result: { id: string; data: NodeInfo; x: number; y: number }[] =
           [];
 
-        const maxSpacing = isMinimized ? nodeRadius * 3 : nodeRadius * 3.5;
+        const maxSpacing = isMinimized ? nodeRadius * 3.5 : nodeRadius * 6;
         leftIds.forEach((id, i) => {
-          const spacing = Math.min(maxSpacing, (height - topPadding - bottomPadding) / Math.max(leftIds.length + 1, 2));
+          const spacing = Math.min(maxSpacing, (height - topPadding - bottomPadding) / Math.max(leftIds.length, 2));
           const totalH = (leftIds.length - 1) * spacing;
           const y = safeCenterY - totalH / 2 + i * spacing;
           result.push({ id, data: nodes[id], x: leftX, y });
         });
 
         rightIds.forEach((id, i) => {
-          const spacing = Math.min(maxSpacing, (height - topPadding - bottomPadding) / Math.max(rightIds.length + 1, 2));
+          const spacing = Math.min(maxSpacing, (height - topPadding - bottomPadding) / Math.max(rightIds.length, 2));
           const totalH = (rightIds.length - 1) * spacing;
           const y = safeCenterY - totalH / 2 + i * spacing;
           result.push({ id, data: nodes[id], x: rightX, y });
@@ -412,27 +413,30 @@
 
       // NCCL connection between left-group nodes (if TP)
       if (leftIds.length >= 2) {
+        const hexEdge = nodeRadius * 0.6; // hexagon visual radius
         for (let i = 0; i < leftIds.length - 1; i++) {
           const p1 = positionById[leftIds[i]];
           const p2 = positionById[leftIds[i + 1]];
           if (p1 && p2) {
+            // Dashed line from bottom edge of hex 1 to top edge of hex 2
             linksGroup
               .append("line")
               .attr("x1", p1.x)
-              .attr("y1", p1.y)
+              .attr("y1", p1.y + hexEdge)
               .attr("x2", p2.x)
-              .attr("y2", p2.y)
+              .attr("y2", p2.y - hexEdge)
               .attr("stroke", acRgba(0.3))
               .attr("stroke-width", 1)
               .attr("stroke-dasharray", "3,2");
-            // NCCL label — positioned just left of the connecting edge
+            // NCCL label — centered between node center and KV arrow start
+            const ncclX = Math.min(p1.x, p2.x) + nodeRadius * 0.4;
             svg
               .append("text")
-              .attr("x", Math.min(p1.x, p2.x) - nodeRadius * 0.15)
+              .attr("x", ncclX)
               .attr("y", (p1.y + p2.y) / 2)
-              .attr("text-anchor", "end")
+              .attr("text-anchor", "middle")
               .attr("dominant-baseline", "middle")
-              .attr("font-size", isMinimized ? 7 : 9)
+              .attr("font-size", isMinimized ? 6 : 11)
               .attr("font-family", "SF Mono, monospace")
               .attr("fill", acRgba(0.5))
               .text("NCCL");
@@ -477,18 +481,18 @@
           .attr("fill", "none")
           .attr("marker-end", "url(#arrowhead)");
 
-        // "KV TRANSFER" label on the arrow
+        // "KV STREAM" label on the arrow
         svg
           .append("text")
           .attr("x", (arrowStartX + arrowEndX) / 2)
           .attr("y", arrowY - 8)
           .attr("text-anchor", "middle")
           .attr("dominant-baseline", "auto")
-          .attr("font-size", isMinimized ? 7 : 9)
+          .attr("font-size", isMinimized ? 7 : 11)
           .attr("font-family", "SF Mono, monospace")
           .attr("fill", acRgba(0.6))
           .attr("letter-spacing", "0.1em")
-          .text("KV TRANSFER");
+          .text(isMinimized ? "KV" : "KV STREAM");
       }
 
       // PREFILL / DECODE group labels (skip in minimized — saves vertical space)
@@ -1207,7 +1211,7 @@
       // Labels - adapt based on mode
       if (showFullLabels) {
         // FULL MODE: Name above, memory info below (1-4 nodes)
-        const nameY = nodeInfo.y - iconBaseHeight / 2 - 22;
+        const nameY = nodeInfo.y - iconBaseHeight / 2 - 12;
         const fontSize = Math.max(10, nodeRadius * 0.16);
 
         // Truncate name based on node count
@@ -1232,7 +1236,7 @@
           .text(displayName);
 
         // Memory info below - used in grey, total in yellow
-        const infoY = nodeInfo.y + iconBaseHeight / 2 + 24;
+        const infoY = nodeInfo.y + iconBaseHeight / 2 + 14;
         const memText = nodeG
           .append("text")
           .attr("x", nodeInfo.x)
@@ -1306,8 +1310,8 @@
           .attr("font-family", "SF Mono, Monaco, monospace")
           .text(shortName);
 
-        // Memory info below icon — compact percentage in minimized mode
-        const infoY = nodeInfo.y + iconBaseHeight / 2 + 14;
+        // Memory info below icon — compact in minimized mode
+        const infoY = nodeInfo.y + iconBaseHeight / 2 + 12;
         nodeG
           .append("text")
           .attr("x", nodeInfo.x)
