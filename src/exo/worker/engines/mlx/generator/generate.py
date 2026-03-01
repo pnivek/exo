@@ -508,6 +508,7 @@ def mlx_generate(
     max_tokens = task.max_output_tokens or MAX_TOKENS
     accumulated_text = ""
     generated_text_parts: list[str] = []
+    generated_token_ids: list[int] = []
     generation_start_time = time.perf_counter()
     usage: Usage | None = None
     in_thinking = False
@@ -534,6 +535,7 @@ def mlx_generate(
         start=1,
     ):
         generated_text_parts.append(out.text)
+        generated_token_ids.append(out.token)
         accumulated_text += out.text
 
         if think_start is not None and out.text == think_start:
@@ -615,11 +617,7 @@ def mlx_generate(
                 f"{generation_tps:.1f} tok/s"
             )
             if kv_prefix_cache is not None:
-                generated_tokens_array = mx.array(
-                    tokenizer.encode(
-                        "".join(generated_text_parts), add_special_tokens=False
-                    )
-                )
+                generated_tokens_array = mx.array(generated_token_ids)
                 full_prompt_tokens = mx.concatenate(
                     [all_prompt_tokens, generated_tokens_array]
                 )
