@@ -10,6 +10,7 @@
     count: number;
     percentage: number;
   } | null = null;
+  export let disaggMode = false;
 
   function handleHome(): void {
     if (onHome) {
@@ -81,9 +82,9 @@
     disabled={!showHome}
   >
     <img
-      src="/exo-logo.png"
+      src={disaggMode ? "/exo-logo-green.png" : "/exo-logo.png"}
       alt="EXO"
-      class="h-18 drop-shadow-[0_0_4px_rgba(255,215,0,0.3)]"
+      class="h-18 transition-all duration-300 {disaggMode ? 'drop-shadow-[0_0_4px_rgba(118,185,0,0.3)]' : 'drop-shadow-[0_0_4px_rgba(255,215,0,0.3)]'}"
     />
   </button>
 

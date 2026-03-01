@@ -4718,6 +4718,7 @@
       {sidebarVisible}
       onToggleSidebar={toggleChatSidebarVisible}
       downloadProgress={activeDownloadSummary}
+      disaggMode={effectiveInferenceMode === "pd"}
     />
   {/if}
 
