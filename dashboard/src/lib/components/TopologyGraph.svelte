@@ -16,6 +16,9 @@
     highlightedNodes?: Set<string>;
     filteredNodes?: Set<string>;
     onNodeClick?: (nodeId: string) => void;
+    accentColor?: { r: number; g: number; b: number };
+    layoutMode?: "circular" | "flow";
+    flowGroups?: { left: Set<string>; right: Set<string> };
   }
 
   let {
@@ -23,6 +26,9 @@
     highlightedNodes = new Set(),
     filteredNodes = new Set(),
     onNodeClick,
+    accentColor,
+    layoutMode = "circular",
+    flowGroups,
   }: Props = $props();
 
   let svgContainer: SVGSVGElement | undefined = $state();
@@ -163,6 +169,10 @@
 
     d3.select(svgContainer).selectAll("*").remove();
 
+    // Accent color — defaults to yellow, overridden to green in disagg mode
+    const ac = accentColor ?? { r: 255, g: 215, b: 0 };
+    const acRgba = (a: number) => `rgba(${ac.r},${ac.g},${ac.b},${a})`;
+
     const nodes = data.nodes || {};
     const edges = data.edges || [];
     const nodeIds = Object.keys(nodes);
@@ -221,7 +231,7 @@
         .attr("y", centerY)
         .attr("text-anchor", "middle")
         .attr("dominant-baseline", "middle")
-        .attr("fill", "rgba(255,215,0,0.4)")
+        .attr("fill", acRgba(0.4))
         .attr("font-size", isMinimized ? 10 : 12)
         .attr("font-family", "SF Mono, monospace")
         .attr("letter-spacing", "0.1em")
@@ -265,26 +275,58 @@
     const safeCenterY = topPadding + (height - topPadding - bottomPadding) / 2;
 
     // Calculate node positions
-    const nodesWithPositions = nodeIds.map((id, index) => {
-      if (numNodes === 1) {
-        // Single node: center it
+    const nodesWithPositions = (() => {
+      if (layoutMode === "flow" && flowGroups) {
+        // Flow layout: left group (prefill) → right group (decode)
+        const leftIds = nodeIds.filter((id) => flowGroups.left.has(id));
+        const rightIds = nodeIds.filter((id) => flowGroups.right.has(id));
+        // Nodes not in either group go to the right
+        const unassigned = nodeIds.filter(
+          (id) => !flowGroups.left.has(id) && !flowGroups.right.has(id),
+        );
+        rightIds.push(...unassigned);
+
+        const leftX = width * 0.28;
+        const rightX = width * 0.72;
+        const result: { id: string; data: NodeInfo; x: number; y: number }[] =
+          [];
+
+        leftIds.forEach((id, i) => {
+          const spacing = Math.min(nodeRadius * 3, (height - topPadding - bottomPadding) / Math.max(leftIds.length, 1));
+          const totalH = (leftIds.length - 1) * spacing;
+          const y = safeCenterY - totalH / 2 + i * spacing;
+          result.push({ id, data: nodes[id], x: leftX, y });
+        });
+
+        rightIds.forEach((id, i) => {
+          const spacing = Math.min(nodeRadius * 3, (height - topPadding - bottomPadding) / Math.max(rightIds.length, 1));
+          const totalH = (rightIds.length - 1) * spacing;
+          const y = safeCenterY - totalH / 2 + i * spacing;
+          result.push({ id, data: nodes[id], x: rightX, y });
+        });
+
+        return result;
+      }
+
+      // Circular layout (default)
+      return nodeIds.map((id, index) => {
+        if (numNodes === 1) {
+          return {
+            id,
+            data: nodes[id],
+            x: centerX,
+            y: safeCenterY,
+          };
+        }
+        const angle = (index / numNodes) * 2 * Math.PI - Math.PI / 2;
         return {
           id,
           data: nodes[id],
-          x: centerX,
-          y: safeCenterY,
+          x: centerX + orbitRadius * Math.cos(angle),
+          y: safeCenterY + orbitRadius * Math.sin(angle),
         };
-      }
-      // Distribute nodes around the orbit
-      // Start from top (-90 degrees) and go clockwise
-      const angle = (index / numNodes) * 2 * Math.PI - Math.PI / 2;
-      return {
-        id,
-        data: nodes[id],
-        x: centerX + orbitRadius * Math.cos(angle),
-        y: safeCenterY + orbitRadius * Math.sin(angle),
-      };
-    });
+      });
+    })();
 
     const positionById: Record<string, { x: number; y: number }> = {};
     nodesWithPositions.forEach((n) => {
@@ -362,7 +404,148 @@
       pairMap.set(key, entry);
     });
 
+    // In flow mode, draw aggregate flow edges instead of per-pair edges
+    if (layoutMode === "flow" && flowGroups) {
+      const leftIds = nodeIds.filter((id) => flowGroups.left.has(id));
+      const rightIds = nodeIds.filter((id) => flowGroups.right.has(id));
+
+      // NCCL connection between left-group nodes (if TP)
+      if (leftIds.length >= 2) {
+        for (let i = 0; i < leftIds.length - 1; i++) {
+          const p1 = positionById[leftIds[i]];
+          const p2 = positionById[leftIds[i + 1]];
+          if (p1 && p2) {
+            linksGroup
+              .append("line")
+              .attr("x1", p1.x)
+              .attr("y1", p1.y)
+              .attr("x2", p2.x)
+              .attr("y2", p2.y)
+              .attr("stroke", acRgba(0.3))
+              .attr("stroke-width", 1)
+              .attr("stroke-dasharray", "3,2");
+            // NCCL label
+            svg
+              .append("text")
+              .attr("x", (p1.x + p2.x) / 2 - nodeRadius * 0.7)
+              .attr("y", (p1.y + p2.y) / 2)
+              .attr("text-anchor", "middle")
+              .attr("dominant-baseline", "middle")
+              .attr("font-size", isMinimized ? 7 : 9)
+              .attr("font-family", "SF Mono, monospace")
+              .attr("fill", acRgba(0.5))
+              .text("NCCL");
+          }
+        }
+      }
+
+      // KV transfer arrow: left group centroid → right group centroid
+      if (leftIds.length > 0 && rightIds.length > 0) {
+        const leftCentroidY =
+          leftIds.reduce((sum, id) => sum + (positionById[id]?.y ?? 0), 0) /
+          leftIds.length;
+        const rightCentroidY =
+          rightIds.reduce((sum, id) => sum + (positionById[id]?.y ?? 0), 0) /
+          rightIds.length;
+        const leftX = positionById[leftIds[0]]?.x ?? 0;
+        const rightX = positionById[rightIds[0]]?.x ?? 0;
+
+        const arrowStartX = leftX + nodeRadius * 0.8;
+        const arrowEndX = rightX - nodeRadius * 0.8;
+        const arrowY = (leftCentroidY + rightCentroidY) / 2;
+
+        // Dashed flow line
+        linksGroup
+          .append("line")
+          .attr("x1", arrowStartX)
+          .attr("y1", arrowY)
+          .attr("x2", arrowEndX)
+          .attr("y2", arrowY)
+          .attr("class", "graph-link");
+
+        // Arrowhead at the end
+        const tipX = arrowEndX;
+        const tipY = arrowY;
+        arrowsGroup
+          .append("line")
+          .attr("x1", tipX - 4)
+          .attr("y1", tipY)
+          .attr("x2", tipX)
+          .attr("y2", tipY)
+          .attr("stroke", "none")
+          .attr("fill", "none")
+          .attr("marker-end", "url(#arrowhead)");
+
+        // "KV TRANSFER" label on the arrow
+        svg
+          .append("text")
+          .attr("x", (arrowStartX + arrowEndX) / 2)
+          .attr("y", arrowY - 8)
+          .attr("text-anchor", "middle")
+          .attr("dominant-baseline", "auto")
+          .attr("font-size", isMinimized ? 7 : 9)
+          .attr("font-family", "SF Mono, monospace")
+          .attr("fill", acRgba(0.6))
+          .attr("letter-spacing", "0.1em")
+          .text("KV TRANSFER");
+      }
+
+      // PREFILL / DECODE group labels
+      if (leftIds.length > 0) {
+        const topLeftY = Math.min(
+          ...leftIds.map((id) => positionById[id]?.y ?? 0),
+        );
+        svg
+          .append("text")
+          .attr("x", positionById[leftIds[0]]?.x ?? 0)
+          .attr("y", topLeftY - nodeRadius * 0.8 - 12)
+          .attr("text-anchor", "middle")
+          .attr("font-size", isMinimized ? 8 : 11)
+          .attr("font-family", "SF Mono, monospace")
+          .attr("fill", acRgba(0.7))
+          .attr("letter-spacing", "0.15em")
+          .text("PREFILL");
+      }
+      if (rightIds.length > 0) {
+        const topRightY = Math.min(
+          ...rightIds.map((id) => positionById[id]?.y ?? 0),
+        );
+        svg
+          .append("text")
+          .attr("x", positionById[rightIds[0]]?.x ?? 0)
+          .attr("y", topRightY - nodeRadius * 0.8 - 12)
+          .attr("text-anchor", "middle")
+          .attr("font-size", isMinimized ? 8 : 11)
+          .attr("font-family", "SF Mono, monospace")
+          .attr("fill", acRgba(0.7))
+          .attr("letter-spacing", "0.15em")
+          .text("DECODE");
+      }
+
+      // Still collect IP labels from edges
+      pairMap.forEach((entry) => {
+        const posA = positionById[entry.a];
+        const posB = positionById[entry.b];
+        if (!posA || !posB) return;
+        const mx = (posA.x + posB.x) / 2;
+        const my = (posA.y + posB.y) / 2;
+        if (entry.connections.length > 0) {
+          const isLeft = mx < centerX;
+          const isTop = my < safeCenterY;
+          debugEdgeLabels.push({
+            connections: entry.connections,
+            isLeft,
+            isTop,
+            mx,
+            my,
+          });
+        }
+      });
+    }
+
+    // Circular layout: draw per-pair edges
     pairMap.forEach((entry) => {
+      if (layoutMode === "flow" && flowGroups) return;
       const posA = positionById[entry.a];
       const posB = positionById[entry.b];
       if (!posA || !posB) return;
@@ -417,8 +600,8 @@
           .attr("marker-end", "url(#arrowhead)");
       }
 
-      // Collect debug labels for later positioning at edges
-      if (debugEnabled && entry.connections.length > 0) {
+      // Collect edge labels for positioning at viewport edges
+      if (entry.connections.length > 0) {
         // Determine which side of viewport based on edge midpoint
         const isLeft = mx < centerX;
         const isTop = my < safeCenterY;
@@ -493,7 +676,9 @@
         quadrantEdges.forEach((edge) => {
           edge.connections.forEach((conn) => {
             const arrow = getArrow(conn.from, conn.to);
-            const label = `${arrow} ${conn.ip} ${conn.ifaceLabel}`;
+            const label = debugEnabled
+              ? `${arrow} ${conn.ip} ${conn.ifaceLabel}`
+              : `${arrow} ${conn.ip}`;
             debugLabelsGroup
               .append("text")
               .attr("x", baseX)
@@ -563,24 +748,24 @@
         filteredNodes.size > 0 && !filteredNodes.has(nodeInfo.id);
       const isHovered = hoveredNodeId === nodeInfo.id && !isInFilter;
 
-      // Holographic wireframe colors - bright yellow for filter, subtle yellow for hover, grey for filtered out
+      // Holographic wireframe colors - bright accent for filter, subtle for hover, grey for filtered out
       const wireColor = isInFilter
-        ? "rgba(255,215,0,1)" // Bright yellow for filter selection
+        ? acRgba(1)
         : isHovered
-          ? "rgba(255,215,0,0.7)" // Subtle yellow for hover
+          ? acRgba(0.7)
           : isHighlighted
-            ? "rgba(255,215,0,0.9)" // Yellow for instance highlight
+            ? acRgba(0.9)
             : isFilteredOut
-              ? "rgba(140,140,140,0.6)" // Grey for filtered out
-              : "rgba(179,179,179,0.8)"; // Default
+              ? "rgba(140,140,140,0.6)"
+              : "rgba(179,179,179,0.8)";
       const wireColorBright = "rgba(255,255,255,0.9)";
       const fillColor = isInFilter
-        ? "rgba(255,215,0,0.25)"
+        ? acRgba(0.25)
         : isHovered
-          ? "rgba(255,215,0,0.12)"
+          ? acRgba(0.12)
           : isHighlighted
-            ? "rgba(255,215,0,0.15)"
-            : "rgba(255,215,0,0.08)";
+            ? acRgba(0.15)
+            : acRgba(0.08);
       const strokeWidth = isInFilter
         ? 3
         : isHovered
@@ -589,7 +774,7 @@
             ? 2.5
             : 1.5;
       const screenFill = "rgba(0,20,40,0.9)";
-      const glowColor = "rgba(255,215,0,0.3)";
+      const glowColor = acRgba(0.3);
 
       const nodeG = nodesGroup
         .append("g")
@@ -671,7 +856,7 @@
             )
             .attr("width", iconBaseWidth)
             .attr("height", memFillActualHeight)
-            .attr("fill", "rgba(255,215,0,0.75)")
+            .attr("fill", acRgba(0.75))
             .attr("clip-path", `url(#${studioClipId})`);
         }
 
@@ -754,7 +939,7 @@
             )
             .attr("width", iconBaseWidth)
             .attr("height", memFillActualHeight)
-            .attr("fill", "rgba(255,215,0,0.75)")
+            .attr("fill", acRgba(0.75))
             .attr("clip-path", `url(#${miniClipId})`);
         }
 
@@ -842,7 +1027,7 @@
             )
             .attr("width", screenWidth - screenBezel * 2)
             .attr("height", memFillActualHeight)
-            .attr("fill", "rgba(255,215,0,0.85)")
+            .attr("fill", acRgba(0.85))
             .attr("clip-path", `url(#${screenClipId})`);
         }
 
@@ -925,8 +1110,9 @@
       }
 
       // --- Vertical GPU Bar (right side of icon) ---
-      // Show in both full mode and minimized mode (scaled appropriately)
-      if (showFullLabels || isMinimized) {
+      // Show only if node reports GPU data (macmon present) — NVIDIA nodes have no macmon
+      const hasGpuData = macmon?.gpu_usage !== undefined;
+      if ((showFullLabels || isMinimized) && hasGpuData) {
         const gpuBarWidth = isMinimized
           ? Math.max(16, nodeRadius * 0.32)
           : Math.max(28, nodeRadius * 0.3);
@@ -1033,7 +1219,7 @@
           .attr("y", nameY)
           .attr("text-anchor", "middle")
           .attr("dominant-baseline", "middle")
-          .attr("fill", "#FFD700")
+          .attr("fill", acRgba(1))
           .attr("font-size", fontSize)
           .attr("font-weight", 500)
           .attr("font-family", "SF Mono, Monaco, monospace")
@@ -1050,7 +1236,7 @@
           .attr("font-family", "SF Mono, Monaco, monospace");
         memText
           .append("tspan")
-          .attr("fill", "rgba(255,215,0,0.9)")
+          .attr("fill", acRgba(0.9))
           .text(`${formatBytes(ramUsed)}`);
         memText
           .append("tspan")
@@ -1075,7 +1261,7 @@
           .attr("x", nodeInfo.x)
           .attr("y", nameY)
           .attr("text-anchor", "middle")
-          .attr("fill", "#FFD700")
+          .attr("fill", acRgba(1))
           .attr("font-size", fontSize)
           .attr("font-family", "SF Mono, Monaco, monospace")
           .text(shortName);
@@ -1087,7 +1273,7 @@
           .attr("x", nodeInfo.x)
           .attr("y", statsY)
           .attr("text-anchor", "middle")
-          .attr("fill", "rgba(255,215,0,0.7)")
+          .attr("fill", acRgba(0.7))
           .attr("font-size", fontSize * 0.85)
           .attr("font-family", "SF Mono, Monaco, monospace")
           .text(
@@ -1108,7 +1294,7 @@
           .attr("x", nodeInfo.x)
           .attr("y", nameY)
           .attr("text-anchor", "middle")
-          .attr("fill", "#FFD700")
+          .attr("fill", acRgba(1))
           .attr("font-size", fontSize)
           .attr("font-weight", "500")
           .attr("font-family", "SF Mono, Monaco, monospace")
@@ -1125,7 +1311,7 @@
           .attr("font-family", "SF Mono, Monaco, monospace");
         memTextMini
           .append("tspan")
-          .attr("fill", "rgba(255,215,0,0.9)")
+          .attr("fill", acRgba(0.9))
           .text(`${formatBytes(ramUsed)}`);
         memTextMini
           .append("tspan")
@@ -1206,6 +1392,9 @@
     const _hoveredNodeId = hoveredNodeId;
     const _filteredNodes = filteredNodes;
     const _highlightedNodes = highlightedNodes;
+    const _layoutMode = layoutMode;
+    const _flowGroups = flowGroups;
+    const _accentColor = accentColor;
     if (_data) {
       renderGraph();
     }

@@ -86,6 +86,22 @@
   const rdmaCtlData = $derived(nodeRdmaCtl());
   const nodeFilter = $derived(previewNodeFilter());
 
+  // Flow groups for disagg topology: NVIDIA/CUDA nodes on left, Apple nodes on right
+  const disaggFlowGroups = $derived.by(() => {
+    if (!identitiesData) return undefined;
+    const left = new Set<string>();
+    const right = new Set<string>();
+    for (const [nid, identity] of Object.entries(identitiesData)) {
+      const chip = ((identity as { chipId?: string }).chipId ?? "").toLowerCase();
+      if (chip.includes("nvidia") || chip.includes("dgx") || chip.includes("cuda") || chip.includes("gb10")) {
+        left.add(nid);
+      } else if (chip.includes("apple") || /\bm[1-4]\b/.test(chip)) {
+        right.add(nid);
+      }
+    }
+    return left.size > 0 || right.size > 0 ? { left, right } : undefined;
+  });
+
   // Aggregate active download progress across all instances for header indicator
   const activeDownloadSummary = $derived.by(() => {
     let totalBytes = 0;
@@ -3811,7 +3827,7 @@
 />
 
 <div
-  class="relative h-screen w-full flex flex-col bg-exo-dark-gray overflow-hidden"
+  class="relative h-screen w-full flex flex-col bg-exo-dark-gray overflow-hidden {selectedInferenceMode === 'pd' ? 'disagg-mode' : ''}"
 >
   <!-- Scanline overlay -->
   <!-- Scanline overlay -->
@@ -4732,6 +4748,9 @@
             highlightedNodes={highlightedNodes()}
             filteredNodes={nodeFilter}
             onNodeClick={togglePreviewNodeFilter}
+            layoutMode={selectedInferenceMode === "pd" ? "flow" : "circular"}
+            flowGroups={selectedInferenceMode === "pd" ? disaggFlowGroups : undefined}
+            accentColor={selectedInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
           />
 
           {@render clusterWarnings()}
@@ -4857,6 +4876,9 @@
               highlightedNodes={highlightedNodes()}
               filteredNodes={nodeFilter}
               onNodeClick={togglePreviewNodeFilter}
+              layoutMode={selectedInferenceMode === "pd" ? "flow" : "circular"}
+              flowGroups={selectedInferenceMode === "pd" ? disaggFlowGroups : undefined}
+              accentColor={selectedInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
             />
 
             <!-- Initial loading state before first data fetch -->
@@ -5671,7 +5693,7 @@
                   >
                     <span class="font-bold tracking-wide">Disaggregated</span>
                     <span class="text-[10px] opacity-70"
-                      >GPU prefill, Apple decode</span
+                      >CUDA prefill, Metal decode</span
                     >
                   </button>
                 </div>
@@ -5942,9 +5964,9 @@
                           "_d" +
                           i}
                         {@const iconSz =
-                          isTp && prefillNodes.length >= 2 ? 34 : 42}
+                          isTp && prefillNodes.length >= 2 ? 38 : 46}
                         {@const svgH =
-                          isTp && prefillNodes.length >= 2 ? 140 : 110}
+                          isTp && prefillNodes.length >= 2 ? 175 : 140}
                         {@const pfCx = 65}
                         {@const dcCx = 195}
                         <div
@@ -6231,7 +6253,7 @@
                                   {@const pNodeY =
                                     prefillNodes.length === 1
                                       ? svgH / 2
-                                      : 30 + pi * 55}
+                                      : 38 + pi * 65}
                                   {@const pScreenH = iconSz * 0.58}
                                   {@const pCurFillH =
                                     pScreenH * (pCurPct / 100)}
@@ -6451,8 +6473,8 @@
                                 <!-- NCCL connection between TP prefill nodes -->
                                 {#if isTp && prefillNodes.length >= 2}
                                   {#if true}
-                                    {@const ncclY1 = 30 + iconSz / 2 + 4}
-                                    {@const ncclY2 = 30 + 55 - iconSz / 2 - 4}
+                                    {@const ncclY1 = 38 + iconSz / 2 + 4}
+                                    {@const ncclY2 = 38 + 65 - iconSz / 2 - 4}
                                     <line
                                       x1={pfCx}
                                       y1={ncclY1}
@@ -6517,7 +6539,7 @@
                                   {@const dNodeY =
                                     decodeNodes.length === 1
                                       ? svgH / 2
-                                      : 30 + di * 55}
+                                      : 38 + di * 65}
                                   {@const dScreenH = iconSz * 0.58}
                                   {@const dCurFillH =
                                     dScreenH * (dCurPct / 100)}
@@ -7052,6 +7074,9 @@
                   highlightedNodes={highlightedNodes()}
                   filteredNodes={nodeFilter}
                   onNodeClick={togglePreviewNodeFilter}
+                  layoutMode={selectedInferenceMode === "pd" ? "flow" : "circular"}
+                  flowGroups={selectedInferenceMode === "pd" ? disaggFlowGroups : undefined}
+                  accentColor={selectedInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
                 />
 
                 {@render clusterWarningsCompact()}
