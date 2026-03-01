@@ -349,10 +349,10 @@
       };
     }
 
-    // Flow layout for disaggregated modes
-    if (isDisaggRuntime && numNodes >= 2) {
-      const leftArray = nodeArray.filter((n) => isNvidiaNode(n.id));
-      const rightArray = nodeArray.filter((n) => !isNvidiaNode(n.id));
+    // Flow layout for disaggregated modes — only when both CUDA and Apple nodes exist
+    const leftArray = nodeArray.filter((n) => isNvidiaNode(n.id));
+    const rightArray = nodeArray.filter((n) => !isNvidiaNode(n.id));
+    if (isDisaggRuntime && leftArray.length > 0 && rightArray.length > 0) {
       const leftX = topoWidth * 0.25;
       const rightX = topoWidth * 0.75;
       const spacing = 55;
