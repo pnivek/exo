@@ -26,6 +26,7 @@
     tags?: string[];
     apiPreview?: PlacementPreview | null;
     modelIdOverride?: string | null;
+    accentColor?: { r: number; g: number; b: number };
   }
 
   let {
@@ -39,7 +40,26 @@
     tags = [],
     apiPreview = null,
     modelIdOverride = null,
+    accentColor,
   }: Props = $props();
+
+  const ac = $derived(accentColor ?? { r: 255, g: 215, b: 0 });
+  const acHex = $derived(`rgb(${ac.r},${ac.g},${ac.b})`);
+  const acRgba = (a: number) => `rgba(${ac.r},${ac.g},${ac.b},${a})`;
+
+  function isNvidiaNode(nodeId: string): boolean {
+    const chip = (nodes[nodeId]?.system_info?.chip ?? "").toLowerCase();
+    return (
+      chip.includes("nvidia") ||
+      chip.includes("dgx") ||
+      chip.includes("cuda") ||
+      chip.includes("gb10")
+    );
+  }
+
+  const isDisaggRuntime = $derived(
+    runtime === "Disaggregated" || runtime === "TensorPrefillDisagg",
+  );
 
   // Estimate memory requirements from model name
   // Uses regex with word boundaries to avoid false matches like '4bit' matching '4b'
@@ -295,19 +315,21 @@
 
     // Use API placement data directly
     const memoryDelta = apiPreview?.memory_delta_by_node ?? {};
-    placementNodes = nodeArray.map((n, i) => {
+
+    function buildNode(
+      n: (typeof nodeArray)[0],
+      x: number,
+      y: number,
+    ) {
       const deltaBytes = memoryDelta[n.id] ?? 0;
       const modelUsageGB = deltaBytes / (1024 * 1024 * 1024);
       const isUsed = deltaBytes > 0;
-      const angle =
-        numNodes === 1 ? 0 : (i / numNodes) * Math.PI * 2 - Math.PI / 2;
       const safeTotal = Math.max(n.totalGB, 0.001);
       const currentPercent = clampPercent((n.usedGB / safeTotal) * 100);
       const newPercent = clampPercent(
         ((n.usedGB + modelUsageGB) / safeTotal) * 100,
       );
       const screenHeight = iconSize * 0.58;
-
       return {
         id: n.id,
         deviceName: n.deviceName,
@@ -318,13 +340,75 @@
         currentPercent,
         newPercent,
         isUsed,
-        x: centerX + Math.cos(angle) * radius,
-        y: centerY + Math.sin(angle) * radius,
+        x,
+        y,
         iconSize,
         screenHeight,
         currentFillHeight: screenHeight * (currentPercent / 100),
         modelFillHeight: screenHeight * ((newPercent - currentPercent) / 100),
       };
+    }
+
+    // Flow layout for disaggregated modes
+    if (isDisaggRuntime && numNodes >= 2) {
+      const leftArray = nodeArray.filter((n) => isNvidiaNode(n.id));
+      const rightArray = nodeArray.filter((n) => !isNvidiaNode(n.id));
+      const leftX = topoWidth * 0.25;
+      const rightX = topoWidth * 0.75;
+      const spacing = 55;
+
+      const buildGroup = (
+        group: typeof nodeArray,
+        gx: number,
+      ) => {
+        const totalH = (group.length - 1) * spacing;
+        return group.map((n, i) =>
+          buildNode(n, gx, centerY - totalH / 2 + i * spacing),
+        );
+      };
+
+      const leftNodes = buildGroup(leftArray, leftX);
+      const rightNodes = buildGroup(rightArray, rightX);
+      placementNodes = [...leftNodes, ...rightNodes];
+
+      const leftCentroidY =
+        leftNodes.length > 0
+          ? leftNodes.reduce((s, n) => s + n.y, 0) / leftNodes.length
+          : centerY;
+      const rightCentroidY =
+        rightNodes.length > 0
+          ? rightNodes.reduce((s, n) => s + n.y, 0) / rightNodes.length
+          : centerY;
+
+      const totalAvailable = nodeArray.reduce(
+        (sum, n) => sum + n.availableGB,
+        0,
+      );
+      return {
+        nodes: placementNodes,
+        canFit: hasApiPreview,
+        totalAvailable,
+        topoWidth,
+        topoHeight,
+        error,
+        flowLayout: true as const,
+        leftX,
+        rightX,
+        leftCentroidY,
+        rightCentroidY,
+        hasNcclGroup: leftArray.length >= 2,
+      };
+    }
+
+    // Circular layout (default)
+    placementNodes = nodeArray.map((n, i) => {
+      const angle =
+        numNodes === 1 ? 0 : (i / numNodes) * Math.PI * 2 - Math.PI / 2;
+      return buildNode(
+        n,
+        centerX + Math.cos(angle) * radius,
+        centerY + Math.sin(angle) * radius,
+      );
     });
 
     const totalAvailable = nodeArray.reduce((sum, n) => sum + n.availableGB, 0);
@@ -335,6 +419,7 @@
       topoWidth,
       topoHeight,
       error,
+      flowLayout: false as const,
     };
   });
 
@@ -491,7 +576,10 @@
   <div
     class="bg-exo-dark-gray/60 border {canFit
       ? 'border-exo-yellow/20 group-hover:border-exo-yellow/40'
-      : 'border-red-500/20'} p-3 transition-all duration-200 group-hover:shadow-[0_0_15px_rgba(255,215,0,0.1)]"
+      : 'border-red-500/20'} p-3 transition-all duration-200"
+    style={canFit ? `--hover-shadow: 0 0 15px ${acRgba(0.1)}` : ""}
+    onmouseenter={(e) => { if (canFit) e.currentTarget.style.boxShadow = `0 0 15px ${acRgba(0.1)}`; }}
+    onmouseleave={(e) => { e.currentTarget.style.boxShadow = ''; }}
   >
     <!-- Model Name & Memory Required -->
     <div class="flex items-start justify-between gap-2 mb-2">
@@ -625,7 +713,8 @@
       >
         <!-- Scanline effect -->
         <div
-          class="absolute inset-0 bg-[repeating-linear-gradient(0deg,transparent,transparent_2px,rgba(255,215,0,0.02)_2px,rgba(255,215,0,0.02)_4px)] pointer-events-none"
+          class="absolute inset-0 pointer-events-none"
+          style="background: repeating-linear-gradient(0deg, transparent, transparent 2px, {acRgba(0.02)} 2px, {acRgba(0.02)} 4px)"
         ></div>
 
         <svg
@@ -665,154 +754,212 @@
 
           <!-- Connection lines between nodes (if multiple) -->
           {#if preview.nodes.length > 1}
-            {@const usedNodes = preview.nodes.filter((n) => n.isUsed)}
-            {@const nodePositions = Object.fromEntries(
-              preview.nodes.map((n) => [n.id, { x: n.x, y: n.y }]),
-            )}
-            {@const allConnections =
-              isDebugMode && usedNodes.length > 1
-                ? (() => {
-                    const conns: Array<{
-                      ip: string;
-                      iface: string | null;
-                      from: string;
-                      to: string;
-                      midX: number;
-                      midY: number;
-                      arrow: string;
-                    }> = [];
-                    for (let i = 0; i < usedNodes.length; i++) {
-                      for (let j = i + 1; j < usedNodes.length; j++) {
-                        const n1 = usedNodes[i];
-                        const n2 = usedNodes[j];
-                        const midX = (n1.x + n2.x) / 2;
-                        const midY = (n1.y + n2.y) / 2;
-                        for (const c of getConnectionInfo(n1.id, n2.id)) {
-                          const fromPos = nodePositions[c.from];
-                          const toPos = nodePositions[c.to];
-                          const arrow =
-                            fromPos && toPos ? getArrow(fromPos, toPos) : "→";
-                          conns.push({ ...c, midX, midY, arrow });
+            {#if preview.flowLayout}
+              <!-- Flow layout: KV TRANSFER arrow + NCCL link -->
+              {@const arrowY = ('leftCentroidY' in preview && 'rightCentroidY' in preview) ? (preview.leftCentroidY + preview.rightCentroidY) / 2 : preview.topoHeight / 2}
+              {@const arrowStartX = ('leftX' in preview ? preview.leftX : 70) + 24}
+              {@const arrowEndX = ('rightX' in preview ? preview.rightX : 190) - 24}
+              <line
+                x1={arrowStartX}
+                y1={arrowY}
+                x2={arrowEndX}
+                y2={arrowY}
+                stroke={acRgba(0.4)}
+                stroke-width="1"
+                stroke-dasharray="4,2"
+              />
+              <!-- Arrowhead -->
+              <polygon
+                points="{arrowEndX - 4},{arrowY - 3} {arrowEndX},{arrowY} {arrowEndX - 4},{arrowY + 3}"
+                fill={acRgba(0.5)}
+              />
+              <!-- KV TRANSFER label -->
+              <text
+                x={(arrowStartX + arrowEndX) / 2}
+                y={arrowY - 6}
+                text-anchor="middle"
+                font-size="6"
+                font-family="SF Mono, Monaco, monospace"
+                fill={acRgba(0.5)}
+              >KV TRANSFER</text>
+
+              <!-- NCCL link between CUDA nodes (if TP) -->
+              {#if 'hasNcclGroup' in preview && preview.hasNcclGroup}
+                {@const cudaNodes = preview.nodes.filter((n) => isNvidiaNode(n.id))}
+                {#each cudaNodes.slice(0, -1) as node, i}
+                  {@const nextNode = cudaNodes[i + 1]}
+                  <line
+                    x1={node.x}
+                    y1={node.y + 16}
+                    x2={nextNode.x}
+                    y2={nextNode.y - 16}
+                    stroke={acRgba(0.3)}
+                    stroke-width="1"
+                    stroke-dasharray="3,2"
+                  />
+                  <text
+                    x={node.x - 22}
+                    y={(node.y + nextNode.y) / 2}
+                    text-anchor="end"
+                    font-size="5"
+                    font-family="SF Mono, Monaco, monospace"
+                    fill={acRgba(0.4)}
+                  >NCCL</text>
+                {/each}
+              {/if}
+            {:else}
+              <!-- Circular layout: all-pairs connections -->
+              {@const usedNodes = preview.nodes.filter((n) => n.isUsed)}
+              {@const nodePositions = Object.fromEntries(
+                preview.nodes.map((n) => [n.id, { x: n.x, y: n.y }]),
+              )}
+              {@const allConnections =
+                isDebugMode && usedNodes.length > 1
+                  ? (() => {
+                      const conns: Array<{
+                        ip: string;
+                        iface: string | null;
+                        from: string;
+                        to: string;
+                        midX: number;
+                        midY: number;
+                        arrow: string;
+                      }> = [];
+                      for (let i = 0; i < usedNodes.length; i++) {
+                        for (let j = i + 1; j < usedNodes.length; j++) {
+                          const n1 = usedNodes[i];
+                          const n2 = usedNodes[j];
+                          const midX = (n1.x + n2.x) / 2;
+                          const midY = (n1.y + n2.y) / 2;
+                          for (const c of getConnectionInfo(n1.id, n2.id)) {
+                            const fromPos = nodePositions[c.from];
+                            const toPos = nodePositions[c.to];
+                            const arrow =
+                              fromPos && toPos ? getArrow(fromPos, toPos) : "→";
+                            conns.push({ ...c, midX, midY, arrow });
+                          }
                         }
                       }
-                    }
-                    return conns;
-                  })()
-                : []}
-            {#each preview.nodes as node, i}
-              {#each preview.nodes.slice(i + 1) as node2}
-                <line
-                  x1={node.x}
-                  y1={node.y}
-                  x2={node2.x}
-                  y2={node2.y}
-                  stroke={node.isUsed && node2.isUsed ? "#FFD700" : "#374151"}
-                  stroke-width="1"
-                  stroke-dasharray={node.isUsed && node2.isUsed ? "4,2" : "2,4"}
-                  opacity={node.isUsed && node2.isUsed ? 0.4 : 0.15}
-                />
+                      return conns;
+                    })()
+                  : []}
+              {#each preview.nodes as node, i}
+                {#each preview.nodes.slice(i + 1) as node2}
+                  <line
+                    x1={node.x}
+                    y1={node.y}
+                    x2={node2.x}
+                    y2={node2.y}
+                    stroke={node.isUsed && node2.isUsed ? acHex : "#374151"}
+                    stroke-width="1"
+                    stroke-dasharray={node.isUsed && node2.isUsed
+                      ? "4,2"
+                      : "2,4"}
+                    opacity={node.isUsed && node2.isUsed ? 0.4 : 0.15}
+                  />
+                {/each}
               {/each}
-            {/each}
-            <!-- Debug: Show connection IPs/interfaces in corners -->
-            {#if isDebugMode && allConnections.length > 0}
-              {@const centerX = preview.topoWidth / 2}
-              {@const centerY = preview.topoHeight / 2}
-              {@const quadrants = {
-                topLeft: allConnections.filter(
-                  (c) => c.midX < centerX && c.midY < centerY,
-                ),
-                topRight: allConnections.filter(
-                  (c) => c.midX >= centerX && c.midY < centerY,
-                ),
-                bottomLeft: allConnections.filter(
-                  (c) => c.midX < centerX && c.midY >= centerY,
-                ),
-                bottomRight: allConnections.filter(
-                  (c) => c.midX >= centerX && c.midY >= centerY,
-                ),
-              }}
-              {@const padding = 4}
-              {@const lineHeight = 8}
-              <!-- Top Left -->
-              {#each quadrants.topLeft as conn, idx}
-                <text
-                  x={padding}
-                  y={padding + idx * lineHeight}
-                  text-anchor="start"
-                  dominant-baseline="hanging"
-                  font-size="6"
-                  font-family="SF Mono, Monaco, monospace"
-                  fill={conn.iface
-                    ? "rgba(255,255,255,0.85)"
-                    : "rgba(248,113,113,0.85)"}
-                >
-                  {conn.arrow}
-                  {isRdma
-                    ? conn.iface || "?"
-                    : `${conn.ip}${conn.iface ? ` (${conn.iface})` : ""}`}
-                </text>
-              {/each}
-              <!-- Top Right -->
-              {#each quadrants.topRight as conn, idx}
-                <text
-                  x={preview.topoWidth - padding}
-                  y={padding + idx * lineHeight}
-                  text-anchor="end"
-                  dominant-baseline="hanging"
-                  font-size="6"
-                  font-family="SF Mono, Monaco, monospace"
-                  fill={conn.iface
-                    ? "rgba(255,255,255,0.85)"
-                    : "rgba(248,113,113,0.85)"}
-                >
-                  {conn.arrow}
-                  {isRdma
-                    ? conn.iface || "?"
-                    : `${conn.ip}${conn.iface ? ` (${conn.iface})` : ""}`}
-                </text>
-              {/each}
-              <!-- Bottom Left -->
-              {#each quadrants.bottomLeft as conn, idx}
-                <text
-                  x={padding}
-                  y={preview.topoHeight -
-                    padding -
-                    (quadrants.bottomLeft.length - 1 - idx) * lineHeight}
-                  text-anchor="start"
-                  dominant-baseline="auto"
-                  font-size="6"
-                  font-family="SF Mono, Monaco, monospace"
-                  fill={conn.iface
-                    ? "rgba(255,255,255,0.85)"
-                    : "rgba(248,113,113,0.85)"}
-                >
-                  {conn.arrow}
-                  {isRdma
-                    ? conn.iface || "?"
-                    : `${conn.ip}${conn.iface ? ` (${conn.iface})` : ""}`}
-                </text>
-              {/each}
-              <!-- Bottom Right -->
-              {#each quadrants.bottomRight as conn, idx}
-                <text
-                  x={preview.topoWidth - padding}
-                  y={preview.topoHeight -
-                    padding -
-                    (quadrants.bottomRight.length - 1 - idx) * lineHeight}
-                  text-anchor="end"
-                  dominant-baseline="auto"
-                  font-size="6"
-                  font-family="SF Mono, Monaco, monospace"
-                  fill={conn.iface
-                    ? "rgba(255,255,255,0.85)"
-                    : "rgba(248,113,113,0.85)"}
-                >
-                  {conn.arrow}
-                  {isRdma
-                    ? conn.iface || "?"
-                    : `${conn.ip}${conn.iface ? ` (${conn.iface})` : ""}`}
-                </text>
-              {/each}
+              <!-- Debug: Show connection IPs/interfaces in corners -->
+              {#if isDebugMode && allConnections.length > 0}
+                {@const centerX = preview.topoWidth / 2}
+                {@const centerY = preview.topoHeight / 2}
+                {@const quadrants = {
+                  topLeft: allConnections.filter(
+                    (c) => c.midX < centerX && c.midY < centerY,
+                  ),
+                  topRight: allConnections.filter(
+                    (c) => c.midX >= centerX && c.midY < centerY,
+                  ),
+                  bottomLeft: allConnections.filter(
+                    (c) => c.midX < centerX && c.midY >= centerY,
+                  ),
+                  bottomRight: allConnections.filter(
+                    (c) => c.midX >= centerX && c.midY >= centerY,
+                  ),
+                }}
+                {@const padding = 4}
+                {@const lineHeight = 8}
+                <!-- Top Left -->
+                {#each quadrants.topLeft as conn, idx}
+                  <text
+                    x={padding}
+                    y={padding + idx * lineHeight}
+                    text-anchor="start"
+                    dominant-baseline="hanging"
+                    font-size="6"
+                    font-family="SF Mono, Monaco, monospace"
+                    fill={conn.iface
+                      ? "rgba(255,255,255,0.85)"
+                      : "rgba(248,113,113,0.85)"}
+                  >
+                    {conn.arrow}
+                    {isRdma
+                      ? conn.iface || "?"
+                      : `${conn.ip}${conn.iface ? ` (${conn.iface})` : ""}`}
+                  </text>
+                {/each}
+                <!-- Top Right -->
+                {#each quadrants.topRight as conn, idx}
+                  <text
+                    x={preview.topoWidth - padding}
+                    y={padding + idx * lineHeight}
+                    text-anchor="end"
+                    dominant-baseline="hanging"
+                    font-size="6"
+                    font-family="SF Mono, Monaco, monospace"
+                    fill={conn.iface
+                      ? "rgba(255,255,255,0.85)"
+                      : "rgba(248,113,113,0.85)"}
+                  >
+                    {conn.arrow}
+                    {isRdma
+                      ? conn.iface || "?"
+                      : `${conn.ip}${conn.iface ? ` (${conn.iface})` : ""}`}
+                  </text>
+                {/each}
+                <!-- Bottom Left -->
+                {#each quadrants.bottomLeft as conn, idx}
+                  <text
+                    x={padding}
+                    y={preview.topoHeight -
+                      padding -
+                      (quadrants.bottomLeft.length - 1 - idx) * lineHeight}
+                    text-anchor="start"
+                    dominant-baseline="auto"
+                    font-size="6"
+                    font-family="SF Mono, Monaco, monospace"
+                    fill={conn.iface
+                      ? "rgba(255,255,255,0.85)"
+                      : "rgba(248,113,113,0.85)"}
+                  >
+                    {conn.arrow}
+                    {isRdma
+                      ? conn.iface || "?"
+                      : `${conn.ip}${conn.iface ? ` (${conn.iface})` : ""}`}
+                  </text>
+                {/each}
+                <!-- Bottom Right -->
+                {#each quadrants.bottomRight as conn, idx}
+                  <text
+                    x={preview.topoWidth - padding}
+                    y={preview.topoHeight -
+                      padding -
+                      (quadrants.bottomRight.length - 1 - idx) * lineHeight}
+                    text-anchor="end"
+                    dominant-baseline="auto"
+                    font-size="6"
+                    font-family="SF Mono, Monaco, monospace"
+                    fill={conn.iface
+                      ? "rgba(255,255,255,0.85)"
+                      : "rgba(248,113,113,0.85)"}
+                  >
+                    {conn.arrow}
+                    {isRdma
+                      ? conn.iface || "?"
+                      : `${conn.ip}${conn.iface ? ` (${conn.iface})` : ""}`}
+                  </text>
+                {/each}
+              {/if}
             {/if}
           {/if}
 
@@ -837,7 +984,7 @@
                     height={node.iconSize * 0.65}
                     rx="2"
                     fill="none"
-                    stroke={node.isUsed ? "#FFD700" : "#4B5563"}
+                    stroke={node.isUsed ? acHex : "#4B5563"}
                     stroke-width="1.5"
                   />
                   <!-- Screen area (memory fill container) -->
@@ -866,7 +1013,7 @@
                         node.modelFillHeight}
                       width={node.iconSize - 8}
                       height={node.modelFillHeight}
-                      fill="#FFD700"
+                      fill={acHex}
                       filter="url(#memGlow-{filterId})"
                       class="animate-pulse-slow"
                     />
@@ -878,7 +1025,7 @@
                       0.68} L {node.iconSize - 2} {node.iconSize *
                       0.78} L 2 {node.iconSize * 0.78} Z"
                     fill="none"
-                    stroke={node.isUsed ? "#FFD700" : "#4B5563"}
+                    stroke={node.isUsed ? acHex : "#4B5563"}
                     stroke-width="1.5"
                   />
                 </g>
@@ -895,7 +1042,7 @@
                     height={node.iconSize - 4}
                     rx="4"
                     fill="none"
-                    stroke={node.isUsed ? "#FFD700" : "#4B5563"}
+                    stroke={node.isUsed ? acHex : "#4B5563"}
                     stroke-width="1.5"
                   />
                   <!-- Memory fill background -->
@@ -923,7 +1070,7 @@
                       width={node.iconSize - 8}
                       height={(node.iconSize - 8) *
                         ((node.newPercent - node.currentPercent) / 100)}
-                      fill="#FFD700"
+                      fill={acHex}
                       filter="url(#memGlow-{filterId})"
                       class="animate-pulse-slow"
                     />
@@ -942,7 +1089,7 @@
                     height={node.iconSize * 0.4}
                     rx="3"
                     fill="none"
-                    stroke={node.isUsed ? "#FFD700" : "#4B5563"}
+                    stroke={node.isUsed ? acHex : "#4B5563"}
                     stroke-width="1.5"
                   />
                   <!-- Memory fill background -->
@@ -972,7 +1119,7 @@
                       height={node.iconSize *
                         0.36 *
                         ((node.newPercent - node.currentPercent) / 100)}
-                      fill="#FFD700"
+                      fill={acHex}
                       filter="url(#memGlow-{filterId})"
                       class="animate-pulse-slow"
                     />
@@ -991,8 +1138,8 @@
                       0.75} {node.iconSize /
                       2},{node.iconSize} 0,{node.iconSize *
                       0.75} 0,{node.iconSize * 0.25}"
-                    fill={node.isUsed ? "rgba(255,215,0,0.1)" : "#0a0a0a"}
-                    stroke={node.isUsed ? "#FFD700" : "#4B5563"}
+                    fill={node.isUsed ? acRgba(0.1) : "#0a0a0a"}
+                    stroke={node.isUsed ? acHex : "#4B5563"}
                     stroke-width="1.5"
                   />
                 </g>
@@ -1007,7 +1154,7 @@
                 fill={node.isUsed
                   ? node.newPercent > 90
                     ? "#f87171"
-                    : "#FFD700"
+                    : acHex
                   : "#4B5563"}
               >
                 {node.newPercent.toFixed(0)}%

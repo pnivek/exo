@@ -1102,6 +1102,9 @@
           return `${nodeInfo.x + hexRadius * Math.cos(angle)},${nodeInfo.y + hexRadius * Math.sin(angle)}`;
         }).join(" ");
 
+        // Update iconBaseHeight to match actual hexagon extent for label placement
+        iconBaseHeight = hexRadius * 2;
+
         // Main shape
         nodeG
           .append("polygon")

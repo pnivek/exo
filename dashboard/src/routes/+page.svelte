@@ -5957,6 +5957,7 @@
                             {tags}
                             {apiPreview}
                             modelIdOverride={apiPreview.model_id}
+                            accentColor={selectedInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
                           />
                         </div>
                       {/each}
