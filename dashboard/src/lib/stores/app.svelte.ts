@@ -780,6 +780,12 @@ class AppStore {
    * Create a new conversation
    */
   createConversation(name?: string): string {
+    // Cancel any in-flight stream before switching conversations
+    this.currentAbortController?.abort();
+    this.currentAbortController = null;
+    this.currentResponse = "";
+    this.isLoading = false;
+
     const id = generateUUID();
     const now = Date.now();
 
@@ -842,6 +848,12 @@ class AppStore {
   loadConversation(id: string): boolean {
     const conversation = this.conversations.find((c) => c.id === id);
     if (!conversation) return false;
+
+    // Cancel any in-flight stream before switching conversations
+    this.currentAbortController?.abort();
+    this.currentAbortController = null;
+    this.currentResponse = "";
+    this.isLoading = false;
 
     this.activeConversationId = id;
     this.messages = [...conversation.messages];
@@ -2080,6 +2092,7 @@ class AppStore {
       if (done) break;
 
       if (!this.conversationExists(targetConversationId)) {
+        reader.cancel().catch(() => {});
         break;
       }
 
@@ -2206,8 +2219,17 @@ class AppStore {
     }[],
     enableThinking?: boolean | null,
   ): Promise<void> {
-    if ((!content.trim() && (!files || files.length === 0)) || this.isLoading)
-      return;
+    if (!content.trim() && (!files || files.length === 0)) return;
+
+    // Cancel any in-flight request before starting a new one
+    if (this.currentAbortController) {
+      this.currentAbortController.abort();
+      this.currentAbortController = null;
+    }
+
+    if (this.isLoading) {
+      this.isLoading = false;
+    }
 
     if (!this.hasStartedChat) {
       this.startChat();
