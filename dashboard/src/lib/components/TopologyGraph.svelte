@@ -286,20 +286,20 @@
         );
         rightIds.push(...unassigned);
 
-        const leftX = width * 0.28;
-        const rightX = width * 0.72;
+        const leftX = width * 0.35;
+        const rightX = width * 0.65;
         const result: { id: string; data: NodeInfo; x: number; y: number }[] =
           [];
 
         leftIds.forEach((id, i) => {
-          const spacing = Math.min(nodeRadius * 3, (height - topPadding - bottomPadding) / Math.max(leftIds.length, 1));
+          const spacing = Math.min(nodeRadius * 2.5, (height - topPadding - bottomPadding) / Math.max(leftIds.length + 1, 2));
           const totalH = (leftIds.length - 1) * spacing;
           const y = safeCenterY - totalH / 2 + i * spacing;
           result.push({ id, data: nodes[id], x: leftX, y });
         });
 
         rightIds.forEach((id, i) => {
-          const spacing = Math.min(nodeRadius * 3, (height - topPadding - bottomPadding) / Math.max(rightIds.length, 1));
+          const spacing = Math.min(nodeRadius * 2.5, (height - topPadding - bottomPadding) / Math.max(rightIds.length + 1, 2));
           const totalH = (rightIds.length - 1) * spacing;
           const y = safeCenterY - totalH / 2 + i * spacing;
           result.push({ id, data: nodes[id], x: rightX, y });

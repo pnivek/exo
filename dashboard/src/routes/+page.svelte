@@ -3827,7 +3827,7 @@
 />
 
 <div
-  class="relative h-screen w-full flex flex-col bg-exo-dark-gray overflow-hidden {selectedInferenceMode === 'pd' ? 'disagg-mode' : ''}"
+  class="relative h-screen w-full flex flex-col bg-exo-dark-gray overflow-hidden {selectedInferenceMode === 'pd' && (disaggFlowGroups?.left?.size ?? 0) > 0 ? 'disagg-mode' : ''}"
 >
   <!-- Scanline overlay -->
   <!-- Scanline overlay -->
@@ -5966,7 +5966,7 @@
                         {@const iconSz =
                           isTp && prefillNodes.length >= 2 ? 38 : 46}
                         {@const svgH =
-                          isTp && prefillNodes.length >= 2 ? 175 : 140}
+                          isTp && prefillNodes.length >= 2 ? 185 : 140}
                         {@const pfCx = 65}
                         {@const dcCx = 195}
                         <div
@@ -6064,12 +6064,12 @@
                               <span
                                 class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
                               >
-                                {isTp ? "Tensor Parallel" : "Disaggregated"}
+                                {isTp ? "Tensor Parallel" : "Pipeline"}
                               </span>
                               <span
                                 class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
                               >
-                                {isTp ? "NCCL + KV" : "KV over TCP"}
+                                {isTp ? "NCCL" : "KV Transfer"}
                               </span>
                             </div>
 
@@ -6253,7 +6253,7 @@
                                   {@const pNodeY =
                                     prefillNodes.length === 1
                                       ? svgH / 2
-                                      : 38 + pi * 65}
+                                      : svgH / 2 - ((prefillNodes.length - 1) * 72) / 2 + pi * 65}
                                   {@const pScreenH = iconSz * 0.58}
                                   {@const pCurFillH =
                                     pScreenH * (pCurPct / 100)}
@@ -6473,8 +6473,10 @@
                                 <!-- NCCL connection between TP prefill nodes -->
                                 {#if isTp && prefillNodes.length >= 2}
                                   {#if true}
-                                    {@const ncclY1 = 38 + iconSz / 2 + 4}
-                                    {@const ncclY2 = 38 + 65 - iconSz / 2 - 4}
+                                    {@const ncclTopY = svgH / 2 - ((prefillNodes.length - 1) * 72) / 2}
+                                    {@const ncclBotY = svgH / 2 + ((prefillNodes.length - 1) * 72) / 2}
+                                    {@const ncclY1 = ncclTopY + iconSz / 2 + 4}
+                                    {@const ncclY2 = ncclBotY - iconSz / 2 - 4}
                                     <line
                                       x1={pfCx}
                                       y1={ncclY1}
@@ -6539,7 +6541,7 @@
                                   {@const dNodeY =
                                     decodeNodes.length === 1
                                       ? svgH / 2
-                                      : 38 + di * 65}
+                                      : svgH / 2 - ((decodeNodes.length - 1) * 72) / 2 + di * 65}
                                   {@const dScreenH = iconSz * 0.58}
                                   {@const dCurFillH =
                                     dScreenH * (dCurPct / 100)}
