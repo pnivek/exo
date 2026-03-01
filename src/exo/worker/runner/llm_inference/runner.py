@@ -899,7 +899,16 @@ def parse_gpt_oss(
         try:
             stream.process(response.token)
         except HarmonyError:
-            logger.error("Encountered critical Harmony Error, returning early")
+            logger.error(
+                f"Harmony Error on token={response.token} "
+                f"text={response.text!r} state={stream.state}, "
+                f"falling back to raw passthrough"
+            )
+            # Yield the current token and pass through remaining tokens unmodified.
+            # This preserves generation output when the Harmony protocol is violated
+            # (e.g. cross-device KV cache causes unexpected first token in disagg mode).
+            yield response
+            yield from responses
             return
 
         delta = stream.last_content_delta
