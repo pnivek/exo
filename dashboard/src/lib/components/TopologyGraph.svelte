@@ -270,8 +270,8 @@
     const showCompactLabels = !isMinimized && numNodes > 4;
 
     // Add padding for labels (top/bottom)
-    const topPadding = 70; // Space for "NETWORK TOPOLOGY" label and node names
-    const bottomPadding = 70; // Space for stats and bottom label
+    const topPadding = 80; // Space for "NETWORK TOPOLOGY" label and node names
+    const bottomPadding = 80; // Space for stats and bottom label
     const safeCenterY = topPadding + (height - topPadding - bottomPadding) / 2;
 
     // Calculate node positions
@@ -292,14 +292,14 @@
           [];
 
         leftIds.forEach((id, i) => {
-          const spacing = Math.min(nodeRadius * 2.5, (height - topPadding - bottomPadding) / Math.max(leftIds.length + 1, 2));
+          const spacing = Math.min(nodeRadius * 3.5, (height - topPadding - bottomPadding) / Math.max(leftIds.length + 1, 2));
           const totalH = (leftIds.length - 1) * spacing;
           const y = safeCenterY - totalH / 2 + i * spacing;
           result.push({ id, data: nodes[id], x: leftX, y });
         });
 
         rightIds.forEach((id, i) => {
-          const spacing = Math.min(nodeRadius * 2.5, (height - topPadding - bottomPadding) / Math.max(rightIds.length + 1, 2));
+          const spacing = Math.min(nodeRadius * 3.5, (height - topPadding - bottomPadding) / Math.max(rightIds.length + 1, 2));
           const totalH = (rightIds.length - 1) * spacing;
           const y = safeCenterY - totalH / 2 + i * spacing;
           result.push({ id, data: nodes[id], x: rightX, y });
@@ -1201,7 +1201,7 @@
       // Labels - adapt based on mode
       if (showFullLabels) {
         // FULL MODE: Name above, memory info below (1-4 nodes)
-        const nameY = nodeInfo.y - iconBaseHeight / 2 - 15;
+        const nameY = nodeInfo.y - iconBaseHeight / 2 - 22;
         const fontSize = Math.max(10, nodeRadius * 0.16);
 
         // Truncate name based on node count
@@ -1226,7 +1226,7 @@
           .text(displayName);
 
         // Memory info below - used in grey, total in yellow
-        const infoY = nodeInfo.y + iconBaseHeight / 2 + 16;
+        const infoY = nodeInfo.y + iconBaseHeight / 2 + 24;
         const memText = nodeG
           .append("text")
           .attr("x", nodeInfo.x)
@@ -1251,7 +1251,7 @@
         const fontSize = Math.max(7, nodeRadius * 0.11);
 
         // Very compact name below icon
-        const nameY = nodeInfo.y + iconBaseHeight / 2 + 9;
+        const nameY = nodeInfo.y + iconBaseHeight / 2 + 14;
         const shortName =
           friendlyName.length > 10
             ? friendlyName.slice(0, 8) + ".."
@@ -1284,7 +1284,7 @@
         const fontSize = 8;
 
         // Friendly name (shortened) above icon
-        const nameY = nodeInfo.y - iconBaseHeight / 2 - 8;
+        const nameY = nodeInfo.y - iconBaseHeight / 2 - 14;
         const shortName =
           friendlyName.length > 12
             ? friendlyName.slice(0, 10) + ".."
@@ -1301,7 +1301,7 @@
           .text(shortName);
 
         // Memory info below icon - used in grey, total in yellow (same as main topology)
-        const infoY = nodeInfo.y + iconBaseHeight / 2 + 10;
+        const infoY = nodeInfo.y + iconBaseHeight / 2 + 18;
         const memTextMini = nodeG
           .append("text")
           .attr("x", nodeInfo.x)
@@ -1328,7 +1328,7 @@
         let debugLabelY =
           nodeInfo.y +
           iconBaseHeight / 2 +
-          (showFullLabels ? 32 : showCompactLabels ? 26 : 22);
+          (showFullLabels ? 40 : showCompactLabels ? 30 : 28);
         const debugFontSize = showFullLabels ? 9 : 7;
         const debugLineHeight = showFullLabels ? 11 : 9;
 
