@@ -5937,6 +5937,16 @@
                         {@const disaggDownloadStatus = getModelDownloadStatus(
                           selectedModel.id,
                         )}
+                        {@const dfId =
+                          selectedModel.id.replace(/[^a-zA-Z0-9]/g, "") +
+                          "_d" +
+                          i}
+                        {@const iconSz =
+                          isTp && prefillNodes.length >= 2 ? 34 : 42}
+                        {@const svgH =
+                          isTp && prefillNodes.length >= 2 ? 140 : 110}
+                        {@const pfCx = 65}
+                        {@const dcCx = 195}
                         <div
                           role="group"
                           class="relative group"
@@ -6068,135 +6078,662 @@
                               </div>
                             {/if}
 
-                            <!-- Prefill / Decode node diagram -->
+                            <!-- Prefill / Decode Topology Diagram -->
                             <div
-                              class="mb-3 bg-exo-black/60 rounded border border-exo-medium-gray/20 p-2.5 relative overflow-hidden"
+                              class="mb-3 bg-exo-black/60 rounded border border-exo-medium-gray/20 p-2 relative overflow-hidden"
                             >
                               <!-- Scanline effect -->
                               <div
                                 class="absolute inset-0 bg-[repeating-linear-gradient(0deg,transparent,transparent_2px,rgba(118,185,0,0.02)_2px,rgba(118,185,0,0.02)_4px)] pointer-events-none"
                               ></div>
 
-                              <div class="flex items-stretch gap-2 relative">
-                                <!-- Prefill box -->
-                                <div
-                                  class="flex-1 border border-exo-nvidia-green/30 rounded-md p-2.5 bg-exo-nvidia-green/5"
-                                >
-                                  <div
-                                    class="text-[10px] font-mono text-exo-nvidia-green tracking-wider uppercase mb-1.5"
+                              <svg
+                                width="100%"
+                                height={svgH}
+                                viewBox="0 0 260 {svgH}"
+                                class="overflow-visible"
+                              >
+                                <defs>
+                                  <filter
+                                    id="dglow-{dfId}"
+                                    x="-50%"
+                                    y="-50%"
+                                    width="200%"
+                                    height="200%"
                                   >
-                                    {isTp ? "PREFILL (TP)" : "PREFILL"}
-                                  </div>
-                                  {#each prefillNodes as nid}
-                                    {@const identity = identitiesData?.[nid]}
-                                    {@const node = data?.nodes?.[nid]}
-                                    {@const totalMem =
-                                      node?.macmon_info?.memory?.ram_total ??
-                                      node?.system_info?.memory ??
-                                      0}
-                                    <div
-                                      class="flex items-center gap-1.5 mb-1 last:mb-0"
-                                    >
-                                      <span
-                                        class="w-2 h-2 rounded-full bg-exo-nvidia-green/60 flex-shrink-0"
-                                      ></span>
-                                      <div class="min-w-0">
-                                        <div
-                                          class="text-xs font-mono text-white/80 truncate"
-                                        >
-                                          {node?.friendly_name ??
-                                            nid.slice(0, 8)}
-                                        </div>
-                                        <div
-                                          class="text-[10px] font-mono text-white/40"
-                                        >
-                                          {identity?.chipId ?? "GPU"}
-                                          {#if totalMem > 0}
-                                            · {(totalMem / 1024 ** 3).toFixed(
-                                              0,
-                                            )}GB
-                                          {/if}
-                                        </div>
-                                      </div>
-                                    </div>
-                                  {/each}
-                                  {#if isTp && prefillNodes.length >= 2}
-                                    <div
-                                      class="text-[10px] font-mono text-exo-nvidia-green/50 mt-1"
-                                    >
-                                      NCCL/RDMA
-                                    </div>
-                                  {/if}
-                                </div>
+                                    <feGaussianBlur
+                                      stdDeviation="2"
+                                      result="blur"
+                                    />
+                                    <feMerge>
+                                      <feMergeNode in="blur" />
+                                      <feMergeNode in="SourceGraphic" />
+                                    </feMerge>
+                                  </filter>
+                                  <filter
+                                    id="dmglow-{dfId}"
+                                    x="-100%"
+                                    y="-100%"
+                                    width="300%"
+                                    height="300%"
+                                  >
+                                    <feGaussianBlur
+                                      stdDeviation="3"
+                                      result="blur"
+                                    />
+                                    <feComposite
+                                      in="SourceGraphic"
+                                      in2="blur"
+                                      operator="over"
+                                    />
+                                  </filter>
+                                </defs>
 
-                                <!-- Arrow -->
-                                <div
-                                  class="flex flex-col items-center justify-center flex-shrink-0 px-1"
+                                <!-- PREFILL label -->
+                                <text
+                                  x={pfCx}
+                                  y="10"
+                                  text-anchor="middle"
+                                  font-size="7"
+                                  font-family="SF Mono, Monaco, monospace"
+                                  fill="#76b900"
+                                  letter-spacing="1.5"
                                 >
-                                  <div
-                                    class="text-exo-nvidia-green/60 text-xs font-mono mb-0.5"
+                                  {isTp ? "PREFILL (TP)" : "PREFILL"}
+                                </text>
+
+                                <!-- DECODE label -->
+                                <text
+                                  x={dcCx}
+                                  y="10"
+                                  text-anchor="middle"
+                                  font-size="7"
+                                  font-family="SF Mono, Monaco, monospace"
+                                  fill="#76b900"
+                                  letter-spacing="1.5"
+                                >
+                                  DECODE
+                                </text>
+
+                                <!-- KV Transfer arrow -->
+                                {#if true}
+                                  {@const arrowMidY = svgH / 2}
+                                  {@const arrowX1 = pfCx + iconSz / 2 + 8}
+                                  {@const arrowX2 = dcCx - iconSz / 2 - 12}
+                                  <line
+                                    x1={arrowX1}
+                                    y1={arrowMidY}
+                                    x2={arrowX2}
+                                    y2={arrowMidY}
+                                    stroke="#76b900"
+                                    stroke-width="1"
+                                    stroke-dasharray="4,3"
+                                    opacity="0.4"
+                                  />
+                                  <polygon
+                                    points="{arrowX2},{arrowMidY} {arrowX2 -
+                                      5},{arrowMidY - 3} {arrowX2 -
+                                      5},{arrowMidY + 3}"
+                                    fill="#76b900"
+                                    opacity="0.5"
+                                  />
+                                  <text
+                                    x={(arrowX1 + arrowX2) / 2}
+                                    y={arrowMidY - 6}
+                                    text-anchor="middle"
+                                    font-size="8"
+                                    font-family="SF Mono, Monaco, monospace"
+                                    fill="#76b900"
+                                    opacity="0.5"
                                   >
                                     KV
-                                  </div>
-                                  <svg
-                                    class="w-5 h-5 text-exo-nvidia-green/60"
-                                    fill="none"
-                                    viewBox="0 0 24 24"
-                                    stroke="currentColor"
-                                    stroke-width="2"
-                                  >
-                                    <path
-                                      stroke-linecap="round"
-                                      stroke-linejoin="round"
-                                      d="M13 7l5 5m0 0l-5 5m5-5H6"
-                                    />
-                                  </svg>
-                                </div>
+                                  </text>
+                                {/if}
 
-                                <!-- Decode box -->
-                                <div
-                                  class="flex-1 border border-exo-nvidia-green/30 rounded-md p-2.5 bg-exo-nvidia-green/5"
-                                >
-                                  <div
-                                    class="text-[10px] font-mono text-exo-nvidia-green tracking-wider uppercase mb-1.5"
+                                <!-- Prefill node(s) -->
+                                {#each prefillNodes as nid, pi}
+                                  {@const pNode = data?.nodes?.[nid]}
+                                  {@const pTotalMem =
+                                    pNode?.macmon_info?.memory?.ram_total ??
+                                    pNode?.system_info?.memory ??
+                                    0}
+                                  {@const pUsedMem =
+                                    pNode?.macmon_info?.memory?.ram_usage ?? 0}
+                                  {@const pDelta =
+                                    apiPreview.memory_delta_by_node?.[nid] ?? 0}
+                                  {@const pSafeTotal = Math.max(pTotalMem, 1)}
+                                  {@const pCurPct = Math.min(
+                                    100,
+                                    Math.max(
+                                      0,
+                                      (pUsedMem / pSafeTotal) * 100,
+                                    ),
+                                  )}
+                                  {@const pNewPct = Math.min(
+                                    100,
+                                    Math.max(
+                                      0,
+                                      ((pUsedMem + pDelta) / pSafeTotal) * 100,
+                                    ),
+                                  )}
+                                  {@const pDevName =
+                                    pNode?.system_info?.model_id ?? "Unknown"}
+                                  {@const pDevLower = pDevName.toLowerCase()}
+                                  {@const pDevType = pDevLower.includes(
+                                    "macbook",
+                                  )
+                                    ? "macbook"
+                                    : pDevLower.includes("studio")
+                                      ? "studio"
+                                      : pDevLower.includes("mini")
+                                        ? "mini"
+                                        : "unknown"}
+                                  {@const pNodeY =
+                                    prefillNodes.length === 1
+                                      ? svgH / 2
+                                      : 30 + pi * 55}
+                                  {@const pScreenH = iconSz * 0.58}
+                                  {@const pCurFillH =
+                                    pScreenH * (pCurPct / 100)}
+                                  {@const pModelFillH =
+                                    pScreenH *
+                                    ((pNewPct - pCurPct) / 100)}
+
+                                  <g
+                                    transform="translate({pfCx}, {pNodeY})"
+                                    filter="url(#dglow-{dfId})"
                                   >
-                                    DECODE
-                                  </div>
-                                  {#each decodeNodes as nid}
-                                    {@const identity = identitiesData?.[nid]}
-                                    {@const node = data?.nodes?.[nid]}
-                                    {@const totalMem =
-                                      node?.macmon_info?.memory?.ram_total ??
-                                      node?.system_info?.memory ??
-                                      0}
-                                    <div
-                                      class="flex items-center gap-1.5 mb-1 last:mb-0"
+                                    {#if pDevType === "macbook"}
+                                      <!-- MacBook icon with memory fill -->
+                                      <g
+                                        transform="translate({-iconSz /
+                                          2}, {-iconSz / 2})"
+                                      >
+                                        <rect
+                                          x="2"
+                                          y="0"
+                                          width={iconSz - 4}
+                                          height={iconSz * 0.65}
+                                          rx="2"
+                                          fill="none"
+                                          stroke="#76b900"
+                                          stroke-width="1.5"
+                                        />
+                                        <rect
+                                          x="4"
+                                          y="2"
+                                          width={iconSz - 8}
+                                          height={pScreenH}
+                                          fill="#0a0a0a"
+                                        />
+                                        <rect
+                                          x="4"
+                                          y={2 + pScreenH - pCurFillH}
+                                          width={iconSz - 8}
+                                          height={pCurFillH}
+                                          fill="#374151"
+                                        />
+                                        {#if pDelta > 0}
+                                          <rect
+                                            x="4"
+                                            y={2 +
+                                              pScreenH -
+                                              pCurFillH -
+                                              pModelFillH}
+                                            width={iconSz - 8}
+                                            height={pModelFillH}
+                                            fill="#76b900"
+                                            filter="url(#dmglow-{dfId})"
+                                            class="animate-pulse"
+                                            opacity="0.8"
+                                          />
+                                        {/if}
+                                        <path
+                                          d="M 0 {iconSz *
+                                            0.68} L {iconSz} {iconSz *
+                                            0.68} L {iconSz -
+                                            2} {iconSz *
+                                            0.78} L 2 {iconSz * 0.78} Z"
+                                          fill="none"
+                                          stroke="#76b900"
+                                          stroke-width="1.5"
+                                        />
+                                      </g>
+                                    {:else if pDevType === "studio"}
+                                      <!-- Mac Studio icon with memory fill -->
+                                      <g
+                                        transform="translate({-iconSz /
+                                          2}, {-iconSz / 2})"
+                                      >
+                                        <rect
+                                          x="2"
+                                          y="2"
+                                          width={iconSz - 4}
+                                          height={iconSz - 4}
+                                          rx="4"
+                                          fill="none"
+                                          stroke="#76b900"
+                                          stroke-width="1.5"
+                                        />
+                                        <rect
+                                          x="4"
+                                          y="4"
+                                          width={iconSz - 8}
+                                          height={iconSz - 8}
+                                          fill="#0a0a0a"
+                                        />
+                                        <rect
+                                          x="4"
+                                          y={4 +
+                                            (iconSz - 8) *
+                                              (1 - pCurPct / 100)}
+                                          width={iconSz - 8}
+                                          height={(iconSz - 8) *
+                                            (pCurPct / 100)}
+                                          fill="#374151"
+                                        />
+                                        {#if pDelta > 0}
+                                          <rect
+                                            x="4"
+                                            y={4 +
+                                              (iconSz - 8) *
+                                                (1 - pNewPct / 100)}
+                                            width={iconSz - 8}
+                                            height={(iconSz - 8) *
+                                              ((pNewPct - pCurPct) / 100)}
+                                            fill="#76b900"
+                                            filter="url(#dmglow-{dfId})"
+                                            class="animate-pulse"
+                                            opacity="0.8"
+                                          />
+                                        {/if}
+                                      </g>
+                                    {:else if pDevType === "mini"}
+                                      <!-- Mac Mini icon with memory fill -->
+                                      <g
+                                        transform="translate({-iconSz /
+                                          2}, {-iconSz / 2})"
+                                      >
+                                        <rect
+                                          x="2"
+                                          y={iconSz * 0.3}
+                                          width={iconSz - 4}
+                                          height={iconSz * 0.4}
+                                          rx="3"
+                                          fill="none"
+                                          stroke="#76b900"
+                                          stroke-width="1.5"
+                                        />
+                                        <rect
+                                          x="4"
+                                          y={iconSz * 0.32}
+                                          width={iconSz - 8}
+                                          height={iconSz * 0.36}
+                                          fill="#0a0a0a"
+                                        />
+                                        <rect
+                                          x="4"
+                                          y={iconSz * 0.32 +
+                                            iconSz *
+                                              0.36 *
+                                              (1 - pCurPct / 100)}
+                                          width={iconSz - 8}
+                                          height={iconSz *
+                                            0.36 *
+                                            (pCurPct / 100)}
+                                          fill="#374151"
+                                        />
+                                        {#if pDelta > 0}
+                                          <rect
+                                            x="4"
+                                            y={iconSz * 0.32 +
+                                              iconSz *
+                                                0.36 *
+                                                (1 - pNewPct / 100)}
+                                            width={iconSz - 8}
+                                            height={iconSz *
+                                              0.36 *
+                                              ((pNewPct - pCurPct) / 100)}
+                                            fill="#76b900"
+                                            filter="url(#dmglow-{dfId})"
+                                            class="animate-pulse"
+                                            opacity="0.8"
+                                          />
+                                        {/if}
+                                      </g>
+                                    {:else}
+                                      <!-- GPU/Unknown - hexagon icon -->
+                                      <g
+                                        transform="translate({-iconSz /
+                                          2}, {-iconSz / 2})"
+                                      >
+                                        <polygon
+                                          points="{iconSz /
+                                            2},0 {iconSz},{iconSz *
+                                            0.25} {iconSz},{iconSz *
+                                            0.75} {iconSz /
+                                            2},{iconSz} 0,{iconSz *
+                                            0.75} 0,{iconSz * 0.25}"
+                                          fill="rgba(118,185,0,0.1)"
+                                          stroke="#76b900"
+                                          stroke-width="1.5"
+                                        />
+                                      </g>
+                                    {/if}
+
+                                    <!-- Node name -->
+                                    <text
+                                      y={iconSz / 2 + 12}
+                                      text-anchor="middle"
+                                      font-size="7"
+                                      font-family="SF Mono, Monaco, monospace"
+                                      fill="rgba(255,255,255,0.7)"
                                     >
-                                      <span
-                                        class="w-2 h-2 rounded-full bg-exo-nvidia-green/60 flex-shrink-0"
-                                      ></span>
-                                      <div class="min-w-0">
-                                        <div
-                                          class="text-xs font-mono text-white/80 truncate"
-                                        >
-                                          {node?.friendly_name ??
-                                            nid.slice(0, 8)}
-                                        </div>
-                                        <div
-                                          class="text-[10px] font-mono text-white/40"
-                                        >
-                                          {identity?.chipId ?? "Apple Silicon"}
-                                          {#if totalMem > 0}
-                                            · {(totalMem / 1024 ** 3).toFixed(
-                                              0,
-                                            )}GB
-                                          {/if}
-                                        </div>
-                                      </div>
-                                    </div>
-                                  {/each}
-                                </div>
-                              </div>
+                                      {pNode?.friendly_name ??
+                                        nid.slice(0, 8)}
+                                    </text>
+
+                                    <!-- Memory percentage -->
+                                    <text
+                                      y={iconSz / 2 + 21}
+                                      text-anchor="middle"
+                                      font-size="7"
+                                      font-family="SF Mono, Monaco, monospace"
+                                      fill={pNewPct > 90
+                                        ? "#f87171"
+                                        : "#76b900"}
+                                    >
+                                      {pNewPct.toFixed(0)}%
+                                    </text>
+                                  </g>
+                                {/each}
+
+                                <!-- NCCL connection between TP prefill nodes -->
+                                {#if isTp && prefillNodes.length >= 2}
+                                  {#if true}
+                                    {@const ncclY1 = 30 + iconSz / 2 + 4}
+                                    {@const ncclY2 = 30 + 55 - iconSz / 2 - 4}
+                                    <line
+                                      x1={pfCx}
+                                      y1={ncclY1}
+                                      x2={pfCx}
+                                      y2={ncclY2}
+                                      stroke="#76b900"
+                                      stroke-width="1"
+                                      stroke-dasharray="3,2"
+                                      opacity="0.3"
+                                    />
+                                    <text
+                                      x={pfCx + iconSz / 2 + 4}
+                                      y={(ncclY1 + ncclY2) / 2 + 3}
+                                      font-size="6"
+                                      font-family="SF Mono, Monaco, monospace"
+                                      fill="#76b900"
+                                      opacity="0.5"
+                                    >
+                                      NCCL
+                                    </text>
+                                  {/if}
+                                {/if}
+
+                                <!-- Decode node(s) -->
+                                {#each decodeNodes as nid, di}
+                                  {@const dNode = data?.nodes?.[nid]}
+                                  {@const dTotalMem =
+                                    dNode?.macmon_info?.memory?.ram_total ??
+                                    dNode?.system_info?.memory ??
+                                    0}
+                                  {@const dUsedMem =
+                                    dNode?.macmon_info?.memory?.ram_usage ?? 0}
+                                  {@const dDelta =
+                                    apiPreview.memory_delta_by_node?.[nid] ?? 0}
+                                  {@const dSafeTotal = Math.max(dTotalMem, 1)}
+                                  {@const dCurPct = Math.min(
+                                    100,
+                                    Math.max(
+                                      0,
+                                      (dUsedMem / dSafeTotal) * 100,
+                                    ),
+                                  )}
+                                  {@const dNewPct = Math.min(
+                                    100,
+                                    Math.max(
+                                      0,
+                                      ((dUsedMem + dDelta) / dSafeTotal) * 100,
+                                    ),
+                                  )}
+                                  {@const dDevName =
+                                    dNode?.system_info?.model_id ?? "Unknown"}
+                                  {@const dDevLower = dDevName.toLowerCase()}
+                                  {@const dDevType = dDevLower.includes(
+                                    "macbook",
+                                  )
+                                    ? "macbook"
+                                    : dDevLower.includes("studio")
+                                      ? "studio"
+                                      : dDevLower.includes("mini")
+                                        ? "mini"
+                                        : "unknown"}
+                                  {@const dNodeY =
+                                    decodeNodes.length === 1
+                                      ? svgH / 2
+                                      : 30 + di * 55}
+                                  {@const dScreenH = iconSz * 0.58}
+                                  {@const dCurFillH =
+                                    dScreenH * (dCurPct / 100)}
+                                  {@const dModelFillH =
+                                    dScreenH *
+                                    ((dNewPct - dCurPct) / 100)}
+
+                                  <g
+                                    transform="translate({dcCx}, {dNodeY})"
+                                    filter="url(#dglow-{dfId})"
+                                  >
+                                    {#if dDevType === "macbook"}
+                                      <!-- MacBook icon with memory fill -->
+                                      <g
+                                        transform="translate({-iconSz /
+                                          2}, {-iconSz / 2})"
+                                      >
+                                        <rect
+                                          x="2"
+                                          y="0"
+                                          width={iconSz - 4}
+                                          height={iconSz * 0.65}
+                                          rx="2"
+                                          fill="none"
+                                          stroke="#76b900"
+                                          stroke-width="1.5"
+                                        />
+                                        <rect
+                                          x="4"
+                                          y="2"
+                                          width={iconSz - 8}
+                                          height={dScreenH}
+                                          fill="#0a0a0a"
+                                        />
+                                        <rect
+                                          x="4"
+                                          y={2 + dScreenH - dCurFillH}
+                                          width={iconSz - 8}
+                                          height={dCurFillH}
+                                          fill="#374151"
+                                        />
+                                        {#if dDelta > 0}
+                                          <rect
+                                            x="4"
+                                            y={2 +
+                                              dScreenH -
+                                              dCurFillH -
+                                              dModelFillH}
+                                            width={iconSz - 8}
+                                            height={dModelFillH}
+                                            fill="#76b900"
+                                            filter="url(#dmglow-{dfId})"
+                                            class="animate-pulse"
+                                            opacity="0.8"
+                                          />
+                                        {/if}
+                                        <path
+                                          d="M 0 {iconSz *
+                                            0.68} L {iconSz} {iconSz *
+                                            0.68} L {iconSz -
+                                            2} {iconSz *
+                                            0.78} L 2 {iconSz * 0.78} Z"
+                                          fill="none"
+                                          stroke="#76b900"
+                                          stroke-width="1.5"
+                                        />
+                                      </g>
+                                    {:else if dDevType === "studio"}
+                                      <!-- Mac Studio icon with memory fill -->
+                                      <g
+                                        transform="translate({-iconSz /
+                                          2}, {-iconSz / 2})"
+                                      >
+                                        <rect
+                                          x="2"
+                                          y="2"
+                                          width={iconSz - 4}
+                                          height={iconSz - 4}
+                                          rx="4"
+                                          fill="none"
+                                          stroke="#76b900"
+                                          stroke-width="1.5"
+                                        />
+                                        <rect
+                                          x="4"
+                                          y="4"
+                                          width={iconSz - 8}
+                                          height={iconSz - 8}
+                                          fill="#0a0a0a"
+                                        />
+                                        <rect
+                                          x="4"
+                                          y={4 +
+                                            (iconSz - 8) *
+                                              (1 - dCurPct / 100)}
+                                          width={iconSz - 8}
+                                          height={(iconSz - 8) *
+                                            (dCurPct / 100)}
+                                          fill="#374151"
+                                        />
+                                        {#if dDelta > 0}
+                                          <rect
+                                            x="4"
+                                            y={4 +
+                                              (iconSz - 8) *
+                                                (1 - dNewPct / 100)}
+                                            width={iconSz - 8}
+                                            height={(iconSz - 8) *
+                                              ((dNewPct - dCurPct) / 100)}
+                                            fill="#76b900"
+                                            filter="url(#dmglow-{dfId})"
+                                            class="animate-pulse"
+                                            opacity="0.8"
+                                          />
+                                        {/if}
+                                      </g>
+                                    {:else if dDevType === "mini"}
+                                      <!-- Mac Mini icon with memory fill -->
+                                      <g
+                                        transform="translate({-iconSz /
+                                          2}, {-iconSz / 2})"
+                                      >
+                                        <rect
+                                          x="2"
+                                          y={iconSz * 0.3}
+                                          width={iconSz - 4}
+                                          height={iconSz * 0.4}
+                                          rx="3"
+                                          fill="none"
+                                          stroke="#76b900"
+                                          stroke-width="1.5"
+                                        />
+                                        <rect
+                                          x="4"
+                                          y={iconSz * 0.32}
+                                          width={iconSz - 8}
+                                          height={iconSz * 0.36}
+                                          fill="#0a0a0a"
+                                        />
+                                        <rect
+                                          x="4"
+                                          y={iconSz * 0.32 +
+                                            iconSz *
+                                              0.36 *
+                                              (1 - dCurPct / 100)}
+                                          width={iconSz - 8}
+                                          height={iconSz *
+                                            0.36 *
+                                            (dCurPct / 100)}
+                                          fill="#374151"
+                                        />
+                                        {#if dDelta > 0}
+                                          <rect
+                                            x="4"
+                                            y={iconSz * 0.32 +
+                                              iconSz *
+                                                0.36 *
+                                                (1 - dNewPct / 100)}
+                                            width={iconSz - 8}
+                                            height={iconSz *
+                                              0.36 *
+                                              ((dNewPct - dCurPct) / 100)}
+                                            fill="#76b900"
+                                            filter="url(#dmglow-{dfId})"
+                                            class="animate-pulse"
+                                            opacity="0.8"
+                                          />
+                                        {/if}
+                                      </g>
+                                    {:else}
+                                      <!-- Unknown device - hexagon -->
+                                      <g
+                                        transform="translate({-iconSz /
+                                          2}, {-iconSz / 2})"
+                                      >
+                                        <polygon
+                                          points="{iconSz /
+                                            2},0 {iconSz},{iconSz *
+                                            0.25} {iconSz},{iconSz *
+                                            0.75} {iconSz /
+                                            2},{iconSz} 0,{iconSz *
+                                            0.75} 0,{iconSz * 0.25}"
+                                          fill="rgba(118,185,0,0.1)"
+                                          stroke="#76b900"
+                                          stroke-width="1.5"
+                                        />
+                                      </g>
+                                    {/if}
+
+                                    <!-- Node name -->
+                                    <text
+                                      y={iconSz / 2 + 12}
+                                      text-anchor="middle"
+                                      font-size="7"
+                                      font-family="SF Mono, Monaco, monospace"
+                                      fill="rgba(255,255,255,0.7)"
+                                    >
+                                      {dNode?.friendly_name ??
+                                        nid.slice(0, 8)}
+                                    </text>
+
+                                    <!-- Memory percentage -->
+                                    <text
+                                      y={iconSz / 2 + 21}
+                                      text-anchor="middle"
+                                      font-size="7"
+                                      font-family="SF Mono, Monaco, monospace"
+                                      fill={dNewPct > 90
+                                        ? "#f87171"
+                                        : "#76b900"}
+                                    >
+                                      {dNewPct.toFixed(0)}%
+                                    </text>
+                                  </g>
+                                {/each}
+                              </svg>
                             </div>
 
                             <!-- Launch Button (full-width, matching ModelCard) -->
