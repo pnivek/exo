@@ -92,6 +92,44 @@ async def _get_interface_types_from_networksetup() -> dict[str, InterfaceType]:
     return types
 
 
+def _get_linux_interface_types() -> dict[str, InterfaceType]:
+    """Classify Linux network interfaces via sysfs.
+
+    Uses /sys/class/net/<iface>/wireless and /sys/class/net/<iface>/type
+    to distinguish wifi from ethernet interfaces.
+    """
+    types: dict[str, InterfaceType] = {}
+    net_class = Path("/sys/class/net")
+    if not net_class.exists():
+        return types
+
+    for iface_dir in net_class.iterdir():
+        iface_name = iface_dir.name
+        if iface_name == "lo":
+            continue
+
+        is_wireless = (iface_dir / "wireless").exists() or (
+            iface_dir / "phy80211"
+        ).exists()
+        if is_wireless:
+            types[iface_name] = "wifi"
+            continue
+
+        type_path = iface_dir / "type"
+        try:
+            arphrd_type = int(type_path.read_text().strip())
+        except (OSError, ValueError):
+            types[iface_name] = "unknown"
+            continue
+
+        if arphrd_type == 1:  # ARPHRD_ETHER
+            types[iface_name] = "ethernet"
+        else:
+            types[iface_name] = "unknown"
+
+    return types
+
+
 def _get_linux_rdma_netdev_map() -> dict[str, str]:
     """Map network interface names to RDMA device names on Linux.
 
@@ -128,7 +166,12 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     Returns a list of NetworkInterfaceInfo objects.
     """
     interfaces_info: list[NetworkInterfaceInfo] = []
-    interface_types = await _get_interface_types_from_networksetup()
+    if sys.platform == "darwin":
+        interface_types = await _get_interface_types_from_networksetup()
+    elif sys.platform == "linux":
+        interface_types = _get_linux_interface_types()
+    else:
+        interface_types = {}
     rdma_map: dict[str, str] = (
         _get_linux_rdma_netdev_map() if sys.platform == "linux" else {}
     )
@@ -143,6 +186,7 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
                             ip_address=service.address,
                             interface_type=interface_types.get(iface, "unknown"),
                             rdma_device_name=rdma_map.get(iface),
+                            netmask=service.netmask,
                         )
                     )
                 case _:

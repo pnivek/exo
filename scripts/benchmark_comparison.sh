@@ -63,26 +63,74 @@ CONFIG=""
 API_URL=""
 COMBINE=false
 RUN_ALL=false
-ONLY_CONFIGS=""   # space-separated allow-list for --run-all; empty = all 4
+ONLY_CONFIGS="" # space-separated allow-list for --run-all; empty = all 4
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-  --configs)        ONLY_CONFIGS="$2";     shift 2 ;;  # e.g. --configs "mac spark"
-  --config)         CONFIG="$2";           shift 2 ;;
-  --api)            API_URL="$2";          shift 2 ;;
-  --model)          MODEL_ID="$2";         shift 2 ;;
-  --trials)         TRIALS="$2";           shift 2 ;;
-  --mac-ssh)        MAC_SSH="$2";          shift 2 ;;
-  --spark-ssh)      SPARK_SSH="$2";        shift 2 ;;
-  --spark2-ssh)     SPARK2_SSH="$2";       shift 2 ;;
-  --mac-api)        MAC_API="$2";          shift 2 ;;
-  --spark-api)      SPARK_API="$2";        shift 2 ;;
-  --spark2-api)     SPARK2_API="$2";       shift 2 ;;
-  --spark-ld-path)  SPARK_LD_PATH="$2";    shift 2 ;;
-  --depths)         DEPTHS="$2";           shift 2 ;;
-  --combine)        COMBINE=true;  shift ;;
-  --run-all)        RUN_ALL=true;  shift ;;
-  *) echo "Unknown argument: $1"; exit 1  ;;
+  --configs)
+    ONLY_CONFIGS="$2"
+    shift 2
+    ;; # e.g. --configs "mac spark"
+  --config)
+    CONFIG="$2"
+    shift 2
+    ;;
+  --api)
+    API_URL="$2"
+    shift 2
+    ;;
+  --model)
+    MODEL_ID="$2"
+    shift 2
+    ;;
+  --trials)
+    TRIALS="$2"
+    shift 2
+    ;;
+  --mac-ssh)
+    MAC_SSH="$2"
+    shift 2
+    ;;
+  --spark-ssh)
+    SPARK_SSH="$2"
+    shift 2
+    ;;
+  --spark2-ssh)
+    SPARK2_SSH="$2"
+    shift 2
+    ;;
+  --mac-api)
+    MAC_API="$2"
+    shift 2
+    ;;
+  --spark-api)
+    SPARK_API="$2"
+    shift 2
+    ;;
+  --spark2-api)
+    SPARK2_API="$2"
+    shift 2
+    ;;
+  --spark-ld-path)
+    SPARK_LD_PATH="$2"
+    shift 2
+    ;;
+  --depths)
+    DEPTHS="$2"
+    shift 2
+    ;;
+  --combine)
+    COMBINE=true
+    shift
+    ;;
+  --run-all)
+    RUN_ALL=true
+    shift
+    ;;
+  *)
+    echo "Unknown argument: $1"
+    exit 1
+    ;;
   esac
 done
 
@@ -213,11 +261,15 @@ _wait_api() {
   local url="$1" label="$2"
   echo -n "  Waiting for ${label} API"
   for i in $(seq 1 40); do
-    if curl -sf "${url}/state" >/dev/null 2>&1; then echo " ready"; return 0; fi
+    if curl -sf "${url}/state" >/dev/null 2>&1; then
+      echo " ready"
+      return 0
+    fi
     echo -n "."
     sleep 2
   done
-  echo " TIMED OUT"; return 1
+  echo " TIMED OUT"
+  return 1
 }
 
 _place_and_wait() {
@@ -228,7 +280,10 @@ _place_and_wait() {
     -d "{\"model_id\":\"${MODEL_ID}\",\"instance_meta\":\"${meta}\"}" >/dev/null
   echo -n "  Waiting for ${n_expected} runner(s) to be Ready"
   for i in $(seq 1 90); do
-    curl -s "${api}/state" -o /tmp/_bench_state.json 2>/dev/null || { sleep 2; continue; }
+    curl -s "${api}/state" -o /tmp/_bench_state.json 2>/dev/null || {
+      sleep 2
+      continue
+    }
     result=$(python3 -c "
 import json, sys
 try:
@@ -241,11 +296,18 @@ except Exception as e:
     print('0/0')
 " 2>/dev/null || echo "0/0")
     echo -n " [${result}]"
-    [[ "$result" == *"FAILED"* ]] && { echo " RUNNER FAILED — aborting"; return 1; }
-    [[ "$result" == "${n_expected}/${n_expected}" ]] && { echo " done"; return 0; }
+    [[ $result == *"FAILED"* ]] && {
+      echo " RUNNER FAILED — aborting"
+      return 1
+    }
+    [[ $result == "${n_expected}/${n_expected}" ]] && {
+      echo " done"
+      return 0
+    }
     sleep 2
   done
-  echo " TIMED OUT"; return 1
+  echo " TIMED OUT"
+  return 1
 }
 
 _kill_mac() {
@@ -314,11 +376,11 @@ if $RUN_ALL; then
   FWD+=" --mac-api ${MAC_API} --spark-api ${SPARK_API} --spark2-api ${SPARK2_API}"
 
   # Returns 0 (true) if the given config should be run based on --configs filter
-  _should_run() { [[ -z "$ONLY_CONFIGS" ]] || [[ " $ONLY_CONFIGS " == *" $1 "* ]]; }
+  _should_run() { [[ -z $ONLY_CONFIGS ]] || [[ " $ONLY_CONFIGS " == *" $1 "* ]]; }
 
   echo "================================================"
   echo "  FULL BENCHMARK SUITE — run-all"
-  [[ -n "$ONLY_CONFIGS" ]] && echo "  Configs:  ${ONLY_CONFIGS}" || echo "  Configs:  mac spark disagg tpdisagg"
+  [[ -n $ONLY_CONFIGS ]] && echo "  Configs:  ${ONLY_CONFIGS}" || echo "  Configs:  mac spark disagg tpdisagg"
   echo "  Model:    ${MODEL_ID}"
   echo "  Trials:   ${TRIALS}"
   echo "  Depths:   ${DEPTHS}"
@@ -378,9 +440,9 @@ if $RUN_ALL; then
     MAC_PORT=$(_ssh "$MAC_SSH" \
       'lsof -i -P -n 2>/dev/null | awk "/python/ && /LISTEN/ && !/52415/ && !/52416/ {print \$9}" | sed "s/.*://" | head -1')
     echo "  Mac libp2p: /ip4/${MAC_HOST}/tcp/${MAC_PORT}"
-    _start_spark  "--dial /ip4/${MAC_HOST}/tcp/${MAC_PORT}"
+    _start_spark "--dial /ip4/${MAC_HOST}/tcp/${MAC_PORT}"
     _start_spark2 "--dial /ip4/${MAC_HOST}/tcp/${MAC_PORT}"
-    _wait_api "$SPARK_API"  "Spark 1"
+    _wait_api "$SPARK_API" "Spark 1"
     _wait_api "$SPARK2_API" "Spark 2"
     sleep 8
     _place_and_wait "$MAC_API" "TensorPrefillDisagg" 3
@@ -440,12 +502,12 @@ echo ""
 # llama-benchy accepts: --depth 0 4096 8192 ...)
 # shellcheck disable=SC2086
 uvx llama-benchy \
-  --base-url  "${API_URL}/v1" \
-  --model     "$MODEL_ID" \
-  --depth     $DEPTHS \
-  --runs      "$TRIALS" \
+  --base-url "${API_URL}/v1" \
+  --model "$MODEL_ID" \
+  --depth $DEPTHS \
+  --runs "$TRIALS" \
   --latency-mode generation \
-  --format    json \
+  --format json \
   --save-result "$OUTFILE"
 
 echo ""

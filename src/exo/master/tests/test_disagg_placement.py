@@ -169,3 +169,114 @@ def test_place_disaggregated_raises_if_no_decode_node(
             node_identities=node_identities,
             node_network=node_network,
         )
+
+
+def test_place_disaggregated_prefers_subnet_connected_prefill(
+    model_card: ModelCard,
+):
+    """When 2 NVIDIA nodes exist, picks the one sharing a subnet with the decode node."""
+    sparkly = NodeId("sparkly")
+    spark1 = NodeId("spark1")
+    mac = NodeId("mac")
+
+    node_identities = {
+        sparkly: NodeIdentity(chip_id="dgx-spark"),
+        spark1: NodeIdentity(chip_id="dgx-spark"),
+        mac: NodeIdentity(chip_id="Apple M2 Ultra"),
+    }
+    node_network = {
+        sparkly: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="eth0",
+                    ip_address="192.168.0.101",
+                    interface_type="ethernet",
+                    netmask="255.255.255.0",
+                ),
+            ]
+        ),
+        spark1: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="enp1s0f0",
+                    ip_address="10.0.0.2",
+                    interface_type="ethernet",
+                    netmask="255.255.255.0",
+                ),
+            ]
+        ),
+        mac: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.0.156",
+                    interface_type="ethernet",
+                    netmask="255.255.255.0",
+                ),
+            ]
+        ),
+    }
+
+    placements = place_disaggregated_instance(
+        model_card=model_card,
+        current_instances={},
+        node_identities=node_identities,
+        node_network=node_network,
+    )
+
+    instance = list(placements.values())[0]
+    assert isinstance(instance, DisaggregatedInstance)
+    # Sparkly shares 192.168.0.x/24 with Mac; Spark1 is on 10.0.0.x/24
+    assert instance.prefill_node_id == sparkly
+    assert instance.decode_node_id == mac
+
+
+def test_place_disaggregated_fallback_no_netmask(
+    model_card: ModelCard,
+):
+    """Without netmask data, falls back to first candidate (backward compat)."""
+    sparkly = NodeId("sparkly")
+    spark1 = NodeId("spark1")
+    mac = NodeId("mac")
+
+    node_identities = {
+        sparkly: NodeIdentity(chip_id="dgx-spark"),
+        spark1: NodeIdentity(chip_id="dgx-spark"),
+        mac: NodeIdentity(chip_id="Apple M2 Ultra"),
+    }
+    # No netmask on any interface
+    node_network = {
+        sparkly: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="eth0", ip_address="192.168.0.101", interface_type="ethernet"
+                ),
+            ]
+        ),
+        spark1: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="enp1s0f0", ip_address="10.0.0.2", interface_type="ethernet"
+                ),
+            ]
+        ),
+        mac: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0", ip_address="192.168.0.156", interface_type="ethernet"
+                ),
+            ]
+        ),
+    }
+
+    placements = place_disaggregated_instance(
+        model_card=model_card,
+        current_instances={},
+        node_identities=node_identities,
+        node_network=node_network,
+    )
+
+    instance = list(placements.values())[0]
+    assert isinstance(instance, DisaggregatedInstance)
+    # Fallback: picks first candidate (no subnet data to differentiate)
+    assert instance.prefill_node_id in (sparkly, spark1)

@@ -21,7 +21,7 @@
     } | null;
     nodes?: Record<string, NodeInfo>;
     sharding?: "Pipeline" | "Tensor";
-    runtime?: "MlxRing" | "MlxJaccl";
+    runtime?: "MlxRing" | "MlxJaccl" | "Disaggregated" | "TensorPrefillDisagg";
     onLaunch?: () => void;
     tags?: string[];
     apiPreview?: PlacementPreview | null;

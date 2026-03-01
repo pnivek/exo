@@ -827,15 +827,23 @@
     return model.tasks.includes("ImageToImage");
   }
   let selectedSharding = $state<"Pipeline" | "Tensor">("Pipeline");
-  type InstanceMeta = "MlxRing" | "MlxJaccl" | "Disaggregated";
+  type InstanceMeta =
+    | "MlxRing"
+    | "MlxJaccl"
+    | "Disaggregated"
+    | "TensorPrefillDisagg";
+  type InferenceMode = "standard" | "pd";
+  let selectedInferenceMode = $state<InferenceMode>("standard");
+  let userHasChosenMode = $state(false);
 
   // Launch defaults persistence
-  const LAUNCH_DEFAULTS_KEY = "exo-launch-defaults-v2";
+  const LAUNCH_DEFAULTS_KEY = "exo-launch-defaults-v3";
   interface LaunchDefaults {
     modelId: string | null;
     sharding: "Pipeline" | "Tensor";
     instanceType: InstanceMeta;
     minNodes: number;
+    inferenceMode: InferenceMode;
   }
 
   function saveLaunchDefaults(): void {
@@ -844,6 +852,7 @@
       sharding: selectedSharding,
       instanceType: selectedInstanceType,
       minNodes: selectedMinNodes,
+      inferenceMode: selectedInferenceMode,
     };
     try {
       localStorage.setItem(LAUNCH_DEFAULTS_KEY, JSON.stringify(defaults));
@@ -875,9 +884,20 @@
     selectedInstanceType =
       defaults.instanceType === "Disaggregated"
         ? "Disaggregated"
-        : defaults.instanceType === "MlxJaccl"
-          ? "MlxJaccl"
-          : "MlxRing";
+        : defaults.instanceType === "TensorPrefillDisagg"
+          ? "TensorPrefillDisagg"
+          : defaults.instanceType === "MlxJaccl"
+            ? "MlxJaccl"
+            : "MlxRing";
+
+    // Apply inference mode
+    if (
+      defaults.inferenceMode === "pd" ||
+      defaults.inferenceMode === "standard"
+    ) {
+      selectedInferenceMode = defaults.inferenceMode;
+      userHasChosenMode = true;
+    }
 
     // Apply minNodes if valid (between 1 and maxNodes)
     if (
@@ -909,6 +929,45 @@
 
   // Advanced options toggle (hides technical jargon for new users)
   let showAdvancedOptions = $state(false);
+
+  // Cluster capability detection for disaggregated inference
+  const clusterCapabilities = $derived.by(() => {
+    if (!identitiesData)
+      return {
+        hasNvidia: false,
+        hasApple: false,
+        nvidiaCount: 0,
+        canDisagg: false,
+        canTpDisagg: false,
+      };
+    const chips = Object.values(identitiesData).map((id: { chipId?: string }) =>
+      (id.chipId ?? "").toLowerCase(),
+    );
+    const nvidiaCount = chips.filter(
+      (c) =>
+        c.includes("nvidia") ||
+        c.includes("dgx") ||
+        c.includes("cuda") ||
+        c.includes("gb10"),
+    ).length;
+    const appleCount = chips.filter(
+      (c) => c.includes("apple") || /\bm[1-4]\b/.test(c),
+    ).length;
+    return {
+      hasNvidia: nvidiaCount > 0,
+      hasApple: appleCount > 0,
+      nvidiaCount,
+      canDisagg: nvidiaCount > 0 && appleCount > 0,
+      canTpDisagg: nvidiaCount >= 2 && appleCount > 0,
+    };
+  });
+
+  // Auto-select PD mode when heterogeneous cluster detected
+  $effect(() => {
+    if (clusterCapabilities.canDisagg && !userHasChosenMode) {
+      selectedInferenceMode = "pd";
+    }
+  });
 
   // Favorites state (reactive)
   const favoritesSet = $derived(getFavoritesSet());
@@ -1090,10 +1149,14 @@
     return { ttft: 300, tps: 50 };
   }
 
-  const matchesSelectedRuntime = (runtime: InstanceMeta): boolean =>
-    selectedInstanceType === "MlxRing"
+  const matchesSelectedRuntime = (runtime: InstanceMeta): boolean => {
+    if (selectedInferenceMode === "pd") {
+      return runtime === "Disaggregated" || runtime === "TensorPrefillDisagg";
+    }
+    return selectedInstanceType === "MlxRing"
       ? runtime === "MlxRing"
       : runtime === "MlxJaccl";
+  };
 
   // Helper to check if a model can be launched (has valid placement with >= minNodes)
   function canModelFit(modelId: string): boolean {
@@ -1101,11 +1164,16 @@
     const matchingPreviews = previewsData.filter(
       (p: PlacementPreview) =>
         p.model_id === modelId &&
-        p.sharding === selectedSharding &&
+        (selectedInferenceMode === "pd" || p.sharding === selectedSharding) &&
         matchesSelectedRuntime(p.instance_meta) &&
         p.error === null &&
         p.memory_delta_by_node !== null,
     );
+
+    // In PD mode, any matching preview is valid (no min nodes check)
+    if (selectedInferenceMode === "pd") {
+      return matchingPreviews.length > 0;
+    }
 
     // Check if any preview has node count >= selectedMinNodes
     return matchingPreviews.some(
@@ -2620,7 +2688,13 @@
     const hasMultiNode = valid.some((p) => getPreviewNodeCount(p) > 1);
 
     if (hasMultiNode) {
-      // Heterogeneous cluster: prefer disaggregated (PD split)
+      // Heterogeneous cluster: prefer TP-Disagg (best prefill throughput with 2+ GPUs)
+      const tpDisagg = valid.filter(
+        (p) => p.instance_meta === "TensorPrefillDisagg",
+      );
+      if (tpDisagg.length > 0) return tpDisagg[0];
+
+      // Then single-GPU Disagg
       const disagg = valid.filter((p) => p.instance_meta === "Disaggregated");
       if (disagg.length > 0) return disagg[0];
 
@@ -3106,11 +3180,17 @@
     // Find previews matching sharding/instance type (model_id filter not needed since previewsData is already for selected model)
     const matchingPreviews = previewsData.filter(
       (p: PlacementPreview) =>
-        p.sharding === selectedSharding &&
+        // In PD mode, skip sharding filter (disagg uses Pipeline as dummy value)
+        (selectedInferenceMode === "pd" || p.sharding === selectedSharding) &&
         matchesSelectedRuntime(p.instance_meta) &&
         p.error === null &&
         p.memory_delta_by_node !== null,
     );
+
+    // In PD mode, skip min nodes filter (always exactly 2 roles)
+    if (selectedInferenceMode === "pd") {
+      return matchingPreviews;
+    }
 
     // Filter to previews with node count >= selectedMinNodes, sorted by node count (ascending)
     return matchingPreviews
@@ -5553,36 +5633,81 @@
               </button>
             </div>
 
-            <!-- Advanced Options Toggle -->
-            <div class="flex-shrink-0 mb-4">
-              <button
-                type="button"
-                onclick={() => (showAdvancedOptions = !showAdvancedOptions)}
-                class="flex items-center gap-2 text-xs text-white/50 hover:text-white/70 font-mono tracking-wider uppercase transition-colors cursor-pointer py-1"
-                aria-expanded={showAdvancedOptions}
-              >
-                <svg
-                  class="w-3 h-3 transition-transform duration-200 {showAdvancedOptions
-                    ? 'rotate-90'
-                    : ''}"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  stroke-width="2"
+            <!-- Inference Mode Toggle -->
+            {#if clusterCapabilities.canDisagg}
+              <div class="flex-shrink-0 mb-4">
+                <div
+                  class="text-xs text-white/50 font-mono mb-2 tracking-wider uppercase"
                 >
-                  <path
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    d="M9 5l7 7-7 7"
-                  />
-                </svg>
-                Advanced Options
-              </button>
+                  Inference Mode:
+                </div>
+                <div class="flex gap-2">
+                  <button
+                    onclick={() => {
+                      selectedInferenceMode = "standard";
+                      userHasChosenMode = true;
+                      saveLaunchDefaults();
+                    }}
+                    class="flex-1 flex flex-col items-center gap-1 py-2 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInferenceMode ===
+                    'standard'
+                      ? 'bg-exo-yellow/10 text-exo-yellow border-exo-yellow'
+                      : 'bg-transparent text-white/60 border-exo-medium-gray/50 hover:border-exo-yellow/30'}"
+                  >
+                    <span class="font-bold tracking-wide">Standard</span>
+                    <span class="text-[10px] opacity-70"
+                      >Shard model across devices</span
+                    >
+                  </button>
+                  <button
+                    onclick={() => {
+                      selectedInferenceMode = "pd";
+                      userHasChosenMode = true;
+                      saveLaunchDefaults();
+                    }}
+                    class="flex-1 flex flex-col items-center gap-1 py-2 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInferenceMode ===
+                    'pd'
+                      ? 'bg-exo-nvidia-green/10 text-exo-nvidia-green border-exo-nvidia-green'
+                      : 'bg-transparent text-white/60 border-exo-medium-gray/50 hover:border-exo-nvidia-green/30'}"
+                  >
+                    <span class="font-bold tracking-wide">Disaggregated</span>
+                    <span class="text-[10px] opacity-70"
+                      >GPU prefill, Apple decode</span
+                    >
+                  </button>
+                </div>
+              </div>
+            {/if}
 
-              {#if showAdvancedOptions}
-                <div class="mt-3 space-y-3 pl-1" in:fade={{ duration: 150 }}>
-                  <!-- Sharding Strategy (hidden for disaggregated) -->
-                  {#if selectedInstanceType !== "Disaggregated"}
+            <!-- Advanced Options Toggle (Standard mode only) -->
+            {#if selectedInferenceMode === "standard"}
+              <div class="flex-shrink-0 mb-4">
+                <button
+                  type="button"
+                  onclick={() => (showAdvancedOptions = !showAdvancedOptions)}
+                  class="flex items-center gap-2 text-xs text-white/50 hover:text-white/70 font-mono tracking-wider uppercase transition-colors cursor-pointer py-1"
+                  aria-expanded={showAdvancedOptions}
+                >
+                  <svg
+                    class="w-3 h-3 transition-transform duration-200 {showAdvancedOptions
+                      ? 'rotate-90'
+                      : ''}"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M9 5l7 7-7 7"
+                    />
+                  </svg>
+                  Advanced Options
+                </button>
+
+                {#if showAdvancedOptions}
+                  <div class="mt-3 space-y-3 pl-1" in:fade={{ duration: 150 }}>
+                    <!-- Sharding Strategy -->
                     <div>
                       <div class="text-xs text-white/50 font-mono mb-2">
                         Sharding Strategy:
@@ -5638,88 +5763,65 @@
                         </button>
                       </div>
                     </div>
-                  {/if}
 
-                  <!-- Interconnect -->
-                  <div>
-                    <div class="text-xs text-white/50 font-mono mb-2">
-                      Interconnect:
-                    </div>
-                    <div class="flex gap-2">
-                      <button
-                        onclick={() => {
-                          selectedInstanceType = "MlxRing";
-                          saveLaunchDefaults();
-                        }}
-                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
-                        'MlxRing'
-                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
-                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
-                      >
-                        <span
-                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedInstanceType ===
+                    <!-- Interconnect (TCP/IP and RDMA only — PD Split is now a separate mode) -->
+                    <div>
+                      <div class="text-xs text-white/50 font-mono mb-2">
+                        Interconnect:
+                      </div>
+                      <div class="flex gap-2">
+                        <button
+                          onclick={() => {
+                            selectedInstanceType = "MlxRing";
+                            saveLaunchDefaults();
+                          }}
+                          class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
                           'MlxRing'
-                            ? 'border-exo-yellow'
-                            : 'border-exo-medium-gray'}"
+                            ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                            : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
                         >
-                          {#if selectedInstanceType === "MlxRing"}
-                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
-                            ></span>
-                          {/if}
-                        </span>
-                        TCP/IP
-                      </button>
-                      <button
-                        onclick={() => {
-                          selectedInstanceType = "MlxJaccl";
-                          saveLaunchDefaults();
-                        }}
-                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
-                        'MlxJaccl'
-                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
-                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
-                      >
-                        <span
-                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedInstanceType ===
+                          <span
+                            class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedInstanceType ===
+                            'MlxRing'
+                              ? 'border-exo-yellow'
+                              : 'border-exo-medium-gray'}"
+                          >
+                            {#if selectedInstanceType === "MlxRing"}
+                              <span
+                                class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                              ></span>
+                            {/if}
+                          </span>
+                          TCP/IP
+                        </button>
+                        <button
+                          onclick={() => {
+                            selectedInstanceType = "MlxJaccl";
+                            saveLaunchDefaults();
+                          }}
+                          class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
                           'MlxJaccl'
-                            ? 'border-exo-yellow'
-                            : 'border-exo-medium-gray'}"
+                            ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                            : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
                         >
-                          {#if selectedInstanceType === "MlxJaccl"}
-                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
-                            ></span>
-                          {/if}
-                        </span>
-                        RDMA (Fast)
-                      </button>
-                      <button
-                        onclick={() => {
-                          selectedInstanceType = "Disaggregated";
-                          saveLaunchDefaults();
-                        }}
-                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
-                        'Disaggregated'
-                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
-                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
-                      >
-                        <span
-                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedInstanceType ===
-                          'Disaggregated'
-                            ? 'border-exo-yellow'
-                            : 'border-exo-medium-gray'}"
-                        >
-                          {#if selectedInstanceType === "Disaggregated"}
-                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
-                            ></span>
-                          {/if}
-                        </span>
-                        PD Split
-                      </button>
+                          <span
+                            class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedInstanceType ===
+                            'MlxJaccl'
+                              ? 'border-exo-yellow'
+                              : 'border-exo-medium-gray'}"
+                          >
+                            {#if selectedInstanceType === "MlxJaccl"}
+                              <span
+                                class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                              ></span>
+                            {/if}
+                          </span>
+                          RDMA (Fast)
+                        </button>
+                      </div>
                     </div>
-                  </div>
 
-                  <!-- Minimum Devices (hidden for disaggregated) -->
-                  {#if selectedInstanceType !== "Disaggregated"}
+                    <!-- Minimum Devices -->
                     <div>
                       <div class="text-xs text-white/50 font-mono mb-2">
                         Minimum Devices:
@@ -5775,10 +5877,10 @@
                         {/each}
                       </div>
                     </div>
-                  {/if}
-                </div>
-              {/if}
-            </div>
+                  </div>
+                {/if}
+              </div>
+            {/if}
 
             <!-- Selected Model Preview -->
             <div class="space-y-3">
@@ -5809,35 +5911,352 @@
                   )}
                   {@const tags = modelTags()[selectedModel.id] || []}
                   <div class="space-y-3">
-                    {#each allPreviews as apiPreview, i}
-                      <div
-                        role="group"
-                        onmouseenter={() => {
-                          if (apiPreview.memory_delta_by_node) {
-                            hoveredPreviewNodes = new Set(
-                              Object.entries(apiPreview.memory_delta_by_node)
-                                .filter(([, delta]) => (delta ?? 0) > 0)
-                                .map(([nodeId]) => nodeId),
-                            );
-                          }
-                        }}
-                        onmouseleave={() => (hoveredPreviewNodes = new Set())}
-                      >
-                        <ModelCard
-                          model={selectedModel}
-                          isLaunching={launchingModelId === selectedModel.id}
-                          {downloadStatus}
-                          nodes={data?.nodes ?? {}}
-                          sharding={apiPreview.sharding}
-                          runtime={apiPreview.instance_meta}
-                          onLaunch={() =>
-                            launchInstance(selectedModel.id, apiPreview)}
-                          {tags}
-                          {apiPreview}
-                          modelIdOverride={apiPreview.model_id}
-                        />
-                      </div>
-                    {/each}
+                    {#if selectedInferenceMode === "pd"}
+                      <!-- Disaggregated Launch Cards -->
+                      {#each allPreviews as apiPreview, i}
+                        {@const nodeIds = apiPreview.memory_delta_by_node
+                          ? Object.keys(apiPreview.memory_delta_by_node)
+                          : []}
+                        {@const isTp =
+                          apiPreview.instance_meta === "TensorPrefillDisagg"}
+                        {@const modelSizeGB = getModelSizeGB(selectedModel)}
+                        {@const prefillNodes = nodeIds.filter((nid) => {
+                          const chip = (
+                            identitiesData?.[nid]?.chipId ?? ""
+                          ).toLowerCase();
+                          return (
+                            chip.includes("nvidia") ||
+                            chip.includes("dgx") ||
+                            chip.includes("cuda") ||
+                            chip.includes("gb10")
+                          );
+                        })}
+                        {@const decodeNodes = nodeIds.filter(
+                          (nid) => !prefillNodes.includes(nid),
+                        )}
+                        {@const disaggDownloadStatus = getModelDownloadStatus(
+                          selectedModel.id,
+                        )}
+                        <div
+                          role="group"
+                          class="relative group"
+                          onmouseenter={() => {
+                            if (apiPreview.memory_delta_by_node) {
+                              hoveredPreviewNodes = new Set(
+                                Object.entries(apiPreview.memory_delta_by_node)
+                                  .filter(([, delta]) => (delta ?? 0) > 0)
+                                  .map(([nodeId]) => nodeId),
+                              );
+                            }
+                          }}
+                          onmouseleave={() => (hoveredPreviewNodes = new Set())}
+                        >
+                          <!-- Corner accents -->
+                          <div
+                            class="absolute -top-px -left-px w-2 h-2 border-l border-t border-exo-nvidia-green/30 group-hover:border-exo-nvidia-green/60 transition-colors"
+                          ></div>
+                          <div
+                            class="absolute -top-px -right-px w-2 h-2 border-r border-t border-exo-nvidia-green/30 group-hover:border-exo-nvidia-green/60 transition-colors"
+                          ></div>
+                          <div
+                            class="absolute -bottom-px -left-px w-2 h-2 border-l border-b border-exo-nvidia-green/30 group-hover:border-exo-nvidia-green/60 transition-colors"
+                          ></div>
+                          <div
+                            class="absolute -bottom-px -right-px w-2 h-2 border-r border-b border-exo-nvidia-green/30 group-hover:border-exo-nvidia-green/60 transition-colors"
+                          ></div>
+
+                          <div
+                            class="bg-exo-dark-gray/60 border border-exo-nvidia-green/20 group-hover:border-exo-nvidia-green/40 p-3 transition-all duration-200 group-hover:shadow-[0_0_15px_rgba(118,185,0,0.1)]"
+                          >
+                            <!-- Model Name & Memory Required -->
+                            <div
+                              class="flex items-start justify-between gap-2 mb-2"
+                            >
+                              <div class="flex-1 min-w-0">
+                                <div class="flex items-center gap-2">
+                                  <div
+                                    class="text-exo-nvidia-green text-xs font-mono tracking-wide truncate"
+                                    title={selectedModel.name ||
+                                      selectedModel.id}
+                                  >
+                                    {selectedModel.name || selectedModel.id}
+                                  </div>
+                                  {#if selectedModel.hugging_face_id}
+                                    <a
+                                      class="shrink-0 text-white/60 hover:text-exo-nvidia-green transition-colors"
+                                      href="https://huggingface.co/{selectedModel.hugging_face_id}"
+                                      target="_blank"
+                                      rel="noreferrer noopener"
+                                      aria-label="View model on Hugging Face"
+                                    >
+                                      <svg
+                                        class="w-3.5 h-3.5"
+                                        viewBox="0 0 24 24"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        stroke-width="2"
+                                        stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                      >
+                                        <path d="M14 3h7v7" />
+                                        <path d="M10 14l11-11" />
+                                        <path
+                                          d="M21 14v6a1 1 0 0 1-1 1h-16a1 1 0 0 1-1-1v-16a1 1 0 0 1 1-1h6"
+                                        />
+                                      </svg>
+                                    </a>
+                                  {/if}
+                                </div>
+                                {#if selectedModel.name && selectedModel.name !== selectedModel.id}
+                                  <div
+                                    class="text-xs text-exo-light-gray font-mono truncate mt-0.5"
+                                    title={selectedModel.id}
+                                  >
+                                    {selectedModel.id}
+                                  </div>
+                                {/if}
+                              </div>
+                              <div class="flex-shrink-0 text-right">
+                                <div
+                                  class="text-xs font-mono text-exo-nvidia-green"
+                                >
+                                  {modelSizeGB >= 1
+                                    ? modelSizeGB.toFixed(0)
+                                    : modelSizeGB.toFixed(1)}GB
+                                </div>
+                              </div>
+                            </div>
+
+                            <!-- Configuration Badge -->
+                            <div class="flex items-center gap-1.5 mb-2">
+                              <span
+                                class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
+                              >
+                                {isTp ? "Tensor Parallel" : "Disaggregated"}
+                              </span>
+                              <span
+                                class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
+                              >
+                                {isTp ? "NCCL + KV" : "KV over TCP"}
+                              </span>
+                            </div>
+
+                            <!-- Download Status -->
+                            {#if disaggDownloadStatus?.isDownloading && disaggDownloadStatus?.progress}
+                              {@const dlProgress =
+                                disaggDownloadStatus.progress}
+                              <div class="mb-2 space-y-1">
+                                <div
+                                  class="flex items-center justify-between text-xs font-mono"
+                                >
+                                  <span
+                                    class="text-blue-400 tracking-wider uppercase"
+                                    >Downloading</span
+                                  >
+                                  <span class="text-white/60">
+                                    {dlProgress.percentage.toFixed(1)}%
+                                  </span>
+                                </div>
+                                <div
+                                  class="h-1 bg-exo-medium-gray/30 rounded overflow-hidden"
+                                >
+                                  <div
+                                    class="h-full bg-blue-500/70 transition-all duration-300"
+                                    style="width: {dlProgress.percentage}%"
+                                  ></div>
+                                </div>
+                              </div>
+                            {/if}
+
+                            <!-- Prefill / Decode node diagram -->
+                            <div
+                              class="mb-3 bg-exo-black/60 rounded border border-exo-medium-gray/20 p-2.5 relative overflow-hidden"
+                            >
+                              <!-- Scanline effect -->
+                              <div
+                                class="absolute inset-0 bg-[repeating-linear-gradient(0deg,transparent,transparent_2px,rgba(118,185,0,0.02)_2px,rgba(118,185,0,0.02)_4px)] pointer-events-none"
+                              ></div>
+
+                              <div class="flex items-stretch gap-2 relative">
+                                <!-- Prefill box -->
+                                <div
+                                  class="flex-1 border border-exo-nvidia-green/30 rounded-md p-2.5 bg-exo-nvidia-green/5"
+                                >
+                                  <div
+                                    class="text-[10px] font-mono text-exo-nvidia-green tracking-wider uppercase mb-1.5"
+                                  >
+                                    {isTp ? "PREFILL (TP)" : "PREFILL"}
+                                  </div>
+                                  {#each prefillNodes as nid}
+                                    {@const identity = identitiesData?.[nid]}
+                                    {@const node = data?.nodes?.[nid]}
+                                    {@const totalMem =
+                                      node?.macmon_info?.memory?.ram_total ??
+                                      node?.system_info?.memory ??
+                                      0}
+                                    <div
+                                      class="flex items-center gap-1.5 mb-1 last:mb-0"
+                                    >
+                                      <span
+                                        class="w-2 h-2 rounded-full bg-exo-nvidia-green/60 flex-shrink-0"
+                                      ></span>
+                                      <div class="min-w-0">
+                                        <div
+                                          class="text-xs font-mono text-white/80 truncate"
+                                        >
+                                          {node?.friendly_name ??
+                                            nid.slice(0, 8)}
+                                        </div>
+                                        <div
+                                          class="text-[10px] font-mono text-white/40"
+                                        >
+                                          {identity?.chipId ?? "GPU"}
+                                          {#if totalMem > 0}
+                                            · {(totalMem / 1024 ** 3).toFixed(
+                                              0,
+                                            )}GB
+                                          {/if}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  {/each}
+                                  {#if isTp && prefillNodes.length >= 2}
+                                    <div
+                                      class="text-[10px] font-mono text-exo-nvidia-green/50 mt-1"
+                                    >
+                                      NCCL/RDMA
+                                    </div>
+                                  {/if}
+                                </div>
+
+                                <!-- Arrow -->
+                                <div
+                                  class="flex flex-col items-center justify-center flex-shrink-0 px-1"
+                                >
+                                  <div
+                                    class="text-exo-nvidia-green/60 text-xs font-mono mb-0.5"
+                                  >
+                                    KV
+                                  </div>
+                                  <svg
+                                    class="w-5 h-5 text-exo-nvidia-green/60"
+                                    fill="none"
+                                    viewBox="0 0 24 24"
+                                    stroke="currentColor"
+                                    stroke-width="2"
+                                  >
+                                    <path
+                                      stroke-linecap="round"
+                                      stroke-linejoin="round"
+                                      d="M13 7l5 5m0 0l-5 5m5-5H6"
+                                    />
+                                  </svg>
+                                </div>
+
+                                <!-- Decode box -->
+                                <div
+                                  class="flex-1 border border-exo-nvidia-green/30 rounded-md p-2.5 bg-exo-nvidia-green/5"
+                                >
+                                  <div
+                                    class="text-[10px] font-mono text-exo-nvidia-green tracking-wider uppercase mb-1.5"
+                                  >
+                                    DECODE
+                                  </div>
+                                  {#each decodeNodes as nid}
+                                    {@const identity = identitiesData?.[nid]}
+                                    {@const node = data?.nodes?.[nid]}
+                                    {@const totalMem =
+                                      node?.macmon_info?.memory?.ram_total ??
+                                      node?.system_info?.memory ??
+                                      0}
+                                    <div
+                                      class="flex items-center gap-1.5 mb-1 last:mb-0"
+                                    >
+                                      <span
+                                        class="w-2 h-2 rounded-full bg-exo-nvidia-green/60 flex-shrink-0"
+                                      ></span>
+                                      <div class="min-w-0">
+                                        <div
+                                          class="text-xs font-mono text-white/80 truncate"
+                                        >
+                                          {node?.friendly_name ??
+                                            nid.slice(0, 8)}
+                                        </div>
+                                        <div
+                                          class="text-[10px] font-mono text-white/40"
+                                        >
+                                          {identity?.chipId ?? "Apple Silicon"}
+                                          {#if totalMem > 0}
+                                            · {(totalMem / 1024 ** 3).toFixed(
+                                              0,
+                                            )}GB
+                                          {/if}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  {/each}
+                                </div>
+                              </div>
+                            </div>
+
+                            <!-- Launch Button (full-width, matching ModelCard) -->
+                            <button
+                              onclick={() =>
+                                launchInstance(selectedModel.id, apiPreview)}
+                              disabled={launchingModelId === selectedModel.id}
+                              class="w-full py-2 text-sm font-mono tracking-wider uppercase border transition-all duration-200
+                                {launchingModelId === selectedModel.id
+                                ? 'bg-transparent text-exo-nvidia-green border-exo-nvidia-green/50 cursor-wait'
+                                : 'bg-transparent text-exo-light-gray border-exo-light-gray/40 hover:text-exo-nvidia-green hover:border-exo-nvidia-green/50 cursor-pointer'}"
+                            >
+                              {#if launchingModelId === selectedModel.id}
+                                <span
+                                  class="flex items-center justify-center gap-1.5"
+                                >
+                                  <span
+                                    class="w-2 h-2 border border-exo-nvidia-green border-t-transparent rounded-full animate-spin"
+                                  ></span>
+                                  LAUNCHING...
+                                </span>
+                              {:else}
+                                ▸ LAUNCH
+                              {/if}
+                            </button>
+                          </div>
+                        </div>
+                      {/each}
+                    {:else}
+                      <!-- Standard Launch Cards -->
+                      {#each allPreviews as apiPreview, i}
+                        <div
+                          role="group"
+                          onmouseenter={() => {
+                            if (apiPreview.memory_delta_by_node) {
+                              hoveredPreviewNodes = new Set(
+                                Object.entries(apiPreview.memory_delta_by_node)
+                                  .filter(([, delta]) => (delta ?? 0) > 0)
+                                  .map(([nodeId]) => nodeId),
+                              );
+                            }
+                          }}
+                          onmouseleave={() => (hoveredPreviewNodes = new Set())}
+                        >
+                          <ModelCard
+                            model={selectedModel}
+                            isLaunching={launchingModelId === selectedModel.id}
+                            {downloadStatus}
+                            nodes={data?.nodes ?? {}}
+                            sharding={apiPreview.sharding}
+                            runtime={apiPreview.instance_meta}
+                            onLaunch={() =>
+                              launchInstance(selectedModel.id, apiPreview)}
+                            {tags}
+                            {apiPreview}
+                            modelIdOverride={apiPreview.model_id}
+                          />
+                        </div>
+                      {/each}
+                    {/if}
                   </div>
                 {:else if selectedModel}
                   <div class="text-center py-4">

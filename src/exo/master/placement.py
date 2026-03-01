@@ -3,6 +3,10 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Sequence
 
+from exo.master.network_affinity import (
+    find_nccl_coordinator_ip,
+    pick_best_connected_node,
+)
 from exo.master.placement_utils import (
     Cycle,
     filter_cycles_by_memory,
@@ -225,27 +229,34 @@ def place_disaggregated_instance(
     Identifies prefill node (DGX Spark / CUDA) and decode node (Apple Silicon)
     from node identities. Both runners load the full model independently.
     """
-    prefill_node_id: NodeId | None = None
+    nvidia_node_ids: list[NodeId] = []
     decode_node_id: NodeId | None = None
     non_apple_nodes: list[NodeId] = []
 
     for node_id, identity in node_identities.items():
         chip_lower = identity.chip_id.lower()
         if "dgx-spark" in chip_lower or "cuda" in chip_lower or "nvidia" in chip_lower:
-            prefill_node_id = node_id
+            nvidia_node_ids.append(node_id)
         elif "apple" in chip_lower or chip_lower.startswith(("m3", "m4", "m2", "m1")):
             decode_node_id = node_id
         else:
             non_apple_nodes.append(node_id)
 
     # Fall back: use the first non-Apple node as prefill (e.g. Linux with unknown chip)
-    if prefill_node_id is None and len(non_apple_nodes) == 1:
-        prefill_node_id = non_apple_nodes[0]
+    if len(nvidia_node_ids) == 0 and len(non_apple_nodes) == 1:
+        nvidia_node_ids = non_apple_nodes
 
-    if prefill_node_id is None:
+    if len(nvidia_node_ids) == 0:
         raise ValueError("No prefill node (DGX Spark / CUDA) found in cluster")
     if decode_node_id is None:
         raise ValueError("No decode node (Apple Silicon) found in cluster")
+
+    # Pick the NVIDIA node with best connectivity to decode node
+    prefill_node_id = pick_best_connected_node(
+        candidates=nvidia_node_ids,
+        target_node=decode_node_id,
+        node_network=node_network,
+    )
 
     # Find decode node IP (prefer ethernet)
     decode_network = node_network.get(decode_node_id, NodeNetworkInfo())
@@ -339,17 +350,9 @@ def place_tensor_prefill_disagg_instance(
     # Find routable IP for NCCL bootstrap (rank 0 coordinator)
     nccl_port = random_ephemeral_port()
     coordinator_node = prefill_node_ids[0]
-    nccl_host_ip: str | None = None
-    coordinator_network = node_network.get(coordinator_node, NodeNetworkInfo())
-    for iface in coordinator_network.interfaces:
-        if (
-            iface.ip_address
-            and iface.ip_address not in ("127.0.0.1", "::1")
-            and not iface.ip_address.startswith("172.")
-            and not iface.ip_address.startswith("fe80:")
-        ):
-            nccl_host_ip = iface.ip_address
-            break
+    nccl_host_ip = find_nccl_coordinator_ip(
+        coordinator_node, prefill_node_ids, node_network
+    )
     if nccl_host_ip is None:
         raise ValueError(
             f"Could not find routable IP for coordinator node {coordinator_node}"
@@ -417,7 +420,11 @@ def place_tensor_prefill_disagg_instance(
         nccl_port=nccl_port,
         decode_node_id=decode_node_id,
         decode_node_host=decode_host,
-        kv_sender_node_id=prefill_node_ids[0],
+        kv_sender_node_id=pick_best_connected_node(
+            candidates=prefill_node_ids,
+            target_node=decode_node_id,
+            node_network=node_network,
+        ),
     )
 
     return target_instances

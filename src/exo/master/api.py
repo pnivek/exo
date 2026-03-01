@@ -475,9 +475,6 @@ class API:
                         )
                     ]
                 )
-        # TODO: PDD
-        # instance_combinations.append((Sharding.PrefillDecodeDisaggregation, InstanceMeta.MlxRing, 1))
-
         for sharding, instance_meta, min_nodes in instance_combinations:
             try:
                 placements = get_instance_placements(
@@ -563,6 +560,62 @@ class API:
                     sharding,
                     instance_meta,
                     len(placement_node_ids),
+                )
+            )
+
+        # Disaggregated previews (heterogeneous cluster: NVIDIA + Apple Silicon)
+        for disagg_meta in (
+            InstanceMeta.Disaggregated,
+            InstanceMeta.TensorPrefillDisagg,
+        ):
+            try:
+                disagg_placements: dict[InstanceId, Instance]
+                if disagg_meta == InstanceMeta.Disaggregated:
+                    disagg_placements = place_disaggregated_instance(
+                        model_card=model_card,
+                        current_instances=self.state.instances,
+                        node_identities=self.state.node_identities,
+                        node_network=self.state.node_network,
+                    )
+                else:
+                    disagg_placements = place_tensor_prefill_disagg_instance(
+                        model_card=model_card,
+                        topology=self.state.topology,
+                        current_instances=self.state.instances,
+                        node_identities=self.state.node_identities,
+                        node_network=self.state.node_network,
+                    )
+            except ValueError:
+                continue
+
+            current_ids = set(self.state.instances.keys())
+            disagg_new_instances = [
+                inst
+                for inst_id, inst in disagg_placements.items()
+                if inst_id not in current_ids
+            ]
+            if len(disagg_new_instances) != 1:
+                continue
+
+            disagg_instance = disagg_new_instances[0]
+            placement_node_ids = list(
+                disagg_instance.shard_assignments.node_to_runner.keys()
+            )
+
+            # Each node loads the full model in disagg modes
+            full_model_bytes = model_card.storage_size.in_bytes
+            memory_delta_by_node = {
+                str(node_id): full_model_bytes for node_id in placement_node_ids
+            }
+
+            previews.append(
+                PlacementPreview(
+                    model_id=model_card.model_id,
+                    sharding=Sharding.Pipeline,
+                    instance_meta=disagg_meta,
+                    instance=disagg_instance,
+                    memory_delta_by_node=memory_delta_by_node or None,
+                    error=None,
                 )
             )
 
