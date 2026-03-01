@@ -1,3 +1,4 @@
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -102,8 +103,15 @@ class Worker:
                 runner.shutdown()
 
     async def _forward_info(self, recv: Receiver[GatheredInfo]):
+        last_sent: dict[str, float] = {}
+        cooldown = 5.0  # seconds — don't re-send same info type faster than this
         with recv as info_stream:
             async for info in info_stream:
+                info_type = type(info).__name__
+                now = time.monotonic()
+                if now - last_sent.get(info_type, 0.0) < cooldown:
+                    continue
+                last_sent[info_type] = now
                 await self.event_sender.send(
                     NodeGatheredInfo(
                         node_id=self.node_id,

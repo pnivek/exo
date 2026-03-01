@@ -110,7 +110,9 @@ class Election:
 
     async def elect(self, em: ElectionMessage) -> None:
         logger.debug(f"Electing: {em}")
-        is_new_master = em.proposed_session != self.current_session
+        is_new_master = (
+            em.proposed_session.master_node_id != self.current_session.master_node_id
+        )
         self.current_session = em.proposed_session
         logger.debug(f"Current session: {self.current_session}")
         await self._er_sender.send(
