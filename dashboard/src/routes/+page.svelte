@@ -985,6 +985,12 @@
     }
   });
 
+  // Effective inference mode: only "pd" when cluster actually supports it
+  // (selectedInferenceMode may be "pd" from localStorage even when no CUDA nodes are present)
+  const effectiveInferenceMode = $derived<InferenceMode>(
+    selectedInferenceMode === "pd" && clusterCapabilities.canDisagg ? "pd" : "standard",
+  );
+
   // Favorites state (reactive)
   const favoritesSet = $derived(getFavoritesSet());
 
@@ -1166,7 +1172,7 @@
   }
 
   const matchesSelectedRuntime = (runtime: InstanceMeta): boolean => {
-    if (selectedInferenceMode === "pd") {
+    if (effectiveInferenceMode === "pd") {
       return runtime === "Disaggregated" || runtime === "TensorPrefillDisagg";
     }
     return selectedInstanceType === "MlxRing"
@@ -1180,14 +1186,14 @@
     const matchingPreviews = previewsData.filter(
       (p: PlacementPreview) =>
         p.model_id === modelId &&
-        (selectedInferenceMode === "pd" || p.sharding === selectedSharding) &&
+        (effectiveInferenceMode === "pd" || p.sharding === selectedSharding) &&
         matchesSelectedRuntime(p.instance_meta) &&
         p.error === null &&
         p.memory_delta_by_node !== null,
     );
 
     // In PD mode, any matching preview is valid (no min nodes check)
-    if (selectedInferenceMode === "pd") {
+    if (effectiveInferenceMode === "pd") {
       return matchingPreviews.length > 0;
     }
 
@@ -3197,14 +3203,14 @@
     const matchingPreviews = previewsData.filter(
       (p: PlacementPreview) =>
         // In PD mode, skip sharding filter (disagg uses Pipeline as dummy value)
-        (selectedInferenceMode === "pd" || p.sharding === selectedSharding) &&
+        (effectiveInferenceMode === "pd" || p.sharding === selectedSharding) &&
         matchesSelectedRuntime(p.instance_meta) &&
         p.error === null &&
         p.memory_delta_by_node !== null,
     );
 
     // In PD mode, skip min nodes filter (always exactly 2 roles)
-    if (selectedInferenceMode === "pd") {
+    if (effectiveInferenceMode === "pd") {
       return matchingPreviews;
     }
 
@@ -3827,7 +3833,7 @@
 />
 
 <div
-  class="relative h-screen w-full flex flex-col bg-exo-dark-gray overflow-hidden {selectedInferenceMode === 'pd' && (disaggFlowGroups?.left?.size ?? 0) > 0 ? 'disagg-mode' : ''}"
+  class="relative h-screen w-full flex flex-col bg-exo-dark-gray overflow-hidden {effectiveInferenceMode === 'pd' ? 'disagg-mode' : ''}"
 >
   <!-- Scanline overlay -->
   <!-- Scanline overlay -->
@@ -4748,9 +4754,9 @@
             highlightedNodes={highlightedNodes()}
             filteredNodes={nodeFilter}
             onNodeClick={togglePreviewNodeFilter}
-            layoutMode={selectedInferenceMode === "pd" ? "flow" : "circular"}
-            flowGroups={selectedInferenceMode === "pd" ? disaggFlowGroups : undefined}
-            accentColor={selectedInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
+            layoutMode={effectiveInferenceMode === "pd" ? "flow" : "circular"}
+            flowGroups={effectiveInferenceMode === "pd" ? disaggFlowGroups : undefined}
+            accentColor={effectiveInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
           />
 
           {@render clusterWarnings()}
@@ -4876,9 +4882,9 @@
               highlightedNodes={highlightedNodes()}
               filteredNodes={nodeFilter}
               onNodeClick={togglePreviewNodeFilter}
-              layoutMode={selectedInferenceMode === "pd" ? "flow" : "circular"}
-              flowGroups={selectedInferenceMode === "pd" ? disaggFlowGroups : undefined}
-              accentColor={selectedInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
+              layoutMode={effectiveInferenceMode === "pd" ? "flow" : "circular"}
+              flowGroups={effectiveInferenceMode === "pd" ? disaggFlowGroups : undefined}
+              accentColor={effectiveInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
             />
 
             <!-- Initial loading state before first data fetch -->
@@ -5699,7 +5705,7 @@
             {/if}
 
             <!-- Advanced Options Toggle (Standard mode only) -->
-            {#if selectedInferenceMode === "standard"}
+            {#if effectiveInferenceMode === "standard"}
               <div class="flex-shrink-0 mb-4">
                 <button
                   type="button"
@@ -5957,7 +5963,7 @@
                             {tags}
                             {apiPreview}
                             modelIdOverride={apiPreview.model_id}
-                            accentColor={selectedInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
+                            accentColor={effectiveInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
                           />
                         </div>
                       {/each}
@@ -6219,9 +6225,9 @@
                   highlightedNodes={highlightedNodes()}
                   filteredNodes={nodeFilter}
                   onNodeClick={togglePreviewNodeFilter}
-                  layoutMode={selectedInferenceMode === "pd" ? "flow" : "circular"}
-                  flowGroups={selectedInferenceMode === "pd" ? disaggFlowGroups : undefined}
-                  accentColor={selectedInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
+                  layoutMode={effectiveInferenceMode === "pd" ? "flow" : "circular"}
+                  flowGroups={effectiveInferenceMode === "pd" ? disaggFlowGroups : undefined}
+                  accentColor={effectiveInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
                 />
 
                 {@render clusterWarningsCompact()}
