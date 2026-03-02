@@ -455,16 +455,12 @@ class Master:
                                     )
                                 )
                         case TaskFinished():
-                            generated_events.append(
-                                TaskDeleted(
-                                    task_id=self.command_task_mapping[
-                                        command.finished_command_id
-                                    ]
+                            if (
+                                task_id := self.command_task_mapping.pop(
+                                    command.finished_command_id, None
                                 )
-                            )
-                            self.command_task_mapping.pop(
-                                command.finished_command_id, None
-                            )
+                            ) is not None:
+                                generated_events.append(TaskDeleted(task_id=task_id))
                             # Clean up paired prefill task for disaggregated inference
                             if (
                                 prefill_task_id := self.disagg_prefill_task_mapping.pop(
