@@ -19,15 +19,20 @@ from exo.shared.types.commands import (
 )
 from exo.shared.types.common import CommandId, NodeId, SystemId
 from exo.shared.types.events import (
+    ChunkGenerated,
     Event,
     IndexedEvent,
     InputChunkReceived,
     NodeDownloadProgress,
     NodeGatheredInfo,
+    TaskAcknowledged,
     TaskCreated,
     TaskStatusUpdated,
+    TestEvent,
     TopologyEdgeCreated,
     TopologyEdgeDeleted,
+    TracesCollected,
+    TracesMerged,
 )
 from exo.shared.types.multiaddr import Multiaddr
 from exo.shared.types.state import State
@@ -81,6 +86,7 @@ class Worker:
         self.input_chunk_counts: dict[CommandId, int] = {}
 
         self._download_backoff: KeyedBackoff[ModelId] = KeyedBackoff(base=0.5, cap=10.0)
+        self._plan_wake: anyio.Event = anyio.Event()
 
     async def run(self):
         logger.info("Starting Worker")
@@ -138,27 +144,46 @@ class Worker:
                     )
                 )
 
+    # Events that pass through apply() without modifying state — no need to wake plan_step
+    _PASSTHROUGH_EVENTS = (
+        TestEvent,
+        ChunkGenerated,
+        TaskAcknowledged,
+        InputChunkReceived,
+        TracesCollected,
+        TracesMerged,
+    )
+
     async def _event_applier(self):
         with self.event_receiver as events:
             async for event in events:
                 # 2. for each event, apply it to the state
                 self.state = apply(self.state, event=event)
-                event = event.event
+                raw = event.event
 
                 # Buffer input image chunks for image editing
-                if isinstance(event, InputChunkReceived):
-                    cmd_id = event.command_id
+                if isinstance(raw, InputChunkReceived):
+                    cmd_id = raw.command_id
                     if cmd_id not in self.input_chunk_buffer:
                         self.input_chunk_buffer[cmd_id] = {}
-                        self.input_chunk_counts[cmd_id] = event.chunk.total_chunks
+                        self.input_chunk_counts[cmd_id] = raw.chunk.total_chunks
 
-                    self.input_chunk_buffer[cmd_id][event.chunk.chunk_index] = (
-                        event.chunk.data
+                    self.input_chunk_buffer[cmd_id][raw.chunk.chunk_index] = (
+                        raw.chunk.data
                     )
+
+                # Wake plan_step for state-mutating events
+                if not isinstance(raw, self._PASSTHROUGH_EVENTS):
+                    self._plan_wake.set()
 
     async def plan_step(self):
         while True:
-            await anyio.sleep(0.1)
+            # Wait for a state-mutating event or 2s fallback (safety net)
+            with anyio.move_on_after(2):
+                await self._plan_wake.wait()
+            # anyio.Event is single-use — replace after each wake.
+            # Safe because _event_applier and plan_step are cooperative (same thread).
+            self._plan_wake = anyio.Event()
             task: Task | None = plan(
                 self.node_id,
                 self.runners,

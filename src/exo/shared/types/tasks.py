@@ -93,6 +93,7 @@ class DisaggPrefill(BaseTask):  # emitted by Master
     task_params: TextGenerationTaskParams
     decode_node_host: str
     decode_node_port: int = 52416
+    paired_task_id: TaskId | None = Field(default=None)
 
     error_type: str | None = Field(default=None)
     error_message: str | None = Field(default=None)
@@ -104,6 +105,7 @@ class DisaggDecode(BaseTask):  # emitted by Master
     command_id: CommandId
     task_params: TextGenerationTaskParams
     kv_transfer_port: int = 52416
+    paired_task_id: TaskId | None = Field(default=None)
 
     error_type: str | None = Field(default=None)
     error_message: str | None = Field(default=None)
@@ -120,6 +122,7 @@ class TensorParallelDisaggPrefill(BaseTask):  # emitted by Master
     task_params: TextGenerationTaskParams
     decode_node_host: str
     decode_node_port: int = 52416
+    paired_task_id: TaskId | None = Field(default=None)
 
     error_type: str | None = Field(default=None)
     error_message: str | None = Field(default=None)
