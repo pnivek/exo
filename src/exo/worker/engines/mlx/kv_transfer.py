@@ -124,8 +124,10 @@ def deserialize_kv_cache(data: bytes) -> tuple[list[KVCache], mx.array]:
         keys = mx.array(loaded[f"layer_{i}_keys"])  # pyright: ignore[reportAny]
         values = mx.array(loaded[f"layer_{i}_values"])  # pyright: ignore[reportAny]
         if uses_bfloat16:
-            keys = keys.astype(mx.bfloat16)
-            values = values.astype(mx.bfloat16)
+            # Bitcast uint16 bits back to bfloat16 — lossless recovery
+            # matching the serialize path which uses view(mx.uint16).
+            keys = keys.view(mx.bfloat16)
+            values = values.view(mx.bfloat16)
         cache.state = (keys, values)
         cache.offset = int(loaded[f"layer_{i}_offset"][0])  # pyright: ignore[reportAny]
         caches.append(cache)
@@ -966,12 +968,25 @@ class KVTransferServer:
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server.bind(("0.0.0.0", port))
-        self._server.listen(1)
+        self._server.listen(4)
         logger.info(f"KV transfer server listening on port {port} (persistent)")
 
-    def receive(self) -> tuple[list[KVCache], mx.array]:
-        """Block until a prefill node connects and sends a KV cache."""
-        conn, addr = self._server.accept()  # pyright: ignore[reportAny]
+    def receive(self, timeout: float = 120.0) -> tuple[list[KVCache], mx.array]:
+        """Block until a prefill node connects and sends a KV cache.
+
+        Raises ``TimeoutError`` if no connection arrives within *timeout*
+        seconds, preventing the decode runner from blocking forever when
+        the prefill node crashes or fails to connect.
+        """
+        self._server.settimeout(timeout)
+        try:
+            conn, addr = self._server.accept()  # pyright: ignore[reportAny]
+        except socket.timeout:
+            raise TimeoutError(
+                f"No prefill connection received within {timeout}s on port {self.port}"
+            ) from None
+        finally:
+            self._server.settimeout(None)
         logger.info(f"KV transfer connection from {addr}")
         try:
             return _receive_one_connection(conn)

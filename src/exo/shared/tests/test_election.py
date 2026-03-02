@@ -91,7 +91,7 @@ async def test_single_round_broadcasts_and_updates_seniority_on_self_win() -> No
             # Wait for the round to finish and produce an ElectionResult
             result = await er_rx.receive()
             assert result.session_id.master_node_id == NodeId("B")
-            # We spawned as master; electing ourselves again is not "new master".
+            # Same node wins with the same session — not a new master.
             assert result.is_new_master is False
 
             # Close inbound streams to end the receivers (and run())

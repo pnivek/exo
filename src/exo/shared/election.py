@@ -113,9 +113,13 @@ class Election:
 
     async def elect(self, em: ElectionMessage) -> None:
         logger.debug(f"Electing: {em}")
-        is_new_master = (
-            em.proposed_session.master_node_id != self.current_session.master_node_id
-        )
+        # Treat any session change as "new master" — even when the same node
+        # wins again, the session ID (election_clock) has changed and all
+        # components (event_router, worker, download_coordinator) must be
+        # recreated so they reference the new session.  Checking only the
+        # master_node_id caused session drift when the same master re-won
+        # after a WiFi flap.
+        is_new_master = em.proposed_session != self.current_session
         self.current_session = em.proposed_session
         logger.debug(f"Current session: {self.current_session}")
         await self._er_sender.send(
