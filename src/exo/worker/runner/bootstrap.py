@@ -92,6 +92,15 @@ def entrypoint(
         logger.info(f"Fast synch flag: {os.environ['MLX_METAL_FAST_SYNCH']}")
     else:
         logger.info("Metal not available, skipping MLX_METAL_FAST_SYNCH")
+        # On CUDA unified-memory devices (GB10), the default 95% cache limit
+        # causes freed buffers to stay resident in the OS page cache
+        # indefinitely.  nvidia-smi can't track memory on these devices, so
+        # the OS sees it as "used" and memory accumulates across requests.
+        # Disable buffer caching so every free returns memory to the system.
+        old_limit = mx.set_cache_limit(0)
+        logger.info(
+            f"CUDA buffer cache disabled (was {old_limit / 1024**3:.1f} GB)"
+        )
 
     # Import main after setting global logger - this lets us just import logger from this module
     try:
