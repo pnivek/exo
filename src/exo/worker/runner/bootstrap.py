@@ -98,9 +98,7 @@ def entrypoint(
         # the OS sees it as "used" and memory accumulates across requests.
         # Disable buffer caching so every free returns memory to the system.
         old_limit = mx.set_cache_limit(0)
-        logger.info(
-            f"CUDA buffer cache disabled (was {old_limit / 1024**3:.1f} GB)"
-        )
+        logger.info(f"CUDA buffer cache disabled (was {old_limit / 1024**3:.1f} GB)")
 
     # Import main after setting global logger - this lets us just import logger from this module
     try:
