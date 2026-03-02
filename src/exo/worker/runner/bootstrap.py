@@ -77,9 +77,12 @@ def entrypoint(
     _ensure_tiktoken_vocab_cached()
 
     # Increase CUDA graph cache for long-context TP prefill workloads.
-    # Default (400) causes cache thrashing at 16K+ tokens with tensor parallelism.
+    # Each unique (sequence_length × layer × TP_rank) combination creates a new
+    # cached graph.  With 36 layers, world_size=2, and varying context depths
+    # (4K–32K+), 2000 entries thrash on the second or third request.  10000
+    # provides headroom up to ~64K context without evictions.
     if "MLX_CUDA_GRAPH_CACHE_SIZE" not in os.environ:
-        os.environ["MLX_CUDA_GRAPH_CACHE_SIZE"] = "2000"
+        os.environ["MLX_CUDA_GRAPH_CACHE_SIZE"] = "10000"
 
     import mlx.core as mx
 
