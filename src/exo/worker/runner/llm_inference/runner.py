@@ -1,3 +1,4 @@
+import itertools
 import math
 import resource
 import time
@@ -480,6 +481,7 @@ def main(
                         )
                         from exo.worker.engines.mlx.constants import (
                             DISAGG_REPREFILL_TOKENS,
+                            HARMONY_CHANNEL_TOKEN_ID,
                         )
                         from exo.worker.engines.mlx.kv_transfer import (
                             send_kv_cache_pipelined_sync,
@@ -487,6 +489,18 @@ def main(
 
                         prompt = apply_chat_template(tokenizer, task_params)
                         all_prompt_tokens = encode_prompt(tokenizer, prompt)
+
+                        # Template-aware: append the <|channel|> token so the
+                        # decode node's first generated token is the channel
+                        # name, not a protocol marker that MoE routing
+                        # divergence might corrupt.
+                        if isinstance(inference_model, GptOssModel):
+                            all_prompt_tokens = mx.concatenate(
+                                [
+                                    all_prompt_tokens,
+                                    mx.array([HARMONY_CHANNEL_TOKEN_ID]),
+                                ]
+                            )
 
                         caches = make_kv_cache(model=cast(Model, inference_model))
                         sampler = make_sampler(
@@ -498,9 +512,7 @@ def main(
                         # Send more tail tokens so the decode node can
                         # re-prefill them with its own model, grounding
                         # hidden states for consistent MoE routing.
-                        reprefill = min(
-                            DISAGG_REPREFILL_TOKENS, len(all_prompt_tokens)
-                        )
+                        reprefill = min(DISAGG_REPREFILL_TOKENS, len(all_prompt_tokens))
                         reprefill = max(reprefill, 2)
                         last_tokens = all_prompt_tokens[-reprefill:]
                         t_pipelined_start = time.monotonic()
@@ -566,6 +578,7 @@ def main(
                         )
                         from exo.worker.engines.mlx.constants import (
                             DISAGG_REPREFILL_TOKENS,
+                            HARMONY_CHANNEL_TOKEN_ID,
                             KV_BITS,
                             KV_GROUP_SIZE,
                         )
@@ -577,10 +590,18 @@ def main(
                         prompt = apply_chat_template(tokenizer, task_params)
                         all_prompt_tokens = encode_prompt(tokenizer, prompt)
 
+                        # Template-aware: same as DisaggPrefill — append
+                        # <|channel|> so decode starts from the channel name.
+                        if isinstance(inference_model, GptOssModel):
+                            all_prompt_tokens = mx.concatenate(
+                                [
+                                    all_prompt_tokens,
+                                    mx.array([HARMONY_CHANNEL_TOKEN_ID]),
+                                ]
+                            )
+
                         prompt_tokens = all_prompt_tokens[:-1]
-                        reprefill = min(
-                            DISAGG_REPREFILL_TOKENS, len(all_prompt_tokens)
-                        )
+                        reprefill = min(DISAGG_REPREFILL_TOKENS, len(all_prompt_tokens))
                         reprefill = max(reprefill, 2)
                         last_tokens = all_prompt_tokens[-reprefill:]
 
@@ -687,6 +708,7 @@ def main(
                         from mlx_lm.sample_utils import make_sampler
 
                         from exo.worker.engines.mlx.constants import (
+                            HARMONY_CHANNEL_TOKEN_ID,
                             KV_BITS,
                             KV_GROUP_SIZE,
                             MAX_TOKENS,
@@ -736,6 +758,28 @@ def main(
                         gen: Generator[
                             GenerationResponse | ToolCallResponse, None, None
                         ] = _wrap_stream_generate(raw_stream, t_decode_start)
+
+                        # Template-aware: the prefill node appended
+                        # <|channel|> to the prompt, so the decode model's
+                        # first generated token is the channel name.  Inject
+                        # a matching synthetic <|channel|> into the parser
+                        # stream so parse_gpt_oss sees a valid Harmony
+                        # sequence instead of falling back to token
+                        # stripping.
+                        if isinstance(inference_model, GptOssModel):
+
+                            def _prepend_channel(
+                                stream: Generator[GenerationResponse, None, None],
+                            ) -> Generator[GenerationResponse, None, None]:
+                                yield GenerationResponse(
+                                    text="<|channel|>",
+                                    token=HARMONY_CHANNEL_TOKEN_ID,
+                                    finish_reason=None,
+                                    usage=None,
+                                )
+                                yield from stream
+
+                            gen = _prepend_channel(gen)
 
                         if tokenizer.has_thinking:
                             gen = parse_thinking_models(
@@ -907,8 +951,6 @@ def strip_harmony_tokens(
     ``<|start|>``, ``<|channel|>``, ``<|message|>``, and ``<|end|>``
     boundaries to extract content while discarding protocol framing.
     """
-    import itertools
-
     in_content = False
     is_thinking = False
     in_header = False  # after <|start|> or <|channel|>, skip non-control tokens

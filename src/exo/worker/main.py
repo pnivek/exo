@@ -1,6 +1,8 @@
 import time
 from collections import defaultdict
+from collections.abc import Coroutine
 from datetime import datetime, timezone
+from typing import Any
 
 import anyio
 from anyio import fail_after
@@ -86,13 +88,29 @@ class Worker:
         info_send, info_recv = channel[GatheredInfo]()
         info_gatherer: InfoGatherer = InfoGatherer(info_send)
 
+        async def _wrap(name: str, coro: Coroutine[Any, Any, None]) -> None:
+            try:
+                await coro
+            except BaseException as e:
+                logger.warning(
+                    f"Worker sub-task '{name}' exited: {type(e).__name__}: {e}"
+                )
+                raise
+            else:
+                logger.warning(
+                    f"Worker sub-task '{name}' returned normally (should run forever)"
+                )
+
         try:
             async with self._tg as tg:
-                tg.start_soon(info_gatherer.run)
-                tg.start_soon(self._forward_info, info_recv)
-                tg.start_soon(self.plan_step)
-                tg.start_soon(self._event_applier)
-                tg.start_soon(self._poll_connection_updates)
+                tg.start_soon(_wrap, "info_gatherer", info_gatherer.run())
+                tg.start_soon(_wrap, "forward_info", self._forward_info(info_recv))
+                tg.start_soon(_wrap, "plan_step", self.plan_step())
+                tg.start_soon(_wrap, "event_applier", self._event_applier())
+                tg.start_soon(_wrap, "poll_conn", self._poll_connection_updates())
+        except BaseException as exc:
+            logger.error(f"Worker exiting: {type(exc).__name__}: {exc}")
+            raise
         finally:
             # Actual shutdown code - waits for all tasks to complete before executing.
             logger.info("Stopping Worker")

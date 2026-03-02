@@ -243,6 +243,9 @@ class Node:
                         f"Node {result.session_id.master_node_id} elected master"
                     )
                 if result.is_new_master:
+                    logger.info(
+                        "New master election: shutting down event_router, worker, etc."
+                    )
                     await anyio.sleep(0)
                     self.event_router.shutdown()
                     self.event_router = EventRouter(

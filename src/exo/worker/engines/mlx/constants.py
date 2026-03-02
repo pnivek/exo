@@ -21,5 +21,11 @@ DEFAULT_TOP_LOGPROBS: int = 5
 # caused by cross-device numerical differences in the transferred KV cache.
 DISAGG_REPREFILL_TOKENS: int = 32
 
+# gpt-oss Harmony protocol: the <|channel|> control token ID.
+# The prefill node appends this to the prompt so the decode node's first
+# generated token is the channel name (not a protocol marker that MoE
+# routing divergence might corrupt).
+HARMONY_CHANNEL_TOKEN_ID: int = 200005
+
 # TODO: We should really make this opt-in, but Kimi requires trust_remote_code=True
 TRUST_REMOTE_CODE: bool = True

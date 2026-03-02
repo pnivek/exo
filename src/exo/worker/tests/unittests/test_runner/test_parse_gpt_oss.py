@@ -274,3 +274,72 @@ class TestStripHarmonyTokens:
         non_thinking_text = "".join(r.text for r in non_thinking)
         assert "Thinking about this" in thinking_text
         assert "Answer here" in non_thinking_text
+
+
+# fmt: off
+# Template-aware disagg: <|channel|> is injected synthetically by the decode
+# node (matching the <|channel|> the prefill node appended to the prompt).
+# The model then generates the channel name, <|message|>, and content.
+TEMPLATE_AWARE_DISAGG_TOKENS: list[tuple[int, str]] = [
+    (_CHANNEL, "<|channel|>"),   # Synthetic injection
+    (15824,    "final"),         # Model generates channel name
+    (_MESSAGE, "<|message|>"),
+    (68127,    "Hello"),
+    (7029,     " world"),
+]
+
+TEMPLATE_AWARE_DISAGG_THINKING_TOKENS: list[tuple[int, str]] = [
+    (_CHANNEL, "<|channel|>"),   # Synthetic injection
+    (35644,    "analysis"),      # Model chooses thinking
+    (_MESSAGE, "<|message|>"),
+    # Use tokens known to decode identically in the Harmony encoding.
+    (12845,    "Let"),
+    (668,      " me"),
+    (2411,     " think"),
+    (_END,     "<|end|>"),
+    (_START,   "<|start|>"),
+    (_ASSISTANT, "assistant"),
+    (_CHANNEL, "<|channel|>"),
+    (15824,    "final"),
+    (_MESSAGE, "<|message|>"),
+    (68127,    "Answer"),
+    (668,      " here"),
+]
+# fmt: on
+
+
+class TestTemplateAwareDisagg:
+    """Template-aware disagg: synthetic <|channel|> enables parse_gpt_oss."""
+
+    def test_content_yields_without_fallback(self):
+        """parse_gpt_oss processes synthetic <|channel|> → content correctly."""
+        results = _collect(TEMPLATE_AWARE_DISAGG_TOKENS)
+        content = [r for r in results if isinstance(r, GenerationResponse)]
+        text = "".join(r.text for r in content)
+        assert "Hello world" in text
+        # No ToolCallResponse should appear
+        assert not any(isinstance(r, ToolCallResponse) for r in results)
+
+    def test_thinking_then_content(self):
+        """Synthetic <|channel|> + analysis → thinking, then final → content.
+
+        The analysis channel is parsed correctly by parse_gpt_oss.  The
+        second message block (<|end|><|start|>assistant<|channel|>final)
+        triggers a HarmonyError and falls back to strip_harmony_tokens,
+        which still yields the final-channel content correctly.
+        """
+        results = _collect(TEMPLATE_AWARE_DISAGG_THINKING_TOKENS)
+        thinking = [
+            r for r in results if isinstance(r, GenerationResponse) and r.is_thinking
+        ]
+        non_thinking = [
+            r
+            for r in results
+            if isinstance(r, GenerationResponse) and not r.is_thinking
+        ]
+        thinking_text = "".join(r.text for r in thinking)
+        non_thinking_text = "".join(r.text for r in non_thinking)
+        # Analysis channel detected as thinking by parse_gpt_oss.
+        assert "Let me think" in thinking_text
+        # Final channel content recovered via strip_harmony_tokens fallback.
+        assert "Answer here" in non_thinking_text
