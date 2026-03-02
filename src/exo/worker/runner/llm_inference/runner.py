@@ -547,6 +547,9 @@ def main(
                         mx.clear_cache()
 
                     except Exception as e:
+                        logger.opt(exception=e).error(
+                            "DisaggPrefill failed, recovering runner"
+                        )
                         if device_rank == 0:
                             event_sender.send(
                                 ChunkGenerated(
@@ -558,7 +561,10 @@ def main(
                                     ),
                                 )
                             )
-                        raise
+                        import gc
+
+                        gc.collect()
+                        mx.clear_cache()
 
                     current_status = RunnerReady()
                     logger.info("runner ready")
@@ -705,6 +711,9 @@ def main(
                         mx.clear_cache()
 
                     except Exception as e:
+                        logger.opt(exception=e).error(
+                            "TensorParallelDisaggPrefill failed, recovering runner"
+                        )
                         if device_rank == 0:
                             event_sender.send(
                                 ChunkGenerated(
@@ -716,7 +725,10 @@ def main(
                                     ),
                                 )
                             )
-                        raise
+                        import gc
+
+                        gc.collect()
+                        mx.clear_cache()
 
                     current_status = RunnerReady()
                     logger.info("runner ready")
@@ -899,7 +911,17 @@ def main(
                             ):
                                 break
 
+                        # Free received KV caches and intermediate tensors.
+                        del received_caches
+                        import gc
+
+                        gc.collect()
+                        mx.clear_cache()
+
                     except Exception as e:
+                        logger.opt(exception=e).error(
+                            "DisaggDecode failed, recovering runner"
+                        )
                         if device_rank == 0:
                             event_sender.send(
                                 ChunkGenerated(
@@ -911,7 +933,10 @@ def main(
                                     ),
                                 )
                             )
-                        raise
+                        import gc
+
+                        gc.collect()
+                        mx.clear_cache()
 
                     current_status = RunnerReady()
                     logger.info("runner ready")

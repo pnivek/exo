@@ -454,6 +454,18 @@ class Master:
                                         task_id=task_id,
                                     )
                                 )
+                            # Also cancel the paired prefill task for disagg inference.
+                            if (
+                                prefill_task_id := self.disagg_prefill_task_mapping.pop(
+                                    command.cancelled_command_id, None
+                                )
+                            ) is not None:
+                                generated_events.append(
+                                    TaskStatusUpdated(
+                                        task_status=TaskStatus.Cancelled,
+                                        task_id=prefill_task_id,
+                                    )
+                                )
                         case TaskFinished():
                             if (
                                 task_id := self.command_task_mapping.pop(
@@ -485,7 +497,7 @@ class Master:
                     logger.warning(
                         "Event sender closed (likely master shutdown during election)"
                     )
-                    return
+                    raise
                 except ValueError as e:
                     logger.opt(exception=e).warning("Error in command processor")
 
