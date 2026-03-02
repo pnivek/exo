@@ -506,7 +506,7 @@ class Master:
                     logger.warning(
                         "Event sender closed (likely master shutdown during election)"
                     )
-                    raise
+                    return
                 except ValueError as e:
                     logger.opt(exception=e).warning("Error in command processor")
 
