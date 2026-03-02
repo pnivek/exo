@@ -682,6 +682,19 @@ def main(
                             logger.info(
                                 f"DISAGG_TIMING tp_kv_send_ms={(t_send_end - t_send_start) * 1000:.1f}"
                             )
+                        else:
+                            # Non-sender rank: free the gathered cache immediately.
+                            # After all_gather each rank holds the full KV cache
+                            # but only the sender needs it for the network send.
+                            # On unified-memory devices (GB10) these arrays consume
+                            # GPU memory via page cache; releasing them here prevents
+                            # the non-sender from holding ~2x the KV footprint until
+                            # the sender finishes its network transfer.
+                            for c in caches:
+                                c.state = (
+                                    mx.zeros((1, 1, 1, 1)),
+                                    mx.zeros((1, 1, 1, 1)),
+                                )
 
                         # Free KV cache and intermediate tensors to prevent
                         # GPU memory accumulation across consecutive requests.
@@ -823,7 +836,19 @@ def main(
                         ):
                             gen = parse_deepseek_v32(gen)
 
+                        assert check_for_cancel_every
+                        tokens_since_last_cancel_check = check_for_cancel_every
                         for response in gen:
+                            tokens_since_last_cancel_check += 1
+                            if tokens_since_last_cancel_check >= check_for_cancel_every:
+                                tokens_since_last_cancel_check = 0
+                                cancelled_tasks.update(cancel_receiver.collect())
+                                want_to_cancel = (task.task_id in cancelled_tasks) or (
+                                    TaskId("CANCEL_CURRENT_TASK") in cancelled_tasks
+                                )
+                                if want_to_cancel:
+                                    break
+
                             if device_rank == 0:
                                 match response:
                                     case GenerationResponse() if (
