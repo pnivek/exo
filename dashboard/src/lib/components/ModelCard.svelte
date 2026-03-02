@@ -316,11 +316,7 @@
     // Use API placement data directly
     const memoryDelta = apiPreview?.memory_delta_by_node ?? {};
 
-    function buildNode(
-      n: (typeof nodeArray)[0],
-      x: number,
-      y: number,
-    ) {
+    function buildNode(n: (typeof nodeArray)[0], x: number, y: number) {
       const deltaBytes = memoryDelta[n.id] ?? 0;
       const modelUsageGB = deltaBytes / (1024 * 1024 * 1024);
       const isUsed = deltaBytes > 0;
@@ -357,10 +353,7 @@
       const rightX = topoWidth * 0.75;
       const spacing = 90;
 
-      const buildGroup = (
-        group: typeof nodeArray,
-        gx: number,
-      ) => {
+      const buildGroup = (group: typeof nodeArray, gx: number) => {
         const totalH = (group.length - 1) * spacing;
         return group.map((n, i) =>
           buildNode(n, gx, centerY - totalH / 2 + i * spacing),
@@ -578,8 +571,12 @@
       ? 'border-exo-yellow/20 group-hover:border-exo-yellow/40'
       : 'border-red-500/20'} p-3 transition-all duration-200"
     style={canFit ? `--hover-shadow: 0 0 15px ${acRgba(0.1)}` : ""}
-    onmouseenter={(e) => { if (canFit) e.currentTarget.style.boxShadow = `0 0 15px ${acRgba(0.1)}`; }}
-    onmouseleave={(e) => { e.currentTarget.style.boxShadow = ''; }}
+    onmouseenter={(e) => {
+      if (canFit) e.currentTarget.style.boxShadow = `0 0 15px ${acRgba(0.1)}`;
+    }}
+    onmouseleave={(e) => {
+      e.currentTarget.style.boxShadow = "";
+    }}
   >
     <!-- Model Name & Memory Required -->
     <div class="flex items-start justify-between gap-2 mb-2">
@@ -657,37 +654,44 @@
         <span
           class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
           title="Single Prefill: one CUDA device runs all prefill layers, full model loaded independently."
-        >Single Prefill</span>
+          >Single Prefill</span
+        >
         <span
           class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
           title="KV Stream: streams KV cache from CUDA prefill to Metal decode."
-        >KV Stream</span>
+          >KV Stream</span
+        >
       {:else if runtime === "TensorPrefillDisagg"}
         <span
           class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
           title="Tensor Prefill: prefill layers split across multiple CUDA devices via tensor parallelism."
-        >Tensor Prefill</span>
+          >Tensor Prefill</span
+        >
         <span
           class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
           title="KV Stream: streams KV cache from CUDA prefill to Metal decode."
-        >KV Stream</span>
+          >KV Stream</span
+        >
         <span
           class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
           title="NCCL: NVIDIA Collective Communications Library for inter-GPU tensor exchange."
-        >NCCL</span>
+          >NCCL</span
+        >
       {:else}
         <span
           class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
           title={sharding === "Pipeline"
             ? "Pipeline: splits model into sequential stages across devices. Lower network overhead."
             : "Tensor: splits each layer across devices. Best with high-bandwidth connections (Thunderbolt)."}
-        >{sharding}</span>
+          >{sharding}</span
+        >
         <span
           class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
           title={runtime === "MlxRing"
             ? "Ring: standard networking. Works over any connection (Wi-Fi, Ethernet, Thunderbolt)."
             : "RDMA: direct memory access over Thunderbolt. Significantly faster for multi-device inference."}
-        >{runtime === "MlxRing" ? "MLX Ring" : "MLX RDMA"}</span>
+          >{runtime === "MlxRing" ? "MLX Ring" : "MLX RDMA"}</span
+        >
       {/if}
     </div>
 
@@ -720,7 +724,9 @@
         <!-- Scanline effect -->
         <div
           class="absolute inset-0 pointer-events-none"
-          style="background: repeating-linear-gradient(0deg, transparent, transparent 2px, {acRgba(0.02)} 2px, {acRgba(0.02)} 4px)"
+          style="background: repeating-linear-gradient(0deg, transparent, transparent 2px, {acRgba(
+            0.02,
+          )} 2px, {acRgba(0.02)} 4px)"
         ></div>
 
         <svg
@@ -762,9 +768,14 @@
           {#if preview.nodes.length > 1}
             {#if preview.flowLayout}
               <!-- Flow layout: KV TRANSFER arrow + NCCL link -->
-              {@const arrowY = ('leftCentroidY' in preview && 'rightCentroidY' in preview) ? (preview.leftCentroidY + preview.rightCentroidY) / 2 : preview.topoHeight / 2}
-              {@const arrowStartX = ('leftX' in preview ? preview.leftX : 70) + 24}
-              {@const arrowEndX = ('rightX' in preview ? preview.rightX : 190) - 24}
+              {@const arrowY =
+                "leftCentroidY" in preview && "rightCentroidY" in preview
+                  ? (preview.leftCentroidY + preview.rightCentroidY) / 2
+                  : preview.topoHeight / 2}
+              {@const arrowStartX =
+                ("leftX" in preview ? preview.leftX : 70) + 24}
+              {@const arrowEndX =
+                ("rightX" in preview ? preview.rightX : 190) - 24}
               <line
                 x1={arrowStartX}
                 y1={arrowY}
@@ -776,7 +787,8 @@
               />
               <!-- Arrowhead -->
               <polygon
-                points="{arrowEndX - 4},{arrowY - 3} {arrowEndX},{arrowY} {arrowEndX - 4},{arrowY + 3}"
+                points="{arrowEndX - 4},{arrowY -
+                  3} {arrowEndX},{arrowY} {arrowEndX - 4},{arrowY + 3}"
                 fill={acRgba(0.5)}
               />
               <!-- KV TRANSFER label -->
@@ -787,12 +799,14 @@
                 font-size="7"
                 font-family="SF Mono, Monaco, monospace"
                 fill={acRgba(0.5)}
-                letter-spacing="0.05em"
-              >KV STREAM</text>
+                letter-spacing="0.05em">KV STREAM</text
+              >
 
               <!-- NCCL link between CUDA nodes (if TP) -->
-              {#if 'hasNcclGroup' in preview && preview.hasNcclGroup}
-                {@const cudaNodes = preview.nodes.filter((n) => isNvidiaNode(n.id))}
+              {#if "hasNcclGroup" in preview && preview.hasNcclGroup}
+                {@const cudaNodes = preview.nodes.filter((n) =>
+                  isNvidiaNode(n.id),
+                )}
                 {@const hexEdge = cudaNodes[0]?.iconSize * 0.5 ?? 16}
                 {#each cudaNodes.slice(0, -1) as node, i}
                   {@const nextNode = cudaNodes[i + 1]}
@@ -812,8 +826,8 @@
                     dominant-baseline="middle"
                     font-size="7"
                     font-family="SF Mono, Monaco, monospace"
-                    fill={acRgba(0.5)}
-                  >NCCL</text>
+                    fill={acRgba(0.5)}>NCCL</text
+                  >
                 {/each}
               {/if}
             {:else}

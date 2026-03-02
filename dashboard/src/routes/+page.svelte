@@ -92,8 +92,15 @@
     const left = new Set<string>();
     const right = new Set<string>();
     for (const [nid, identity] of Object.entries(identitiesData)) {
-      const chip = ((identity as { chipId?: string }).chipId ?? "").toLowerCase();
-      if (chip.includes("nvidia") || chip.includes("dgx") || chip.includes("cuda") || chip.includes("gb10")) {
+      const chip = (
+        (identity as { chipId?: string }).chipId ?? ""
+      ).toLowerCase();
+      if (
+        chip.includes("nvidia") ||
+        chip.includes("dgx") ||
+        chip.includes("cuda") ||
+        chip.includes("gb10")
+      ) {
         left.add(nid);
       } else if (chip.includes("apple") || /\bm[1-4]\b/.test(chip)) {
         right.add(nid);
@@ -988,7 +995,9 @@
   // Effective inference mode: only "pd" when cluster actually supports it
   // (selectedInferenceMode may be "pd" from localStorage even when no CUDA nodes are present)
   const effectiveInferenceMode = $derived<InferenceMode>(
-    selectedInferenceMode === "pd" && clusterCapabilities.canDisagg ? "pd" : "standard",
+    selectedInferenceMode === "pd" && clusterCapabilities.canDisagg
+      ? "pd"
+      : "standard",
   );
 
   // Favorites state (reactive)
@@ -3833,7 +3842,10 @@
 />
 
 <div
-  class="relative h-screen w-full flex flex-col bg-exo-dark-gray overflow-hidden {effectiveInferenceMode === 'pd' ? 'disagg-mode' : ''}"
+  class="relative h-screen w-full flex flex-col bg-exo-dark-gray overflow-hidden {effectiveInferenceMode ===
+  'pd'
+    ? 'disagg-mode'
+    : ''}"
 >
   <!-- Scanline overlay -->
   <!-- Scanline overlay -->
@@ -4756,8 +4768,12 @@
             filteredNodes={nodeFilter}
             onNodeClick={togglePreviewNodeFilter}
             layoutMode={effectiveInferenceMode === "pd" ? "flow" : "circular"}
-            flowGroups={effectiveInferenceMode === "pd" ? disaggFlowGroups : undefined}
-            accentColor={effectiveInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
+            flowGroups={effectiveInferenceMode === "pd"
+              ? disaggFlowGroups
+              : undefined}
+            accentColor={effectiveInferenceMode === "pd"
+              ? { r: 118, g: 185, b: 0 }
+              : undefined}
           />
 
           {@render clusterWarnings()}
@@ -4884,8 +4900,12 @@
               filteredNodes={nodeFilter}
               onNodeClick={togglePreviewNodeFilter}
               layoutMode={effectiveInferenceMode === "pd" ? "flow" : "circular"}
-              flowGroups={effectiveInferenceMode === "pd" ? disaggFlowGroups : undefined}
-              accentColor={effectiveInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
+              flowGroups={effectiveInferenceMode === "pd"
+                ? disaggFlowGroups
+                : undefined}
+              accentColor={effectiveInferenceMode === "pd"
+                ? { r: 118, g: 185, b: 0 }
+                : undefined}
             />
 
             <!-- Initial loading state before first data fetch -->
@@ -5697,9 +5717,7 @@
                       : 'bg-transparent text-white/60 border-exo-medium-gray/50 hover:border-exo-nvidia-green/30'}"
                   >
                     <span class="font-bold tracking-wide">Disaggregated</span>
-                    <span class="text-[10px] opacity-70"
-                      >CUDA + METAL</span
-                    >
+                    <span class="text-[10px] opacity-70">CUDA + METAL</span>
                   </button>
                 </div>
               </div>
@@ -5938,36 +5956,38 @@
                   )}
                   {@const tags = modelTags()[selectedModel.id] || []}
                   <div class="space-y-3">
-                      {#each allPreviews as apiPreview, i}
-                        <div
-                          role="group"
-                          onmouseenter={() => {
-                            if (apiPreview.memory_delta_by_node) {
-                              hoveredPreviewNodes = new Set(
-                                Object.entries(apiPreview.memory_delta_by_node)
-                                  .filter(([, delta]) => (delta ?? 0) > 0)
-                                  .map(([nodeId]) => nodeId),
-                              );
-                            }
-                          }}
-                          onmouseleave={() => (hoveredPreviewNodes = new Set())}
-                        >
-                          <ModelCard
-                            model={selectedModel}
-                            isLaunching={launchingModelId === selectedModel.id}
-                            {downloadStatus}
-                            nodes={data?.nodes ?? {}}
-                            sharding={apiPreview.sharding}
-                            runtime={apiPreview.instance_meta}
-                            onLaunch={() =>
-                              launchInstance(selectedModel.id, apiPreview)}
-                            {tags}
-                            {apiPreview}
-                            modelIdOverride={apiPreview.model_id}
-                            accentColor={effectiveInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
-                          />
-                        </div>
-                      {/each}
+                    {#each allPreviews as apiPreview, i}
+                      <div
+                        role="group"
+                        onmouseenter={() => {
+                          if (apiPreview.memory_delta_by_node) {
+                            hoveredPreviewNodes = new Set(
+                              Object.entries(apiPreview.memory_delta_by_node)
+                                .filter(([, delta]) => (delta ?? 0) > 0)
+                                .map(([nodeId]) => nodeId),
+                            );
+                          }
+                        }}
+                        onmouseleave={() => (hoveredPreviewNodes = new Set())}
+                      >
+                        <ModelCard
+                          model={selectedModel}
+                          isLaunching={launchingModelId === selectedModel.id}
+                          {downloadStatus}
+                          nodes={data?.nodes ?? {}}
+                          sharding={apiPreview.sharding}
+                          runtime={apiPreview.instance_meta}
+                          onLaunch={() =>
+                            launchInstance(selectedModel.id, apiPreview)}
+                          {tags}
+                          {apiPreview}
+                          modelIdOverride={apiPreview.model_id}
+                          accentColor={effectiveInferenceMode === "pd"
+                            ? { r: 118, g: 185, b: 0 }
+                            : undefined}
+                        />
+                      </div>
+                    {/each}
                   </div>
                 {:else if selectedModel}
                   <div class="text-center py-4">
@@ -6226,9 +6246,15 @@
                   highlightedNodes={highlightedNodes()}
                   filteredNodes={nodeFilter}
                   onNodeClick={togglePreviewNodeFilter}
-                  layoutMode={effectiveInferenceMode === "pd" ? "flow" : "circular"}
-                  flowGroups={effectiveInferenceMode === "pd" ? disaggFlowGroups : undefined}
-                  accentColor={effectiveInferenceMode === "pd" ? { r: 118, g: 185, b: 0 } : undefined}
+                  layoutMode={effectiveInferenceMode === "pd"
+                    ? "flow"
+                    : "circular"}
+                  flowGroups={effectiveInferenceMode === "pd"
+                    ? disaggFlowGroups
+                    : undefined}
+                  accentColor={effectiveInferenceMode === "pd"
+                    ? { r: 118, g: 185, b: 0 }
+                    : undefined}
                 />
 
                 {@render clusterWarningsCompact()}

@@ -294,14 +294,21 @@
 
         const maxSpacing = isMinimized ? nodeRadius * 3.5 : nodeRadius * 6;
         leftIds.forEach((id, i) => {
-          const spacing = Math.min(maxSpacing, (height - topPadding - bottomPadding) / Math.max(leftIds.length, 2));
+          const spacing = Math.min(
+            maxSpacing,
+            (height - topPadding - bottomPadding) / Math.max(leftIds.length, 2),
+          );
           const totalH = (leftIds.length - 1) * spacing;
           const y = safeCenterY - totalH / 2 + i * spacing;
           result.push({ id, data: nodes[id], x: leftX, y });
         });
 
         rightIds.forEach((id, i) => {
-          const spacing = Math.min(maxSpacing, (height - topPadding - bottomPadding) / Math.max(rightIds.length, 2));
+          const spacing = Math.min(
+            maxSpacing,
+            (height - topPadding - bottomPadding) /
+              Math.max(rightIds.length, 2),
+          );
           const totalH = (rightIds.length - 1) * spacing;
           const y = safeCenterY - totalH / 2 + i * spacing;
           result.push({ id, data: nodes[id], x: rightX, y });
@@ -1320,7 +1327,9 @@
           .attr("font-size", fontSize * 0.85)
           .attr("font-family", "SF Mono, Monaco, monospace")
           .attr("fill", acRgba(0.8))
-          .text(`${formatBytes(ramUsed)}/${formatBytes(ramTotal)} (${ramUsagePercent.toFixed(0)}%)`);
+          .text(
+            `${formatBytes(ramUsed)}/${formatBytes(ramTotal)} (${ramUsagePercent.toFixed(0)}%)`,
+          );
       }
 
       // Debug mode: Show TB bridge and RDMA status
