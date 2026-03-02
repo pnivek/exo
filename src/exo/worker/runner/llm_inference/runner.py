@@ -478,6 +478,9 @@ def main(
                             encode_prompt,
                             make_kv_cache,
                         )
+                        from exo.worker.engines.mlx.constants import (
+                            DISAGG_REPREFILL_TOKENS,
+                        )
                         from exo.worker.engines.mlx.kv_transfer import (
                             send_kv_cache_pipelined_sync,
                         )
@@ -492,7 +495,14 @@ def main(
                             else 0.7,
                         )
 
-                        last_tokens = all_prompt_tokens[-2:]
+                        # Send more tail tokens so the decode node can
+                        # re-prefill them with its own model, grounding
+                        # hidden states for consistent MoE routing.
+                        reprefill = min(
+                            DISAGG_REPREFILL_TOKENS, len(all_prompt_tokens)
+                        )
+                        reprefill = max(reprefill, 2)
+                        last_tokens = all_prompt_tokens[-reprefill:]
                         t_pipelined_start = time.monotonic()
                         prefill_tps, num_tokens = send_kv_cache_pipelined_sync(
                             host=decode_host,
@@ -555,6 +565,7 @@ def main(
                             make_kv_cache,
                         )
                         from exo.worker.engines.mlx.constants import (
+                            DISAGG_REPREFILL_TOKENS,
                             KV_BITS,
                             KV_GROUP_SIZE,
                         )
@@ -567,7 +578,11 @@ def main(
                         all_prompt_tokens = encode_prompt(tokenizer, prompt)
 
                         prompt_tokens = all_prompt_tokens[:-1]
-                        last_tokens = all_prompt_tokens[-2:]
+                        reprefill = min(
+                            DISAGG_REPREFILL_TOKENS, len(all_prompt_tokens)
+                        )
+                        reprefill = max(reprefill, 2)
+                        last_tokens = all_prompt_tokens[-reprefill:]
 
                         from mlx_lm.models.cache import KVCache as PlainKVCache
 
@@ -880,6 +895,60 @@ def get_gpt_oss_encoding():
         return None
 
 
+def strip_harmony_tokens(
+    first: GenerationResponse,
+    remaining: Generator[GenerationResponse],
+) -> Generator[GenerationResponse]:
+    """Strip Harmony control tokens and yield only content text.
+
+    Used as a fallback when the Harmony parser rejects a token sequence
+    (e.g. the model skips a channel declaration in disaggregated mode).
+    Walks the token stream with a minimal state machine that recognises
+    ``<|start|>``, ``<|channel|>``, ``<|message|>``, and ``<|end|>``
+    boundaries to extract content while discarding protocol framing.
+    """
+    import itertools
+
+    in_content = False
+    is_thinking = False
+    in_header = False  # after <|start|> or <|channel|>, skip non-control tokens
+    channel_parts: list[str] = []
+
+    for response in itertools.chain([first], remaining):
+        text = response.text
+        is_control = text.startswith("<|") and text.endswith("|>")
+
+        if is_control:
+            in_header = False
+            if text == "<|start|>":
+                in_content = False
+                in_header = True
+            elif text == "<|channel|>":
+                in_content = False
+                in_header = True
+                channel_parts = []
+            elif text == "<|message|>":
+                channel_name = "".join(channel_parts).strip()
+                is_thinking = channel_name == "analysis"
+                channel_parts = []
+                in_content = True
+            elif text == "<|end|>":
+                in_content = False
+            # Skip all control tokens.
+            continue
+
+        if in_header:
+            channel_parts.append(text)
+            continue
+
+        if in_content:
+            yield response.model_copy(update={"is_thinking": is_thinking})
+
+        # Tokens outside any <|message|>...<|end|> block are discarded.
+        # finish_reason on the last token still propagates through the
+        # generator termination.
+
+
 def parse_gpt_oss(
     responses: Generator[GenerationResponse],
 ) -> Generator[GenerationResponse | ToolCallResponse]:
@@ -899,16 +968,15 @@ def parse_gpt_oss(
         try:
             stream.process(response.token)
         except HarmonyError:
-            logger.error(
+            logger.warning(
                 f"Harmony Error on token={response.token} "
                 f"text={response.text!r} state={stream.state}, "
-                f"falling back to raw passthrough"
+                f"falling back to Harmony token stripping"
             )
-            # Yield the current token and pass through remaining tokens unmodified.
-            # This preserves generation output when the Harmony protocol is violated
-            # (e.g. cross-device KV cache causes unexpected first token in disagg mode).
-            yield response
-            yield from responses
+            # The model violated the Harmony protocol (e.g. cross-device KV cache
+            # in disagg mode causes MoE models to skip channel declarations).
+            # Strip control tokens and yield only content text.
+            yield from strip_harmony_tokens(response, responses)
             return
 
         delta = stream.last_content_delta

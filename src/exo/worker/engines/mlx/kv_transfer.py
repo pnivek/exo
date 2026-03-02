@@ -424,7 +424,9 @@ def send_precomputed_kv_cache_sync(
     takes a pre-computed cache and streams it. Used by TP prefill after gather.
     """
     num_layers = len(cache)
-    num_tokens = cache[0].offset
+    # Send fewer entries so the decode node can re-prefill the tail tokens
+    # with its own model (same logic as the pipelined path).
+    num_tokens = cache[0].offset - max(0, len(last_tokens) - 2)
 
     sock = _connect_with_retries(host, port)
 
@@ -512,6 +514,16 @@ def send_kv_cache_pipelined_sync(
     num_layers = len(cache)
     num_tokens = len(prompt_tokens)
 
+    # Number of KV entries to send.  The decode node will re-prefill the tail
+    # tokens (last_tokens) using its own model, so we only transfer entries
+    # that the decode side will NOT recompute.
+    #
+    # Math: prompt has T total tokens.  Spark prefills prompt_tokens (T-1).
+    # After stream_generate + trim(2), cache has T-2 entries.  Cap extraction
+    # to kv_send_cap so the decode side receives exactly T - len(last_tokens)
+    # entries, and stream_generate(prompt=last_tokens) recomputes the rest.
+    kv_send_cap = num_tokens + 1 - len(last_tokens)
+
     # Connect to decode node (start connecting while we prefill)
     sock = _connect_with_retries(host, port)
 
@@ -540,11 +552,9 @@ def send_kv_cache_pipelined_sync(
         if error_event.is_set():
             return
 
-        # Determine current cache offset from the cache itself, capped to the
-        # valid prompt length. stream_generate processes all prompt tokens then
-        # generates 1 extra token. After trim(2) only num_tokens-1 entries remain.
-        # We cap to num_tokens-1 so we only send the genuine prompt KV entries.
-        current_offset = min(cache[0].offset, num_tokens - 1)
+        # Cap extraction to kv_send_cap so we only send entries the decode
+        # node won't recompute during its re-prefill of last_tokens.
+        current_offset = min(cache[0].offset, kv_send_cap)
         if current_offset <= prev_offset:
             return
 
@@ -563,7 +573,7 @@ def send_kv_cache_pipelined_sync(
                 _VERSION,
                 num_layers,
                 dtype_flag,
-                num_tokens - 1,
+                kv_send_cap,
                 cache_n_kv_heads,
                 cache_head_dim,
             )
@@ -623,7 +633,7 @@ def send_kv_cache_pipelined_sync(
             _VERSION,
             num_layers,
             dtype_flag,
-            num_tokens,
+            kv_send_cap,
             cache_n_kv_heads,
             cache_head_dim,
         )
@@ -632,7 +642,7 @@ def send_kv_cache_pipelined_sync(
         header_sent = True
 
     # Extract final delta if any tokens remain unsent after the last callback
-    final_offset = cache[0].offset
+    final_offset = min(cache[0].offset, kv_send_cap)
     if final_offset > prev_offset:
         delta = extract_kv_delta(cache, prev_offset, final_offset, chunk_index)
         send_queue.put(delta)

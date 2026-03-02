@@ -13,5 +13,13 @@ KV_CACHE_BITS: int | None = None
 
 DEFAULT_TOP_LOGPROBS: int = 5
 
+# Number of tail prompt tokens the decode node re-prefills in disaggregated
+# inference.  The prefill node sends KV for all positions *except* the last
+# DISAGG_REPREFILL_TOKENS, and the decode node recomputes those using its own
+# model.  This "grounds" the hidden states so MoE expert routing on the
+# decode device is consistent with its own computation, avoiding divergence
+# caused by cross-device numerical differences in the transferred KV cache.
+DISAGG_REPREFILL_TOKENS: int = 32
+
 # TODO: We should really make this opt-in, but Kimi requires trust_remote_code=True
 TRUST_REMOTE_CODE: bool = True

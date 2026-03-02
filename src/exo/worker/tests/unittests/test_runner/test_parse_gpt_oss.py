@@ -4,7 +4,10 @@ from exo.shared.types.worker.runner_response import (
     GenerationResponse,
     ToolCallResponse,
 )
-from exo.worker.runner.llm_inference.runner import parse_gpt_oss
+from exo.worker.runner.llm_inference.runner import (
+    parse_gpt_oss,
+    strip_harmony_tokens,
+)
 
 # Token IDs from mlx-community/gpt-oss-20b-MXFP4-Q8 tokenizer.
 # These are stable since they come from the model's vocabulary.
@@ -171,3 +174,103 @@ class TestParseGptOssThinkingThenToolCall:
         tc = _get_tool_call(results)
         assert tc.tool_calls[0].name == "get_current_weather"
         assert "Tokyo" in tc.tool_calls[0].arguments
+
+
+# fmt: off
+# Simulates what gpt-oss generates in disagg mode: <|message|> directly
+# (skipping <|channel|>), junk content, then a self-corrected full block.
+DISAGG_FALLBACK_TOKENS: list[tuple[int, str]] = [
+    (_MESSAGE, "<|message|>"),         # triggers HarmonyError (no channel)
+    (1620,     "We"),
+    (1182,     " just"),
+    (3553,     " give"),
+    (261,      " a"),
+    (142958,   " haiku"),
+    (13,       "."),
+    (_END,     "<|end|>"),
+    (_START,   "<|start|>"),
+    (_ASSISTANT, "assistant"),
+    (_CHANNEL, "<|channel|>"),
+    (15824,    "final"),
+    (_MESSAGE, "<|message|>"),
+    (68127,    "Wind"),
+    (118411,   " whispers"),
+    (1752,     " through"),
+    (26343,    " waves"),
+]
+
+# Analysis channel content in the stripped fallback.
+DISAGG_THINKING_TOKENS: list[tuple[int, str]] = [
+    (_MESSAGE, "<|message|>"),         # triggers HarmonyError
+    (12845,    "Let"),
+    (668,      " me"),
+    (_END,     "<|end|>"),
+    (_START,   "<|start|>"),
+    (_ASSISTANT, "assistant"),
+    (_CHANNEL, "<|channel|>"),
+    (35644,    "analysis"),
+    (_MESSAGE, "<|message|>"),
+    (35676,    "Thinking"),
+    (1078,     " about"),
+    (495,      " this"),
+    (_END,     "<|end|>"),
+    (_START,   "<|start|>"),
+    (_ASSISTANT, "assistant"),
+    (_CHANNEL, "<|channel|>"),
+    (15824,    "final"),
+    (_MESSAGE, "<|message|>"),
+    (35676,    "Answer"),
+    (668,      " here"),
+]
+# fmt: on
+
+
+def _collect_strip(
+    tokens: list[tuple[int, str]],
+) -> list[GenerationResponse]:
+    """Feed tokens through _strip_harmony_tokens and collect results."""
+    responses = _make_gen_responses(tokens)
+    first = responses[0]
+
+    def _gen() -> Generator[GenerationResponse, None, None]:
+        yield from responses[1:]
+
+    return list(strip_harmony_tokens(first, _gen()))
+
+
+class TestStripHarmonyTokens:
+    """Harmony stripping fallback for disaggregated mode."""
+
+    def test_strips_control_tokens(self):
+        results = _collect_strip(DISAGG_FALLBACK_TOKENS)
+        text = "".join(r.text for r in results)
+        # Control tokens must not appear in output
+        assert "<|message|>" not in text
+        assert "<|end|>" not in text
+        assert "<|start|>" not in text
+        assert "<|channel|>" not in text
+        # Role and channel name metadata must be stripped
+        assert "assistant" not in text
+        assert "final" not in text.split("Wind")[0] if "Wind" in text else True
+
+    def test_yields_content_from_both_blocks(self):
+        results = _collect_strip(DISAGG_FALLBACK_TOKENS)
+        text = "".join(r.text for r in results)
+        # Content from the first (channel-less) block
+        assert "We just give a haiku." in text
+        # Content from the self-corrected block
+        assert "Wind whispers through waves" in text
+
+    def test_all_tokens_not_thinking(self):
+        results = _collect_strip(DISAGG_FALLBACK_TOKENS)
+        for r in results:
+            assert not r.is_thinking
+
+    def test_thinking_channel_sets_is_thinking(self):
+        results = _collect_strip(DISAGG_THINKING_TOKENS)
+        thinking = [r for r in results if r.is_thinking]
+        non_thinking = [r for r in results if not r.is_thinking]
+        thinking_text = "".join(r.text for r in thinking)
+        non_thinking_text = "".join(r.text for r in non_thinking)
+        assert "Thinking about this" in thinking_text
+        assert "Answer here" in non_thinking_text
