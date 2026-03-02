@@ -435,7 +435,10 @@ def send_precomputed_kv_cache_sync(
     num_layers = len(cache)
     # Send fewer entries so the decode node can re-prefill the tail tokens
     # with its own model (same logic as the pipelined path).
-    num_tokens = cache[0].offset - max(0, len(last_tokens) - 2)
+    # Ensure at least 1 token is sent so the receiver always gets a chunk
+    # frame — without this, short prompts (< DISAGG_REPREFILL_TOKENS) produce
+    # num_tokens=0 and the receiver raises "No chunk frames received".
+    num_tokens = max(1, cache[0].offset - max(0, len(last_tokens) - 2))
 
     sock = _connect_with_retries(host, port)
 
