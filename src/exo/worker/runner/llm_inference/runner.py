@@ -20,6 +20,12 @@ from openai_harmony import (  # pyright: ignore[reportMissingTypeStubs]
 )
 
 from exo.shared.models.model_cards import ModelTask
+from exo.shared.types.api import (
+    CompletionTokensDetails,
+    FinishReason,
+    PromptTokensDetails,
+    Usage,
+)
 from exo.shared.types.chunks import (
     ErrorChunk,
     PrefillProgressChunk,
@@ -532,6 +538,14 @@ def main(
                             f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens}"
                         )
 
+                        # Free KV cache and intermediate tensors to prevent
+                        # GPU memory accumulation across consecutive requests.
+                        del caches
+                        import gc
+
+                        gc.collect()
+                        mx.clear_cache()
+
                     except Exception as e:
                         if device_rank == 0:
                             event_sender.send(
@@ -669,6 +683,14 @@ def main(
                                 f"DISAGG_TIMING tp_kv_send_ms={(t_send_end - t_send_start) * 1000:.1f}"
                             )
 
+                        # Free KV cache and intermediate tensors to prevent
+                        # GPU memory accumulation across consecutive requests.
+                        del caches
+                        import gc
+
+                        gc.collect()
+                        mx.clear_cache()
+
                     except Exception as e:
                         if device_rank == 0:
                             event_sender.send(
@@ -744,6 +766,10 @@ def main(
 
                         t_decode_start = time.monotonic()
 
+                        # Compute prompt tokens for usage reporting.
+                        prompt = apply_chat_template(tokenizer, task_params)
+                        prompt_tokens = len(tokenizer.encode(prompt))
+
                         raw_stream = stream_generate(
                             model=cast(Model, inference_model),
                             tokenizer=tokenizer,
@@ -757,7 +783,11 @@ def main(
                         )
                         gen: Generator[
                             GenerationResponse | ToolCallResponse, None, None
-                        ] = _wrap_stream_generate(raw_stream, t_decode_start)
+                        ] = _wrap_stream_generate(
+                            raw_stream,
+                            t_decode_start,
+                            prompt_tokens=prompt_tokens,
+                        )
 
                         # Template-aware: the prefill node appended
                         # <|channel|> to the prompt, so the decode model's
@@ -906,23 +936,35 @@ def main(
 def _wrap_stream_generate(
     raw_stream: Generator[Any, None, None],
     t_decode_start: float,
+    prompt_tokens: int = 0,
 ) -> Generator[GenerationResponse, None, None]:
     """Wrap raw mlx_lm stream_generate output into GenerationResponse objects.
 
-    Also logs first-token timing for disaggregated decode.
+    Also logs first-token timing for disaggregated decode and computes
+    usage on the final response.
     """
     t_first_token: float | None = None
-    for out in raw_stream:  # pyright: ignore[reportAny]
+    for completion_tokens, out in enumerate(raw_stream, start=1):  # pyright: ignore[reportAny]
         if t_first_token is None:
             t_first_token = time.monotonic()
             logger.info(
                 f"DISAGG_TIMING decode_first_token_ms={(t_first_token - t_decode_start) * 1000:.1f}"
             )
+        finish_reason: FinishReason | None = out.finish_reason  # pyright: ignore[reportAny]
+        usage: Usage | None = None
+        if finish_reason is not None:
+            usage = Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                prompt_tokens_details=PromptTokensDetails(),
+                completion_tokens_details=CompletionTokensDetails(),
+            )
         yield GenerationResponse(
             text=out.text,  # pyright: ignore[reportAny]
             token=out.token,  # pyright: ignore[reportAny]
-            finish_reason=out.finish_reason,  # pyright: ignore[reportAny]
-            usage=None,
+            finish_reason=finish_reason,
+            usage=usage,
         )
 
 

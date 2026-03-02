@@ -250,7 +250,12 @@ class Worker:
                 case CancelTask(
                     cancelled_task_id=cancelled_task_id, runner_id=runner_id
                 ):
-                    await self.runners[runner_id].cancel_task(cancelled_task_id)
+                    try:
+                        await self.runners[runner_id].cancel_task(cancelled_task_id)
+                    except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+                        logger.warning(
+                            f"Runner {runner_id} channel closed, cannot cancel task {cancelled_task_id}"
+                        )
                     await self.event_sender.send(
                         TaskStatusUpdated(
                             task_id=task.task_id, task_status=TaskStatus.Complete
