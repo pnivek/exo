@@ -44,6 +44,7 @@ def em(
 @pytest.fixture(autouse=True)
 def fast_election_timeout(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("exo.shared.election.DEFAULT_ELECTION_TIMEOUT", 0.1)
+    monkeypatch.setattr("exo.shared.election.CONNECTION_DEBOUNCE", 0.1)
 
 
 @pytest.mark.anyio

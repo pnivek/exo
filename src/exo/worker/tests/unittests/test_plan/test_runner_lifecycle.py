@@ -165,6 +165,39 @@ def test_plan_does_not_create_runner_when_supervisor_already_present():
     assert result is None
 
 
+def test_plan_does_not_create_runner_when_sibling_failed():
+    """
+    If a sibling runner in the same instance has already failed (e.g. OOM),
+    plan() must NOT create a new local runner — otherwise _kill_runner will
+    immediately shut it down, causing an infinite create/shutdown loop.
+    """
+    shard1 = get_pipeline_shard_metadata(MODEL_A_ID, device_rank=0, world_size=2)
+    shard2 = get_pipeline_shard_metadata(MODEL_A_ID, device_rank=1, world_size=2)
+    instance = get_mlx_ring_instance(
+        instance_id=INSTANCE_1_ID,
+        model_id=MODEL_A_ID,
+        node_to_runner={NODE_A: RUNNER_1_ID, NODE_B: RUNNER_2_ID},
+        runner_to_shard={RUNNER_1_ID: shard1, RUNNER_2_ID: shard2},
+    )
+
+    runners: dict[Any, Any] = {}  # Local runner was already shut down
+    instances = {INSTANCE_1_ID: instance}
+    all_runners: dict[RunnerId, RunnerStatus] = {
+        RUNNER_2_ID: RunnerFailed(error_message="OOM"),
+    }
+
+    result = plan_mod.plan(
+        node_id=NODE_A,
+        runners=runners,
+        global_download_status={NODE_A: []},
+        instances=instances,
+        all_runners=all_runners,
+        tasks={},
+    )
+
+    assert not isinstance(result, plan_mod.CreateRunner)
+
+
 def test_plan_does_not_create_runner_for_unassigned_node():
     """
     If this node does not appear in shard_assignments.node_to_runner,

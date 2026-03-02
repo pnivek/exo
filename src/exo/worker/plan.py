@@ -66,7 +66,7 @@ def plan(
     return (
         _cancel_tasks(runners, tasks)
         or _kill_runner(runners, all_runners, instances)
-        or _create_runner(node_id, runners, instances)
+        or _create_runner(node_id, runners, instances, all_runners)
         or _model_needs_download(node_id, runners, global_download_status)
         or _init_distributed_backend(runners, all_runners)
         or _load_model(runners, all_runners, global_download_status)
@@ -102,6 +102,7 @@ def _create_runner(
     node_id: NodeId,
     runners: Mapping[RunnerId, RunnerSupervisor],
     instances: Mapping[InstanceId, Instance],
+    all_runners: Mapping[RunnerId, RunnerStatus],
 ) -> CreateRunner | None:
     for instance in instances.values():
         runner_id = instance.shard_assignments.node_to_runner.get(node_id, None)
@@ -109,6 +110,16 @@ def _create_runner(
             continue
 
         if runner_id in runners:
+            continue
+
+        # Don't create a runner if any sibling in this instance has failed.
+        # Otherwise _kill_runner shuts it down immediately, causing a loop.
+        has_failed_sibling = any(
+            isinstance(all_runners.get(rid), RunnerFailed)
+            for rid in instance.shard_assignments.node_to_runner.values()
+            if rid != runner_id
+        )
+        if has_failed_sibling:
             continue
 
         shard = instance.shard(runner_id)
