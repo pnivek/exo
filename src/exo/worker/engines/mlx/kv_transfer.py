@@ -343,14 +343,21 @@ def _sender_thread_fn(
                 continue
             # KVChunkMessage
             assert isinstance(item, KVChunkMessage)
+            chunk_index = item.chunk_index
             frame_data = _serialize_chunk_frame(item)
+            # Release numpy arrays immediately — on unified memory (GB10),
+            # these consume GPU memory via page cache.
+            item.layer_keys.clear()
+            item.layer_values.clear()
+            del item
             t_send_start = time.monotonic()
             _sendall(sock, frame_data)
             t_send_end = time.monotonic()
             chunk_mb = len(frame_data) / 1024 / 1024
+            del frame_data
             logger.info(
                 f"DISAGG_TIMING pipelined_chunk_send_ms={(t_send_end - t_send_start) * 1000:.1f} "
-                f"chunk_index={item.chunk_index} chunk_mb={chunk_mb:.2f}"
+                f"chunk_index={chunk_index} chunk_mb={chunk_mb:.2f}"
             )
     except Exception as exc:
         logger.error(f"Pipelined sender thread error: {exc}")
