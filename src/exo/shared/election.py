@@ -113,9 +113,12 @@ class Election:
 
     async def elect(self, em: ElectionMessage) -> None:
         logger.debug(f"Electing: {em}")
-        is_new_master = (
-            em.proposed_session.master_node_id != self.current_session.master_node_id
-        )
+        # Compare the full session (including election_clock), not just
+        # master_node_id.  When the same node re-wins with a new clock the
+        # event_router, worker, and download_coordinator must be recreated
+        # so they reference the new session.  Comparing only master_node_id
+        # caused silent session drift after WiFi-flap re-elections.
+        is_new_master = em.proposed_session != self.current_session
         self.current_session = em.proposed_session
         logger.debug(f"Current session: {self.current_session}")
         await self._er_sender.send(
