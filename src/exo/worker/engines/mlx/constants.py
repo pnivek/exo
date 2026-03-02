@@ -19,7 +19,7 @@ DEFAULT_TOP_LOGPROBS: int = 5
 # model.  This "grounds" the hidden states so MoE expert routing on the
 # decode device is consistent with its own computation, avoiding divergence
 # caused by cross-device numerical differences in the transferred KV cache.
-DISAGG_REPREFILL_TOKENS: int = 32
+DISAGG_REPREFILL_TOKENS: int = 64
 
 # gpt-oss Harmony protocol: the <|channel|> control token ID.
 # The prefill node appends this to the prompt so the decode node's first

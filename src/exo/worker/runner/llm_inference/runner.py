@@ -1027,10 +1027,12 @@ def strip_harmony_tokens(
 
         if in_content:
             yield response.model_copy(update={"is_thinking": is_thinking})
-
-        # Tokens outside any <|message|>...<|end|> block are discarded.
-        # finish_reason on the last token still propagates through the
-        # generator termination.
+        elif response.finish_reason is not None:
+            # Always propagate finish_reason even when outside a content block.
+            # Without this the API stream never terminates if the stop token
+            # falls outside a <|message|>...<|end|> block (common when MoE
+            # routing divergence causes the model to skip Harmony framing).
+            yield response.model_copy(update={"text": "", "is_thinking": False})
 
 
 def parse_gpt_oss(
