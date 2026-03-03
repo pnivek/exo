@@ -565,6 +565,7 @@ def main(
 
                         gc.collect()
                         mx.clear_cache()
+                        mx.synchronize()
 
                     current_status = RunnerReady()
                     logger.info("runner ready")
@@ -729,6 +730,7 @@ def main(
 
                         gc.collect()
                         mx.clear_cache()
+                        mx.synchronize()
 
                     current_status = RunnerReady()
                     logger.info("runner ready")
@@ -937,6 +939,7 @@ def main(
 
                         gc.collect()
                         mx.clear_cache()
+                        mx.synchronize()
 
                     current_status = RunnerReady()
                     logger.info("runner ready")

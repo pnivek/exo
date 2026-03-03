@@ -268,15 +268,29 @@ _QueueItem = KVChunkMessage | tuple[int, "np.ndarray[Any, Any]"] | None
 
 
 def _connect_with_retries(
-    host: str, port: int, retries: int = 30, delay: float = 1.0
+    host: str,
+    port: int,
+    retries: int = 30,
+    delay: float = 1.0,
+    send_timeout: float = 120.0,
 ) -> socket.socket:
-    """Connect a TCP socket with retries."""
+    """Connect a TCP socket with retries.
+
+    The returned socket has a send timeout (``SO_SNDTIMEO``) configured so
+    that ``sendall`` will raise ``TimeoutError`` instead of blocking forever
+    when the remote side stops reading (e.g. the decode receiver already
+    timed out and moved on).
+    """
     last_exc: Exception | None = None
     for attempt in range(retries):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(10.0)  # connect timeout
             sock.connect((host, port))
+            # Set a send timeout so _sendall doesn't block forever when the
+            # receiver has closed/abandoned the connection.
+            sock.settimeout(send_timeout)
             return sock
         except (ConnectionRefusedError, OSError) as exc:
             sock.close()
@@ -293,7 +307,7 @@ def _connect_with_retries(
 
 
 def _sendall(sock: socket.socket, data: bytes | memoryview) -> None:
-    """Send all bytes, raise on failure."""
+    """Send all bytes, raise on failure (respects socket timeout)."""
     sock.sendall(data)
 
 
@@ -521,16 +535,33 @@ def send_precomputed_kv_cache_sync(
     last_tokens_np: np.ndarray[Any, Any] = np.array(last_tokens, copy=False).astype(
         np.int32
     )
-    send_queue.put((len(last_tokens_np), last_tokens_np))
+    try:
+        send_queue.put((len(last_tokens_np), last_tokens_np), timeout=10.0)
+    except queue.Full:
+        logger.warning("Precomputed KV last_tokens enqueue timed out")
+        error_event.set()
 
-    # Send end sentinel and wait for sender thread
-    send_queue.put(None)
+    # Send end sentinel and wait for sender thread.
+    # Use a timeout on put() in case the sender thread is blocked on a
+    # socket write (e.g. the receiver already disconnected and the kernel
+    # buffer is full).
+    try:
+        send_queue.put(None, timeout=10.0)
+    except queue.Full:
+        logger.warning("Precomputed KV send_queue full — sender thread likely stuck")
+        error_event.set()
+
     sender.join(timeout=60.0)
-    sock.close()
+    if sender.is_alive():
+        logger.warning("Precomputed KV sender thread did not exit, closing socket")
+        # Closing the socket unblocks the sender thread's _sendall call.
+        sock.close()
+        sender.join(timeout=5.0)
+    else:
+        sock.close()
 
     t_send_end = time.monotonic()
     send_ms = (t_send_end - t_send_start) * 1000
-    kv_size_mb = sum(c.keys.nbytes + c.values.nbytes for c in cache) / 1024 / 1024
 
     if error_event.is_set():
         raise ConnectionError("Precomputed KV sender thread encountered a socket error")
@@ -704,11 +735,20 @@ def send_kv_cache_pipelined_sync(
     )
     send_queue.put((len(last_tokens_np), last_tokens_np))
 
-    # Send end sentinel and wait for sender thread
-    send_queue.put(None)
-    sender.join(timeout=30.0)
+    # Send end sentinel and wait for sender thread.
+    try:
+        send_queue.put(None, timeout=10.0)
+    except queue.Full:
+        logger.warning("Pipelined KV send_queue full — sender thread likely stuck")
+        error_event.set()
 
-    sock.close()
+    sender.join(timeout=30.0)
+    if sender.is_alive():
+        logger.warning("Pipelined KV sender thread did not exit, closing socket")
+        sock.close()
+        sender.join(timeout=5.0)
+    else:
+        sock.close()
 
     if error_event.is_set():
         raise ConnectionError("Pipelined sender thread encountered a socket error")
@@ -1029,6 +1069,9 @@ class KVTransferServer:
         finally:
             self._server.settimeout(None)
         logger.info(f"KV transfer connection from {addr}")
+        # Set a recv timeout on the accepted connection so _recvall doesn't
+        # block forever if the sender crashes mid-transfer.
+        conn.settimeout(timeout)
         try:
             return _receive_one_connection(conn)
         finally:
