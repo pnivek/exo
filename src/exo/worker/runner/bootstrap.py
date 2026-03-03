@@ -76,10 +76,13 @@ def entrypoint(
 
     _ensure_tiktoken_vocab_cached()
 
-    # Increase CUDA graph cache for long-context TP prefill workloads.
+    # CUDA graph cache for long-context TP prefill workloads.
+    # Each cached graph pins its GPU workspace memory for its lifetime.
+    # On unified-memory devices (GB10) this directly reduces available RAM.
     # Default (400) causes cache thrashing at 16K+ tokens with tensor parallelism.
+    # 3000 is sufficient for 120b models at 16K+ depth without thrashing.
     if "MLX_CUDA_GRAPH_CACHE_SIZE" not in os.environ:
-        os.environ["MLX_CUDA_GRAPH_CACHE_SIZE"] = "2000"
+        os.environ["MLX_CUDA_GRAPH_CACHE_SIZE"] = "3000"
 
     import mlx.core as mx
 
