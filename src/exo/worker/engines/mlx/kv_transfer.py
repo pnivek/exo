@@ -473,11 +473,23 @@ def send_precomputed_kv_cache_sync(
     chunk_size = 4096
     chunk_index = 0
     t_send_start = time.monotonic()
+
+    # Capture KV size before we free the cache arrays.
+    kv_size_mb = sum(c.keys.nbytes + c.values.nbytes for c in cache) / 1024 / 1024
+
     for start in range(0, num_tokens, chunk_size):
         end = min(start + chunk_size, num_tokens)
         delta = extract_kv_delta(cache, start, end, chunk_index)
         send_queue.put(delta)
         chunk_index += 1
+
+    # All chunk data has been copied to numpy.  Free the GPU-resident KV
+    # cache immediately so the sender rank doesn't hold both the MLX arrays
+    # *and* the numpy copies during the network send.  On unified-memory
+    # devices (GB10), this releases ~2× the KV footprint worth of RAM.
+    for c in cache:
+        c.state = (mx.zeros((1, 1, 1, 1)), mx.zeros((1, 1, 1, 1)))
+    mx.synchronize()
 
     # Send last_tokens frame
     last_tokens_np: np.ndarray[Any, Any] = np.array(last_tokens, copy=False).astype(
@@ -492,7 +504,6 @@ def send_precomputed_kv_cache_sync(
 
     t_send_end = time.monotonic()
     send_ms = (t_send_end - t_send_start) * 1000
-    kv_size_mb = sum(c.keys.nbytes + c.values.nbytes for c in cache) / 1024 / 1024
 
     if error_event.is_set():
         raise ConnectionError("Precomputed KV sender thread encountered a socket error")
