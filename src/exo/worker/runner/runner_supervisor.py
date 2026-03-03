@@ -1,5 +1,6 @@
 import contextlib
 import multiprocessing as mp
+import os
 import signal
 from dataclasses import dataclass, field
 from typing import Self
@@ -25,6 +26,7 @@ from exo.shared.types.worker.runners import (
     RunnerFailed,
     RunnerIdle,
     RunnerLoading,
+    RunnerReady,
     RunnerRunning,
     RunnerShuttingDown,
     RunnerStatus,
@@ -37,6 +39,12 @@ from exo.worker.runner.bootstrap import entrypoint
 
 PREFILL_TIMEOUT_SECONDS = 60
 DECODE_TIMEOUT_SECONDS = 5
+
+# After this many inference completions (Running → Ready transitions), the
+# supervisor reports RunnerFailed to trigger a full restart cycle.  Killing the
+# subprocess is the only way to reclaim CUDA graph workspace memory that
+# accumulates across different sequence lengths.  Set to 0 to disable.
+_RUNNER_RESTART_THRESHOLD = int(os.environ.get("EXO_RUNNER_RESTART_THRESHOLD", "5"))
 
 
 @dataclass(eq=False)
@@ -54,6 +62,7 @@ class RunnerSupervisor:
     pending: dict[TaskId, anyio.Event] = field(default_factory=dict, init=False)
     completed: set[TaskId] = field(default_factory=set, init=False)
     cancelled: set[TaskId] = field(default_factory=set, init=False)
+    completed_inference_count: int = field(default=0, init=False)
     _cancel_watch_runner: anyio.CancelScope = field(
         default_factory=anyio.CancelScope, init=False
     )
@@ -172,7 +181,34 @@ class RunnerSupervisor:
             with self._ev_recv as events:
                 async for event in events:
                     if isinstance(event, RunnerStatusUpdated):
+                        prev_status = self.status
                         self.status = event.runner_status
+                        # Count inference completions (Running → Ready)
+                        if isinstance(prev_status, RunnerRunning) and isinstance(
+                            event.runner_status, RunnerReady
+                        ):
+                            self.completed_inference_count += 1
+                            if (
+                                _RUNNER_RESTART_THRESHOLD > 0
+                                and self.completed_inference_count
+                                >= _RUNNER_RESTART_THRESHOLD
+                            ):
+                                logger.info(
+                                    f"Runner completed {self.completed_inference_count} "
+                                    f"inference tasks, restarting for CUDA graph "
+                                    f"cache refresh"
+                                )
+                                self.status = RunnerFailed(
+                                    error_message="Scheduled restart: "
+                                    "clearing CUDA graph cache"
+                                )
+                                await self._event_sender.send(
+                                    RunnerStatusUpdated(
+                                        runner_id=self.bound_instance.bound_runner_id,
+                                        runner_status=self.status,
+                                    )
+                                )
+                                continue  # Don't forward RunnerReady
                     if isinstance(event, TaskAcknowledged):
                         self.pending.pop(event.task_id).set()
                         continue
@@ -189,6 +225,7 @@ class RunnerSupervisor:
                                 RunnerLoading,
                                 RunnerConnecting,
                                 RunnerShuttingDown,
+                                RunnerFailed,
                             ),
                         )
                         self.completed.add(event.task_id)

@@ -85,6 +85,10 @@ def _kill_runner(
         if (instance_id := runner.bound_instance.instance.instance_id) not in instances:
             return Shutdown(instance_id=instance_id, runner_id=runner_id)
 
+        # Kill locally-failed runners (crash or scheduled restart)
+        if isinstance(runner.status, RunnerFailed):
+            return Shutdown(instance_id=instance_id, runner_id=runner_id)
+
         for (
             global_runner_id
         ) in runner.bound_instance.instance.shard_assignments.node_to_runner.values():
