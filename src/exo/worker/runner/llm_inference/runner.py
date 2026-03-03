@@ -704,11 +704,19 @@ def main(
 
                         # Free KV cache and intermediate tensors to prevent
                         # GPU memory accumulation across consecutive requests.
+                        # Force synchronous evaluation so the GPU actually
+                        # releases the underlying buffers before the next
+                        # request allocates new ones.
                         del caches
                         import gc
 
                         gc.collect()
                         mx.clear_cache()
+                        # Synchronize the GPU to ensure all pending frees
+                        # complete.  Without this, freed buffers on the
+                        # non-sender rank (which never does a numpy
+                        # conversion) can stay resident in unified memory.
+                        mx.synchronize()
 
                     except Exception as e:
                         logger.opt(exception=e).error(
