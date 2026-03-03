@@ -76,16 +76,19 @@ def entrypoint(
 
     _ensure_tiktoken_vocab_cached()
 
-    # Increase CUDA graph cache for long-context TP prefill workloads.
-    # Each unique (sequence_length × layer × TP_rank) combination creates a new
-    # cached graph.  With 36 layers, world_size=2, and varying context depths
-    # (4K–32K+), 2000 entries thrash on the second or third request.
-    # 3000 prevents thrashing at 16K context while keeping memory pressure
-    # manageable — each cached graph pins its GPU workspace memory for the
-    # lifetime of the entry, and on unified-memory devices this directly
-    # reduces available system RAM.
+    # CUDA graph cache for long-context TP prefill workloads.
+    # Each cached graph pins its GPU workspace memory for its lifetime.
+    # On unified-memory devices (GB10) this directly reduces available RAM.
+    #
+    # With 40 layers per rank (TP world_size=2) the model needs ~150-200
+    # graph entries per unique sequence length.  A cache of 500 entries
+    # holds enough for 2-3 distinct lengths without thrashing, while
+    # evicting stale graphs to prevent unbounded memory growth across
+    # consecutive requests at varying depths.  The previous value of 3000
+    # never evicted, causing ~36% prefill TPS degradation over 5 runs at
+    # the same depth due to pinned workspace memory accumulating.
     if "MLX_CUDA_GRAPH_CACHE_SIZE" not in os.environ:
-        os.environ["MLX_CUDA_GRAPH_CACHE_SIZE"] = "3000"
+        os.environ["MLX_CUDA_GRAPH_CACHE_SIZE"] = "500"
 
     import mlx.core as mx
 

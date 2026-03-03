@@ -473,7 +473,44 @@ def send_precomputed_kv_cache_sync(
     )
     _sendall(sock, header)
 
-    # Set up sender thread
+    # ── Phase 1: Extract all chunks to numpy (fast, compute-only) ──────
+    # Extraction is a fast GPU→CPU copy that doesn't depend on the network.
+    # By extracting ALL chunks first we can free the GPU KV cache before
+    # any network I/O starts.  The previous approach interleaved extraction
+    # with queue puts (maxsize=2), so the GPU cache stayed resident for the
+    # entire network send duration — on unified-memory devices (GB10) this
+    # meant the MLX arrays AND their numpy copies coexisted for seconds,
+    # causing severe memory pressure and prefill TPS degradation across
+    # consecutive runs.
+    chunk_size = 4096
+    chunk_index = 0
+    t_send_start = time.monotonic()
+
+    # Capture KV size before we free the cache arrays.
+    kv_size_mb = sum(c.keys.nbytes + c.values.nbytes for c in cache) / 1024 / 1024
+
+    extracted_chunks: list[KVChunkMessage] = []
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        delta = extract_kv_delta(cache, start, end, chunk_index)
+        extracted_chunks.append(delta)
+        chunk_index += 1
+
+    # ── Phase 2: Free GPU KV cache immediately ──────────────────────────
+    # All KV data is now in numpy.  Free the GPU-resident cache so the
+    # sender rank releases MLX memory before any network I/O.
+    for c in cache:
+        c.state = (mx.zeros((1, 1, 1, 1)), mx.zeros((1, 1, 1, 1)))
+    mx.synchronize()
+
+    t_extract_end = time.monotonic()
+    extract_ms = (t_extract_end - t_send_start) * 1000
+    logger.info(
+        f"DISAGG_TIMING kv_extract_ms={extract_ms:.1f} "
+        f"chunks={chunk_index} kv_size_mb={kv_size_mb:.2f}"
+    )
+
+    # ── Phase 3: Drain numpy chunks through sender thread ────────────
     send_queue: queue.Queue[_QueueItem] = queue.Queue(maxsize=2)
     error_event = threading.Event()
     sender = threading.Thread(
@@ -483,34 +520,16 @@ def send_precomputed_kv_cache_sync(
     )
     sender.start()
 
-    # Extract and send the full cache in chunks
-    chunk_size = 4096
-    chunk_index = 0
-    t_send_start = time.monotonic()
-
-    # Capture KV size before we free the cache arrays.
-    kv_size_mb = sum(c.keys.nbytes + c.values.nbytes for c in cache) / 1024 / 1024
-
-    for start in range(0, num_tokens, chunk_size):
+    for delta in extracted_chunks:
         if error_event.is_set():
             break
-        end = min(start + chunk_size, num_tokens)
-        delta = extract_kv_delta(cache, start, end, chunk_index)
         try:
             send_queue.put(delta, timeout=120.0)
         except queue.Full:
             logger.warning("Precomputed KV chunk enqueue timed out — sender stuck")
             error_event.set()
             break
-        chunk_index += 1
-
-    # All chunk data has been copied to numpy.  Free the GPU-resident KV
-    # cache immediately so the sender rank doesn't hold both the MLX arrays
-    # *and* the numpy copies during the network send.  On unified-memory
-    # devices (GB10), this releases ~2× the KV footprint worth of RAM.
-    for c in cache:
-        c.state = (mx.zeros((1, 1, 1, 1)), mx.zeros((1, 1, 1, 1)))
-    mx.synchronize()
+    del extracted_chunks
 
     # Send last_tokens frame
     last_tokens_np: np.ndarray[Any, Any] = np.array(last_tokens, copy=False).astype(
