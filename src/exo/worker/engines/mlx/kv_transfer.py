@@ -124,8 +124,10 @@ def deserialize_kv_cache(data: bytes) -> tuple[list[KVCache], mx.array]:
         keys = mx.array(loaded[f"layer_{i}_keys"])  # pyright: ignore[reportAny]
         values = mx.array(loaded[f"layer_{i}_values"])  # pyright: ignore[reportAny]
         if uses_bfloat16:
-            keys = keys.astype(mx.bfloat16)
-            values = values.astype(mx.bfloat16)
+            # Bitcast uint16 bits back to bfloat16 — lossless recovery
+            # matching the serialize path which uses view(mx.uint16).
+            keys = keys.view(mx.bfloat16)
+            values = values.view(mx.bfloat16)
         cache.state = (keys, values)
         cache.offset = int(loaded[f"layer_{i}_offset"][0])  # pyright: ignore[reportAny]
         caches.append(cache)
@@ -266,15 +268,29 @@ _QueueItem = KVChunkMessage | tuple[int, "np.ndarray[Any, Any]"] | None
 
 
 def _connect_with_retries(
-    host: str, port: int, retries: int = 30, delay: float = 1.0
+    host: str,
+    port: int,
+    retries: int = 30,
+    delay: float = 1.0,
+    send_timeout: float = 120.0,
 ) -> socket.socket:
-    """Connect a TCP socket with retries."""
+    """Connect a TCP socket with retries.
+
+    The returned socket has a send timeout (``SO_SNDTIMEO``) configured so
+    that ``sendall`` will raise ``TimeoutError`` instead of blocking forever
+    when the remote side stops reading (e.g. the decode receiver already
+    timed out and moved on).
+    """
     last_exc: Exception | None = None
     for attempt in range(retries):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(10.0)  # connect timeout
             sock.connect((host, port))
+            # Set a send timeout so _sendall doesn't block forever when the
+            # receiver has closed/abandoned the connection.
+            sock.settimeout(send_timeout)
             return sock
         except (ConnectionRefusedError, OSError) as exc:
             sock.close()
@@ -291,7 +307,7 @@ def _connect_with_retries(
 
 
 def _sendall(sock: socket.socket, data: bytes | memoryview) -> None:
-    """Send all bytes, raise on failure."""
+    """Send all bytes, raise on failure (respects socket timeout)."""
     sock.sendall(data)
 
 
@@ -433,7 +449,10 @@ def send_precomputed_kv_cache_sync(
     num_layers = len(cache)
     # Send fewer entries so the decode node can re-prefill the tail tokens
     # with its own model (same logic as the pipelined path).
-    num_tokens = cache[0].offset - max(0, len(last_tokens) - 2)
+    # Ensure at least 1 token is sent so the receiver always gets a chunk
+    # frame — without this, short prompts (< DISAGG_REPREFILL_TOKENS) produce
+    # num_tokens=0 and the receiver raises "No chunk frames received".
+    num_tokens = max(1, cache[0].offset - max(0, len(last_tokens) - 2))
 
     sock = _connect_with_retries(host, port)
 
@@ -454,7 +473,44 @@ def send_precomputed_kv_cache_sync(
     )
     _sendall(sock, header)
 
-    # Set up sender thread
+    # ── Phase 1: Extract all chunks to numpy (fast, compute-only) ──────
+    # Extraction is a fast GPU→CPU copy that doesn't depend on the network.
+    # By extracting ALL chunks first we can free the GPU KV cache before
+    # any network I/O starts.  The previous approach interleaved extraction
+    # with queue puts (maxsize=2), so the GPU cache stayed resident for the
+    # entire network send duration — on unified-memory devices (GB10) this
+    # meant the MLX arrays AND their numpy copies coexisted for seconds,
+    # causing severe memory pressure and prefill TPS degradation across
+    # consecutive runs.
+    chunk_size = 4096
+    chunk_index = 0
+    t_send_start = time.monotonic()
+
+    # Capture KV size before we free the cache arrays.
+    kv_size_mb = sum(c.keys.nbytes + c.values.nbytes for c in cache) / 1024 / 1024
+
+    extracted_chunks: list[KVChunkMessage] = []
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        delta = extract_kv_delta(cache, start, end, chunk_index)
+        extracted_chunks.append(delta)
+        chunk_index += 1
+
+    # ── Phase 2: Free GPU KV cache immediately ──────────────────────────
+    # All KV data is now in numpy.  Free the GPU-resident cache so the
+    # sender rank releases MLX memory before any network I/O.
+    for c in cache:
+        c.state = (mx.zeros((1, 1, 1, 1)), mx.zeros((1, 1, 1, 1)))
+    mx.synchronize()
+
+    t_extract_end = time.monotonic()
+    extract_ms = (t_extract_end - t_send_start) * 1000
+    logger.info(
+        f"DISAGG_TIMING kv_extract_ms={extract_ms:.1f} "
+        f"chunks={chunk_index} kv_size_mb={kv_size_mb:.2f}"
+    )
+
+    # ── Phase 3: Drain numpy chunks through sender thread ────────────
     send_queue: queue.Queue[_QueueItem] = queue.Queue(maxsize=2)
     error_event = threading.Event()
     sender = threading.Thread(
@@ -464,30 +520,48 @@ def send_precomputed_kv_cache_sync(
     )
     sender.start()
 
-    # Extract and send the full cache in chunks
-    chunk_size = 4096
-    chunk_index = 0
-    t_send_start = time.monotonic()
-    for start in range(0, num_tokens, chunk_size):
-        end = min(start + chunk_size, num_tokens)
-        delta = extract_kv_delta(cache, start, end, chunk_index)
-        send_queue.put(delta)
-        chunk_index += 1
+    for delta in extracted_chunks:
+        if error_event.is_set():
+            break
+        try:
+            send_queue.put(delta, timeout=120.0)
+        except queue.Full:
+            logger.warning("Precomputed KV chunk enqueue timed out — sender stuck")
+            error_event.set()
+            break
+    del extracted_chunks
 
     # Send last_tokens frame
     last_tokens_np: np.ndarray[Any, Any] = np.array(last_tokens, copy=False).astype(
         np.int32
     )
-    send_queue.put((len(last_tokens_np), last_tokens_np))
+    try:
+        send_queue.put((len(last_tokens_np), last_tokens_np), timeout=10.0)
+    except queue.Full:
+        logger.warning("Precomputed KV last_tokens enqueue timed out")
+        error_event.set()
 
-    # Send end sentinel and wait for sender thread
-    send_queue.put(None)
+    # Send end sentinel and wait for sender thread.
+    # Use a timeout on put() in case the sender thread is blocked on a
+    # socket write (e.g. the receiver already disconnected and the kernel
+    # buffer is full).
+    try:
+        send_queue.put(None, timeout=10.0)
+    except queue.Full:
+        logger.warning("Precomputed KV send_queue full — sender thread likely stuck")
+        error_event.set()
+
     sender.join(timeout=60.0)
-    sock.close()
+    if sender.is_alive():
+        logger.warning("Precomputed KV sender thread did not exit, closing socket")
+        # Closing the socket unblocks the sender thread's _sendall call.
+        sock.close()
+        sender.join(timeout=5.0)
+    else:
+        sock.close()
 
     t_send_end = time.monotonic()
     send_ms = (t_send_end - t_send_start) * 1000
-    kv_size_mb = sum(c.keys.nbytes + c.values.nbytes for c in cache) / 1024 / 1024
 
     if error_event.is_set():
         raise ConnectionError("Precomputed KV sender thread encountered a socket error")
@@ -661,11 +735,20 @@ def send_kv_cache_pipelined_sync(
     )
     send_queue.put((len(last_tokens_np), last_tokens_np))
 
-    # Send end sentinel and wait for sender thread
-    send_queue.put(None)
-    sender.join(timeout=30.0)
+    # Send end sentinel and wait for sender thread.
+    try:
+        send_queue.put(None, timeout=10.0)
+    except queue.Full:
+        logger.warning("Pipelined KV send_queue full — sender thread likely stuck")
+        error_event.set()
 
-    sock.close()
+    sender.join(timeout=30.0)
+    if sender.is_alive():
+        logger.warning("Pipelined KV sender thread did not exit, closing socket")
+        sock.close()
+        sender.join(timeout=5.0)
+    else:
+        sock.close()
 
     if error_event.is_set():
         raise ConnectionError("Pipelined sender thread encountered a socket error")
@@ -966,13 +1049,29 @@ class KVTransferServer:
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server.bind(("0.0.0.0", port))
-        self._server.listen(1)
+        self._server.listen(4)
         logger.info(f"KV transfer server listening on port {port} (persistent)")
 
-    def receive(self) -> tuple[list[KVCache], mx.array]:
-        """Block until a prefill node connects and sends a KV cache."""
-        conn, addr = self._server.accept()  # pyright: ignore[reportAny]
+    def receive(self, timeout: float = 120.0) -> tuple[list[KVCache], mx.array]:
+        """Block until a prefill node connects and sends a KV cache.
+
+        Raises ``TimeoutError`` if no connection arrives within *timeout*
+        seconds, preventing the decode runner from blocking forever when
+        the prefill node crashes or fails to connect.
+        """
+        self._server.settimeout(timeout)
+        try:
+            conn, addr = self._server.accept()  # pyright: ignore[reportAny]
+        except socket.timeout:
+            raise TimeoutError(
+                f"No KV cache transfer received within {timeout}s on port {self.port}"
+            ) from None
+        finally:
+            self._server.settimeout(None)
         logger.info(f"KV transfer connection from {addr}")
+        # Set a recv timeout on the accepted connection so _recvall doesn't
+        # block forever if the sender crashes mid-transfer.
+        conn.settimeout(timeout)
         try:
             return _receive_one_connection(conn)
         finally:

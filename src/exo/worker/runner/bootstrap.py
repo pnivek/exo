@@ -76,10 +76,13 @@ def entrypoint(
 
     _ensure_tiktoken_vocab_cached()
 
-    # Increase CUDA graph cache for long-context TP prefill workloads.
+    # CUDA graph cache for long-context TP prefill workloads.
+    # Each cached graph pins its GPU workspace memory for its lifetime.
+    # On unified-memory devices (GB10) this directly reduces available RAM.
     # Default (400) causes cache thrashing at 16K+ tokens with tensor parallelism.
+    # 3000 is sufficient for 120b models at 16K+ depth without thrashing.
     if "MLX_CUDA_GRAPH_CACHE_SIZE" not in os.environ:
-        os.environ["MLX_CUDA_GRAPH_CACHE_SIZE"] = "2000"
+        os.environ["MLX_CUDA_GRAPH_CACHE_SIZE"] = "3000"
 
     import mlx.core as mx
 
@@ -92,6 +95,13 @@ def entrypoint(
         logger.info(f"Fast synch flag: {os.environ['MLX_METAL_FAST_SYNCH']}")
     else:
         logger.info("Metal not available, skipping MLX_METAL_FAST_SYNCH")
+        # On CUDA unified-memory devices (GB10), the default 95% cache limit
+        # causes freed buffers to stay resident in the OS page cache
+        # indefinitely.  nvidia-smi can't track memory on these devices, so
+        # the OS sees it as "used" and memory accumulates across requests.
+        # Disable buffer caching so every free returns memory to the system.
+        old_limit = mx.set_cache_limit(0)
+        logger.info(f"CUDA buffer cache disabled (was {old_limit / 1024**3:.1f} GB)")
 
     # Import main after setting global logger - this lets us just import logger from this module
     try:

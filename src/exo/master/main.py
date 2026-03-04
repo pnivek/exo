@@ -44,6 +44,7 @@ from exo.shared.types.events import (
     NodeTimedOut,
     TaskCreated,
     TaskDeleted,
+    TaskFailed,
     TaskStatusUpdated,
     TraceEventData,
     TracesCollected,
@@ -82,6 +83,13 @@ from exo.utils.channels import Receiver, Sender
 from exo.utils.event_buffer import MultiSourceBuffer
 from exo.utils.task_group import TaskGroup
 
+# Task types that carry a paired_task_id for disaggregated inference
+_PAIRED_TASK_TYPES = (
+    DisaggPrefillTask,
+    DisaggDecodeTask,
+    TensorParallelDisaggPrefillTask,
+)
+
 
 class Master:
     def __init__(
@@ -100,7 +108,6 @@ class Master:
         self.state = State()
         self._tg: TaskGroup = TaskGroup()
         self.command_task_mapping: dict[CommandId, TaskId] = {}
-        self.disagg_prefill_task_mapping: dict[CommandId, TaskId] = {}
         self.command_receiver = command_receiver
         self.local_event_receiver = local_event_receiver
         self.global_event_sender = global_event_sender
@@ -194,6 +201,7 @@ class Master:
                                             task_params=command.task_params,
                                             decode_node_host=selected_instance.decode_node_host,
                                             decode_node_port=selected_instance.kv_transfer_port,
+                                            paired_task_id=decode_task_id,
                                         ),
                                     )
                                 )
@@ -207,15 +215,13 @@ class Master:
                                             task_status=TaskStatus.Pending,
                                             task_params=command.task_params,
                                             kv_transfer_port=selected_instance.kv_transfer_port,
+                                            paired_task_id=prefill_task_id,
                                         ),
                                     )
                                 )
 
                                 self.command_task_mapping[command.command_id] = (
                                     decode_task_id
-                                )
-                                self.disagg_prefill_task_mapping[command.command_id] = (
-                                    prefill_task_id
                                 )
                             elif isinstance(selected_instance, DisaggregatedInstance):
                                 # Disaggregated: create prefill + decode tasks
@@ -233,6 +239,7 @@ class Master:
                                             task_params=command.task_params,
                                             decode_node_host=selected_instance.decode_node_host,
                                             decode_node_port=selected_instance.kv_transfer_port,
+                                            paired_task_id=decode_task_id,
                                         ),
                                     )
                                 )
@@ -246,15 +253,13 @@ class Master:
                                             task_status=TaskStatus.Pending,
                                             task_params=command.task_params,
                                             kv_transfer_port=selected_instance.kv_transfer_port,
+                                            paired_task_id=prefill_task_id,
                                         ),
                                     )
                                 )
 
                                 self.command_task_mapping[command.command_id] = (
                                     decode_task_id
-                                )
-                                self.disagg_prefill_task_mapping[command.command_id] = (
-                                    prefill_task_id
                                 )
                             else:
                                 task_id = TaskId()
@@ -454,6 +459,19 @@ class Master:
                                         task_id=task_id,
                                     )
                                 )
+                                # Cascade cancellation to paired disagg task
+                                task = self.state.tasks.get(task_id)
+                                if (
+                                    task is not None
+                                    and isinstance(task, _PAIRED_TASK_TYPES)
+                                    and task.paired_task_id is not None
+                                ):
+                                    generated_events.append(
+                                        TaskStatusUpdated(
+                                            task_status=TaskStatus.Cancelled,
+                                            task_id=task.paired_task_id,
+                                        )
+                                    )
                         case TaskFinished():
                             if (
                                 task_id := self.command_task_mapping.pop(
@@ -461,15 +479,18 @@ class Master:
                                 )
                             ) is not None:
                                 generated_events.append(TaskDeleted(task_id=task_id))
-                            # Clean up paired prefill task for disaggregated inference
-                            if (
-                                prefill_task_id := self.disagg_prefill_task_mapping.pop(
-                                    command.finished_command_id, None
-                                )
-                            ) is not None:
-                                generated_events.append(
-                                    TaskDeleted(task_id=prefill_task_id)
-                                )
+                                # Clean up paired task via paired_task_id
+                                finished_task = self.state.tasks.get(task_id)
+                                if (
+                                    finished_task is not None
+                                    and isinstance(finished_task, _PAIRED_TASK_TYPES)
+                                    and finished_task.paired_task_id is not None
+                                ):
+                                    generated_events.append(
+                                        TaskDeleted(
+                                            task_id=finished_task.paired_task_id
+                                        )
+                                    )
                         case RequestEventLog():
                             # We should just be able to send everything, since other buffers will ignore old messages
                             # rate limit to 1000 at a time
@@ -553,6 +574,26 @@ class Master:
 
                     self._event_log.append(event)
                     await self._send_event(indexed)
+
+                    # Cascade failure to paired disagg task
+                    if isinstance(event, TaskFailed):
+                        failed_task = self.state.tasks.get(event.task_id)
+                        if (
+                            failed_task is not None
+                            and isinstance(failed_task, _PAIRED_TASK_TYPES)
+                            and failed_task.paired_task_id is not None
+                        ):
+                            paired = self.state.tasks.get(failed_task.paired_task_id)
+                            if paired is not None and paired.task_status not in (
+                                TaskStatus.Complete,
+                                TaskStatus.Failed,
+                                TaskStatus.Cancelled,
+                            ):
+                                cancel_event = TaskStatusUpdated(
+                                    task_id=failed_task.paired_task_id,
+                                    task_status=TaskStatus.Cancelled,
+                                )
+                                await self.event_sender.send(cancel_event)
 
     # This function is re-entrant, take care!
     async def _send_event(self, event: IndexedEvent):
