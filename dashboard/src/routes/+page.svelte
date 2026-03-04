@@ -6240,12 +6240,11 @@
               </div>
 
               <div
-                class="relative aspect-square bg-exo-dark-gray rounded-lg overflow-hidden"
+                class="relative aspect-square bg-exo-dark-gray rounded-lg overflow-hidden pointer-events-none"
               >
                 <TopologyGraph
                   highlightedNodes={highlightedNodes()}
                   filteredNodes={nodeFilter}
-                  onNodeClick={togglePreviewNodeFilter}
                   layoutMode={effectiveInferenceMode === "pd"
                     ? "flow"
                     : "circular"}

@@ -4,7 +4,7 @@ from exo.shared.types.worker.runner_response import (
     GenerationResponse,
     ToolCallResponse,
 )
-from exo.worker.runner.llm_inference.runner import (
+from exo.worker.runner.llm_inference.model_output_parsers import (
     parse_gpt_oss,
     strip_harmony_tokens,
 )
@@ -110,7 +110,7 @@ def _collect(
     def _gen() -> Generator[GenerationResponse, None, None]:
         yield from _make_gen_responses(tokens)
 
-    return list(parse_gpt_oss(_gen()))
+    return list(x for x in parse_gpt_oss(_gen()) if x is not None)
 
 
 def _get_tool_call(

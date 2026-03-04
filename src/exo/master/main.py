@@ -472,6 +472,10 @@ class Master:
                                             task_id=task.paired_task_id,
                                         )
                                     )
+                            else:
+                                logger.warning(
+                                    f"Nonexistent command {command.cancelled_command_id} cancelled"
+                                )
                         case TaskFinished():
                             if (
                                 task_id := self.command_task_mapping.pop(
@@ -491,6 +495,10 @@ class Master:
                                             task_id=finished_task.paired_task_id
                                         )
                                     )
+                            else:
+                                logger.warning(
+                                    f"Finished command {command.finished_command_id} finished"
+                                )
                         case RequestEventLog():
                             # We should just be able to send everything, since other buffers will ignore old messages
                             # rate limit to 1000 at a time
