@@ -1,5 +1,8 @@
+import itertools
+import time
 from collections.abc import Generator
 from functools import cache
+from typing import Any
 
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.gpt_oss import Model as GptOssModel
@@ -12,7 +15,12 @@ from openai_harmony import (  # pyright: ignore[reportMissingTypeStubs]
     load_harmony_encoding,
 )
 
-from exo.shared.types.api import ToolCallItem
+from exo.shared.types.api import (
+    CompletionTokensDetails,
+    PromptTokensDetails,
+    ToolCallItem,
+    Usage,
+)
 from exo.shared.types.common import ModelId
 from exo.shared.types.mlx import Model
 from exo.shared.types.worker.runner_response import GenerationResponse, ToolCallResponse
@@ -76,7 +84,12 @@ def parse_gpt_oss(
         try:
             stream.process(response.token)
         except HarmonyError:
-            logger.error("Encountered critical Harmony Error, returning early")
+            # Fall back to stripping Harmony framing tokens and yielding
+            # raw content.  This commonly triggers in disaggregated inference
+            # when MoE routing divergence causes the model to emit tokens
+            # that violate the Harmony protocol.
+            logger.warning("Harmony parse error, falling back to strip_harmony_tokens")
+            yield from strip_harmony_tokens(response, responses)
             return
 
         delta = stream.last_content_delta
@@ -374,3 +387,96 @@ def parse_tool_calls(
         else:
             # fallthrough
             yield response
+
+
+def strip_harmony_tokens(
+    first: GenerationResponse,
+    remaining: Generator[GenerationResponse | None],
+) -> Generator[GenerationResponse]:
+    """Strip Harmony control tokens and yield only content text.
+
+    Used as a fallback when the Harmony parser rejects a token sequence
+    (e.g. the model skips a channel declaration in disaggregated mode).
+    Walks the token stream with a minimal state machine that recognises
+    ``<|start|>``, ``<|channel|>``, ``<|message|>``, and ``<|end|>``
+    boundaries to extract content while discarding protocol framing.
+    """
+    in_content = False
+    is_thinking = False
+    in_header = False  # after <|start|> or <|channel|>, skip non-control tokens
+    channel_parts: list[str] = []
+
+    for response in itertools.chain([first], remaining):
+        if response is None:
+            continue
+        text = response.text
+        is_control = text.startswith("<|") and text.endswith("|>")
+
+        if is_control:
+            in_header = False
+            if text == "<|start|>":
+                in_content = False
+                in_header = True
+            elif text == "<|channel|>":
+                in_content = False
+                in_header = True
+                channel_parts = []
+            elif text == "<|message|>":
+                channel_name = "".join(channel_parts).strip()
+                is_thinking = channel_name == "analysis"
+                channel_parts = []
+                in_content = True
+            elif text == "<|end|>":
+                in_content = False
+            # Skip all control tokens.
+            continue
+
+        if in_header:
+            channel_parts.append(text)
+            continue
+
+        if in_content:
+            yield response.model_copy(update={"is_thinking": is_thinking})
+        elif response.finish_reason is not None:
+            # Always propagate finish_reason even when outside a content block.
+            # Without this the API stream never terminates if the stop token
+            # falls outside a <|message|>...<|end|> block (common when MoE
+            # routing divergence causes the model to skip Harmony framing).
+            yield response.model_copy(update={"text": "", "is_thinking": False})
+
+
+def wrap_stream_generate(
+    raw_stream: Generator[Any, None, None],
+    t_decode_start: float,
+    prompt_tokens: int = 0,
+) -> Generator[GenerationResponse, None, None]:
+    """Wrap raw mlx_lm stream_generate output into GenerationResponse objects.
+
+    Also logs first-token timing for disaggregated decode and computes
+    usage on the final response.
+    """
+    t_first_token: float | None = None
+    for completion_tokens, out in enumerate(raw_stream, start=1):  # pyright: ignore[reportAny]
+        if t_first_token is None:
+            t_first_token = time.monotonic()
+            logger.info(
+                f"DISAGG_TIMING decode_first_token_ms={(t_first_token - t_decode_start) * 1000:.1f}"
+            )
+        from exo.shared.types.api import FinishReason
+
+        finish_reason: FinishReason | None = out.finish_reason  # pyright: ignore[reportAny]
+        usage: Usage | None = None
+        if finish_reason is not None:
+            usage = Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                prompt_tokens_details=PromptTokensDetails(),
+                completion_tokens_details=CompletionTokensDetails(),
+            )
+        yield GenerationResponse(
+            text=out.text,  # pyright: ignore[reportAny]
+            token=out.token,  # pyright: ignore[reportAny]
+            finish_reason=finish_reason,
+            usage=usage,
+        )
