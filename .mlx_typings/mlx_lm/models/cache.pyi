@@ -170,7 +170,10 @@ class KVCache(_BaseCache):
 
 class RotatingKVCache(_BaseCache):
     step = ...
-    def __init__(self, max_size, keep=...) -> None: ...
+    max_size: int
+    keep: int
+    _idx: int
+    def __init__(self, max_size: int = ..., keep: int = ...) -> None: ...
     def update_and_fetch(
         self, keys, values
     ):  # -> tuple[array | Any, array | Any] | tuple[array | Any, array | Any | None]:

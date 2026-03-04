@@ -79,6 +79,80 @@ from .batch_generator import Cancelled, Finished
 from .tool_parsers import ToolParser, make_mlx_parser
 
 
+def _align_received_caches(
+    model: Model,
+    received_caches: list[Any],
+) -> list[Any]:
+    """Align received KV caches to the model's expected cache types.
+
+    Models like gpt-oss use interleaved attention — some layers expect
+    RotatingKVCache (sliding window) while others use plain KVCache.
+    The KV transfer receiver creates all caches as plain KVCache, which
+    makes sliding-attention layers attend to the entire sequence instead
+    of just the window — causing the GPU to hang on long contexts.
+    """
+    if not hasattr(model, "make_cache"):
+        return received_caches
+
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    expected_caches: list[Any] = model.make_cache()  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
+    if len(expected_caches) != len(received_caches):  # pyright: ignore[reportUnknownArgumentType]
+        logger.warning(
+            f"Cache count mismatch: model expects {len(expected_caches)}, "  # pyright: ignore[reportUnknownArgumentType]
+            f"received {len(received_caches)}. Skipping alignment."
+        )
+        return received_caches
+
+    aligned: list[Any] = []
+    converted_count = 0
+    for expected, received_any in zip(  # pyright: ignore[reportAny]
+        expected_caches, received_caches, strict=True  # pyright: ignore[reportUnknownArgumentType]
+    ):
+        if not isinstance(expected, RotatingKVCache):
+            aligned.append(received_any)
+            continue
+
+        received = cast(KVCache, received_any)
+
+        # Extract K/V from the received plain KVCache.
+        keys, values = received.state
+        assert keys is not None and values is not None
+        seq_len: int = keys.shape[2]
+        max_size = expected.max_size
+
+        if seq_len <= max_size:
+            # Sequence fits in the window — just wrap in RotatingKVCache.
+            rotating = RotatingKVCache(
+                max_size=max_size, keep=expected.keep
+            )
+            rotating.state = (keys, values)
+            rotating.offset = received.offset
+            rotating._idx = seq_len
+        else:
+            # Trim to the last max_size tokens for the sliding window.
+            trimmed_keys = keys[:, :, -max_size:, :]
+            trimmed_values = values[:, :, -max_size:, :]
+            rotating = RotatingKVCache(
+                max_size=max_size, keep=expected.keep
+            )
+            rotating.state = (trimmed_keys, trimmed_values)
+            rotating.offset = received.offset
+            # Buffer is full — next write wraps to keep position.
+            rotating._idx = max_size
+
+        aligned.append(rotating)
+        converted_count += 1
+
+    if converted_count > 0:
+        logger.info(
+            f"Aligned {converted_count}/{len(received_caches)} caches "
+            f"to RotatingKVCache (sliding window)"
+        )
+
+    return aligned
+
+
 class ExitCode(str, Enum):
     AllTasksComplete = "AllTasksComplete"
     Shutdown = "Shutdown"
@@ -716,6 +790,7 @@ class Runner:
             from mlx_lm.sample_utils import make_sampler
 
             from exo.worker.engines.mlx.constants import (
+                DISAGG_REPREFILL_TOKENS,
                 HARMONY_CHANNEL_TOKEN_ID,
                 KV_BITS,
                 KV_GROUP_SIZE,
@@ -744,6 +819,17 @@ class Runner:
                 f"layers={len(received_caches)}"
             )
 
+            # Align received caches to the model's expected cache types.
+            # Models like gpt-oss use interleaved attention: some layers
+            # use RotatingKVCache (sliding window) while others use KVCache
+            # (full attention).  The receiver creates all caches as plain
+            # KVCache, which makes sliding-attention layers attend to the
+            # entire sequence instead of just max_size tokens — causing
+            # Metal to hang on long contexts.
+            received_caches = _align_received_caches(
+                gen.model, received_caches
+            )
+
             sampler = make_sampler(
                 temp=task_params.temperature
                 if task_params.temperature is not None
@@ -765,7 +851,7 @@ class Runner:
                 max_tokens=max_tokens,
                 sampler=sampler,
                 prompt_cache=received_caches,
-                prefill_step_size=1,
+                prefill_step_size=DISAGG_REPREFILL_TOKENS,
                 kv_group_size=KV_GROUP_SIZE,
                 kv_bits=KV_BITS,
             )

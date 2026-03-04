@@ -390,13 +390,30 @@ def extract_kv_delta(
 
     Copies the slice to numpy immediately so the MLX buffer can be reused.
     """
+    from mlx_lm.models.cache import RotatingKVCache
+
     num_tokens = current_offset - prev_offset
     layer_keys: list["np.ndarray[Any, Any]"] = []
     layer_values: list["np.ndarray[Any, Any]"] = []
     for c in cache:
-        # keys/values shape: [1, n_kv_heads, offset, head_dim]
-        k_slice = c.keys[:, :, prev_offset:current_offset, :]
-        v_slice = c.values[:, :, prev_offset:current_offset, :]
+        if isinstance(c, RotatingKVCache) and c._idx >= 0:
+            # RotatingKVCache wraps its buffer — global offsets don't map to
+            # buffer indices.  After _update_concat (batch prefill), _idx ==
+            # keys.shape[2] and the buffer is in temporal order.  Map global
+            # offsets to buffer coordinates.
+            buf_start_token = c.offset - c._idx
+            buf_idx_start = max(0, prev_offset - buf_start_token)
+            buf_idx_end = min(c._idx, current_offset - buf_start_token)
+            if buf_idx_end > buf_idx_start:
+                k_slice = c.keys[:, :, buf_idx_start:buf_idx_end, :]
+                v_slice = c.values[:, :, buf_idx_start:buf_idx_end, :]
+            else:
+                k_slice = c.keys[:, :, :0, :]
+                v_slice = c.values[:, :, :0, :]
+        else:
+            # Standard KVCache: buffer indices match global offsets.
+            k_slice = c.keys[:, :, prev_offset:current_offset, :]
+            v_slice = c.values[:, :, prev_offset:current_offset, :]
         mx.eval(k_slice, v_slice)
         layer_keys.append(_mlx_to_numpy(k_slice).copy())
         layer_values.append(_mlx_to_numpy(v_slice).copy())
@@ -821,6 +838,8 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
     full_keys: list["np.ndarray[Any, Any]"] | None = None
     full_values: list["np.ndarray[Any, Any]"] | None = None
     head_dim_x_heads: int = 0
+    n_kv_heads_wire: int = 0
+    head_dim_wire: int = 0
     total_received_tokens: int = 0
     last_tokens: mx.array | None = None
 
@@ -875,6 +894,19 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
             if full_keys is None:
                 elements_per_array = len(chunk_layer_keys[0])
                 head_dim_x_heads = elements_per_array // chunk_num_tokens
+                # Derive per-head dimensions for head-major chunk assembly
+                if header_n_kv_heads is not None and header_head_dim is not None:
+                    n_kv_heads_wire = header_n_kv_heads
+                    head_dim_wire = header_head_dim
+                else:
+                    # v1 fallback
+                    head_dim_wire = head_dim_x_heads
+                    n_kv_heads_wire = 1
+                    for candidate in [128, 96, 80, 64]:
+                        if head_dim_x_heads % candidate == 0:
+                            head_dim_wire = candidate
+                            n_kv_heads_wire = head_dim_x_heads // candidate
+                            break
                 full_keys = [
                     np.zeros(head_dim_x_heads * total_tokens, dtype=wire_np_dtype)
                     for _ in range(num_layers)
@@ -884,17 +916,26 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
                     for _ in range(num_layers)
                 ]
 
-            # Copy chunk data into pre-allocated buffers
+            # Copy chunk data into pre-allocated buffers using per-head
+            # placement.  The numpy arrays are in C-order of shape
+            # (1, n_kv_heads, N, head_dim) — i.e. head-major.  A naive
+            # flat copy (token-major) corrupts data when chunks have
+            # different seq_len because the head boundaries don't align.
             assert full_keys is not None
             assert full_values is not None
             for layer_idx in range(num_layers):
-                chunk_elements = len(chunk_layer_keys[layer_idx])
-                flat_start = start_offset * head_dim_x_heads
-                flat_end = flat_start + chunk_elements
-                full_keys[layer_idx][flat_start:flat_end] = chunk_layer_keys[layer_idx]
-                full_values[layer_idx][flat_start:flat_end] = chunk_layer_values[
-                    layer_idx
-                ]
+                k_chunk = chunk_layer_keys[layer_idx].reshape(
+                    n_kv_heads_wire, -1
+                )
+                v_chunk = chunk_layer_values[layer_idx].reshape(
+                    n_kv_heads_wire, -1
+                )
+                s = start_offset * head_dim_wire
+                e = s + chunk_num_tokens * head_dim_wire
+                fk = full_keys[layer_idx].reshape(n_kv_heads_wire, -1)
+                fv = full_values[layer_idx].reshape(n_kv_heads_wire, -1)
+                fk[:, s:e] = k_chunk
+                fv[:, s:e] = v_chunk
 
             total_received_tokens += chunk_num_tokens
             t_chunk_end = time.monotonic()
