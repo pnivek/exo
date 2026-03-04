@@ -98,6 +98,19 @@ from exo.worker.runner.bootstrap import logger
 from .tool_parsers import ToolParser, make_mlx_parser
 
 
+def _clear_gpu_caches() -> None:
+    """Clear buffer cache and CUDA graph caches.
+
+    CUDA graphs pin GPU workspace memory for each unique (sequence_length,
+    layer, TP_rank) configuration.  Between requests with different sequence
+    lengths, stale graphs waste memory and degrade performance.
+    """
+    mx.clear_cache()
+    _clear_fn = getattr(mx.cuda, "clear_graph_caches", None)
+    if _clear_fn is not None:
+        _clear_fn()
+
+
 def main(
     bound_instance: BoundInstance,
     event_sender: MpSender[Event],
@@ -544,7 +557,7 @@ def main(
                         import gc
 
                         gc.collect()
-                        mx.clear_cache()
+                        _clear_gpu_caches()
 
                     except Exception as e:
                         logger.opt(exception=e).error(
@@ -564,7 +577,7 @@ def main(
                         import gc
 
                         gc.collect()
-                        mx.clear_cache()
+                        _clear_gpu_caches()
                         mx.synchronize()
 
                     current_status = RunnerReady()
@@ -712,7 +725,7 @@ def main(
                         import gc
 
                         gc.collect()
-                        mx.clear_cache()
+                        _clear_gpu_caches()
                         # Synchronize the GPU to ensure all pending frees
                         # complete.  Without this, freed buffers on the
                         # non-sender rank (which never does a numpy
@@ -737,7 +750,7 @@ def main(
                         import gc
 
                         gc.collect()
-                        mx.clear_cache()
+                        _clear_gpu_caches()
                         mx.synchronize()
 
                     current_status = RunnerReady()
@@ -926,7 +939,7 @@ def main(
                         import gc
 
                         gc.collect()
-                        mx.clear_cache()
+                        _clear_gpu_caches()
 
                     except Exception as e:
                         logger.opt(exception=e).error(
@@ -946,7 +959,7 @@ def main(
                         import gc
 
                         gc.collect()
-                        mx.clear_cache()
+                        _clear_gpu_caches()
                         mx.synchronize()
 
                     current_status = RunnerReady()
@@ -960,7 +973,7 @@ def main(
                         kv_transfer_server = None
                     if not TYPE_CHECKING:
                         del inference_model, tokenizer, group
-                        mx.clear_cache()
+                        _clear_gpu_caches()
                         import gc
 
                         gc.collect()
