@@ -44,7 +44,8 @@ DECODE_TIMEOUT_SECONDS = 5
 # supervisor reports RunnerFailed to trigger a full restart cycle.  Killing the
 # subprocess is the only way to reclaim CUDA graph workspace memory that
 # accumulates across different sequence lengths.  Set to 0 to disable.
-_RUNNER_RESTART_THRESHOLD = int(os.environ.get("EXO_RUNNER_RESTART_THRESHOLD", "12"))
+# Disabled by default since mx.cuda.clear_graph_caches() now handles cleanup.
+_RUNNER_RESTART_THRESHOLD = int(os.environ.get("EXO_RUNNER_RESTART_THRESHOLD", "0"))
 
 
 @dataclass(eq=False)
