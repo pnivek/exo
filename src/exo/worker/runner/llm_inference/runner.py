@@ -599,6 +599,13 @@ class Runner:
 
         except Exception as e:
             logger.opt(exception=e).error("DisaggPrefill failed, recovering runner")
+            # Best-effort: notify decode node so it fails fast instead
+            # of waiting the full 120-second KV receive timeout.
+            from exo.worker.engines.mlx.kv_transfer import (
+                notify_decode_of_failure,
+            )
+
+            notify_decode_of_failure(decode_host, decode_port, str(e))
             if self.device_rank == 0:
                 self.event_sender.send(
                     ChunkGenerated(
@@ -750,7 +757,14 @@ class Runner:
             logger.opt(exception=e).error(
                 "TensorParallelDisaggPrefill failed, recovering runner"
             )
+            # Best-effort: notify decode node so it fails fast instead
+            # of waiting the full 120-second KV receive timeout.
             if self.device_rank == 0:
+                from exo.worker.engines.mlx.kv_transfer import (
+                    notify_decode_of_failure,
+                )
+
+                notify_decode_of_failure(decode_host, decode_port, str(e))
                 self.event_sender.send(
                     ChunkGenerated(
                         command_id=command_id,

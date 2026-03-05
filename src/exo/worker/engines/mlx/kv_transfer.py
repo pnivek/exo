@@ -39,6 +39,7 @@ _MAGIC = b"KVPS"
 _VERSION = 0x02
 _FRAME_CHUNK = 0x01
 _FRAME_LAST_TOKENS = 0x02
+_FRAME_ERROR = 0xFE
 _FRAME_END = 0xFF
 
 # Dtype flags for wire protocol
@@ -304,6 +305,31 @@ def _connect_with_retries(
     raise ConnectionError(
         f"Failed to connect to decode node at {host}:{port} after {retries} attempts"
     ) from last_exc
+
+
+def notify_decode_of_failure(host: str, port: int, error_message: str) -> None:
+    """Best-effort: connect to decode node and send a KVPS error frame.
+
+    If the decode node is waiting on ``KVTransferServer.receive()``, this
+    lets it fail immediately instead of waiting the full 120-second timeout.
+    Any exception is swallowed — the decode side will fall back to its
+    timeout if this notification doesn't get through.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        sock.connect((host, port))
+        # Minimal KVPS v2 header so receiver recognises the protocol
+        header = _MAGIC + struct.pack("!BIBI", _VERSION, 0, _DTYPE_FLOAT16, 0)
+        header += struct.pack("!II", 1, 64)  # dummy n_kv_heads, head_dim
+        sock.sendall(header)
+        # Error frame: type(1) + msg_len(4) + msg_bytes
+        msg_bytes = error_message.encode("utf-8")[:1024]
+        sock.sendall(struct.pack("!BI", _FRAME_ERROR, len(msg_bytes)) + msg_bytes)
+        sock.close()
+        logger.info(f"Notified decode node of prefill failure: {error_message[:80]}")
+    except Exception as exc:
+        logger.debug(f"Could not notify decode node of failure: {exc}")
 
 
 def _sendall(sock: socket.socket, data: bytes | memoryview) -> None:
@@ -849,6 +875,11 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
 
         if frame_type == _FRAME_END:
             break
+
+        if frame_type == _FRAME_ERROR:
+            msg_len: int = struct.unpack("!I", _recvall(conn, 4))[0]  # pyright: ignore[reportAny]
+            msg = _recvall(conn, msg_len).decode("utf-8", errors="replace")
+            raise RuntimeError(f"Prefill node reported error: {msg}")
 
         if frame_type == _FRAME_LAST_TOKENS:
             n_tokens_data = _recvall(conn, 4)
