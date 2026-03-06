@@ -61,6 +61,8 @@ class TensorPrefillDisaggInstance(BaseInstance):
     decode_node_host: str
     kv_transfer_port: int = 52416
     kv_sender_node_id: NodeId
+    kv_relay_host: str
+    kv_relay_port: int
 
 
 Instance = (

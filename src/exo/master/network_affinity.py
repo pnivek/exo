@@ -124,3 +124,71 @@ def find_nccl_coordinator_ip(
             return iface.ip_address
 
     return None
+
+
+def _is_reachable_by_all(
+    iface: NetworkInterfaceInfo,
+    other_nodes: Sequence[NodeId],
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> bool:
+    """Check if an interface shares a subnet with at least one interface on every other node."""
+    coord_net = _interface_network(iface)
+    if coord_net is None:
+        return False
+    for other_node in other_nodes:
+        other_network = node_network.get(other_node, NodeNetworkInfo())
+        reachable = any(
+            (other_net := _interface_network(other_iface)) is not None
+            and coord_net.overlaps(other_net)
+            for other_iface in other_network.interfaces
+        )
+        if not reachable:
+            return False
+    return True
+
+
+def find_relay_ip(
+    sender_node: NodeId,
+    all_prefill_nodes: Sequence[NodeId],
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> str | None:
+    """Find sender's IP on the fastest link reachable by other prefill nodes.
+
+    Unlike find_nccl_coordinator_ip which returns the first subnet match,
+    this function prioritizes high-bandwidth interfaces (RDMA, link-local)
+    over regular ethernet/WiFi.
+
+    Priority:
+    1. RDMA interface IP sharing subnet with all other prefill nodes
+    2. Link-local (169.254.x.x) IP sharing subnet with all other prefill nodes
+    3. Any non-loopback IP sharing subnet with all other prefill nodes
+    """
+    sender_network = node_network.get(sender_node, NodeNetworkInfo())
+    others = [n for n in all_prefill_nodes if n != sender_node]
+
+    # Strategy 1: RDMA interface reachable by all
+    for iface in sender_network.interfaces:
+        if iface.rdma_device_name is None:
+            continue
+        if iface.ip_address in ("127.0.0.1", "::1"):
+            continue
+        if _is_reachable_by_all(iface, others, node_network):
+            return iface.ip_address
+
+    # Strategy 2: link-local (169.254.x.x) reachable by all
+    for iface in sender_network.interfaces:
+        if not iface.ip_address.startswith("169.254."):
+            continue
+        if _is_reachable_by_all(iface, others, node_network):
+            return iface.ip_address
+
+    # Strategy 3: any non-loopback IP reachable by all
+    for iface in sender_network.interfaces:
+        if iface.ip_address in ("127.0.0.1", "::1") or iface.ip_address.startswith(
+            "fe80:"
+        ):
+            continue
+        if _is_reachable_by_all(iface, others, node_network):
+            return iface.ip_address
+
+    return None

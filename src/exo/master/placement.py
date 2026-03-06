@@ -5,6 +5,7 @@ from typing import Sequence
 
 from exo.master.network_affinity import (
     find_nccl_coordinator_ip,
+    find_relay_ip,
     pick_best_connected_node,
 )
 from exo.master.placement_utils import (
@@ -410,6 +411,21 @@ def place_tensor_prefill_disagg_instance(
     if decode_host is None:
         raise ValueError(f"Could not find IP address for decode node {decode_node_id}")
 
+    kv_sender_node_id = pick_best_connected_node(
+        candidates=prefill_node_ids,
+        target_node=decode_node_id,
+        node_network=node_network,
+    )
+
+    # Resolve the sender's IP on the fast inter-Spark link for TCP relay.
+    # Prefers RDMA/link-local interfaces over WiFi for maximum bandwidth.
+    kv_relay_host = find_relay_ip(kv_sender_node_id, prefill_node_ids, node_network)
+    if kv_relay_host is None:
+        raise ValueError(
+            f"Could not find relay IP for KV sender node {kv_sender_node_id}"
+        )
+    kv_relay_port = random_ephemeral_port()
+
     instance_id = InstanceId()
     target_instances = dict(deepcopy(current_instances))
     target_instances[instance_id] = TensorPrefillDisaggInstance(
@@ -420,11 +436,9 @@ def place_tensor_prefill_disagg_instance(
         nccl_port=nccl_port,
         decode_node_id=decode_node_id,
         decode_node_host=decode_host,
-        kv_sender_node_id=pick_best_connected_node(
-            candidates=prefill_node_ids,
-            target_node=decode_node_id,
-            node_network=node_network,
-        ),
+        kv_sender_node_id=kv_sender_node_id,
+        kv_relay_host=kv_relay_host,
+        kv_relay_port=kv_relay_port,
     )
 
     return target_instances

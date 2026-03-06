@@ -811,6 +811,698 @@ def send_kv_cache_pipelined_sync(
     return prefill_tps, num_tokens
 
 
+def send_kv_cache_pipelined_tp_sync(
+    host: str,
+    port: int,
+    model: Model,
+    tokenizer: TokenizerWrapper,
+    prompt_tokens: mx.array,
+    last_tokens: mx.array,
+    cache: KVCacheType,
+    sampler: Callable[[mx.array], mx.array],
+    group: mx.distributed.Group,
+    is_kv_sender: bool,
+    prefill_step_size: int = 4096,
+) -> tuple[float, int]:
+    """Run TP prefill while streaming gathered KV deltas to the decode node.
+
+    Both ranks call this function.  Inside the prefill callback, each chunk's
+    sharded KV delta is all_gathered across ranks (NCCL collective — both ranks
+    must participate).  The sender rank then extracts the full-headed delta to
+    numpy and queues it for the background sender thread; the non-sender rank
+    discards the gathered result.
+
+    Returns (prefill_tps, num_tokens).
+    """
+    from exo.worker.engines.mlx.auto_parallel import set_pipeline_prefill
+    from exo.worker.engines.mlx.constants import KV_BITS, KV_GROUP_SIZE
+
+    num_layers = len(cache)
+    num_tokens = len(prompt_tokens)
+    kv_send_cap = num_tokens + 1 - len(last_tokens)
+
+    # Only the sender rank connects to the decode node.
+    sock: socket.socket | None = None
+    if is_kv_sender:
+        sock = _connect_with_retries(host, port)
+
+    header_sent = False
+
+    # Sender thread (only used by sender rank)
+    send_queue: queue.Queue[_QueueItem] = queue.Queue(maxsize=2)
+    error_event = threading.Event()
+    sender: threading.Thread | None = None
+    if is_kv_sender:
+        assert sock is not None
+        sender = threading.Thread(
+            target=_sender_thread_fn,
+            args=(sock, send_queue, error_event),
+            daemon=True,
+        )
+
+    prev_offset = 0
+    chunk_index = 0
+    t_prefill_start = time.monotonic()
+
+    def on_prefill_chunk(processed: int, total: int) -> None:
+        """Called after each mx.eval during prefill — gather, extract, enqueue."""
+        nonlocal prev_offset, chunk_index, header_sent
+        if error_event.is_set():
+            return
+
+        current_offset = min(cache[0].offset, kv_send_cap)
+        if current_offset <= prev_offset:
+            return
+
+        # Slice sharded KV deltas from each layer and all_gather across ranks.
+        # This is a collective op — both ranks must execute it together.
+        gathered_keys: list[mx.array] = []
+        gathered_vals: list[mx.array] = []
+        for c in cache:
+            k_delta = c.keys[:, :, prev_offset:current_offset, :]
+            v_delta = c.values[:, :, prev_offset:current_offset, :]
+            gathered_keys.append(mx.distributed.all_gather(k_delta, group=group))
+            gathered_vals.append(mx.distributed.all_gather(v_delta, group=group))
+        mx.eval(*gathered_keys, *gathered_vals)
+
+        t_gather_end = time.monotonic()
+
+        if not is_kv_sender:
+            # Non-sender: discard gathered data, update offset, return
+            del gathered_keys, gathered_vals
+            prev_offset = current_offset
+            chunk_index += 1
+            return
+
+        assert sock is not None and sender is not None
+
+        # Send header on first chunk
+        if not header_sent:
+            # After all_gather: [world, n_kv_heads/world, seq, hd] → full heads
+            full_k0 = gathered_keys[0].reshape(
+                1, -1, gathered_keys[0].shape[2], gathered_keys[0].shape[3]
+            )
+            uses_bfloat16 = full_k0.dtype == mx.bfloat16
+            dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
+            cache_n_kv_heads = full_k0.shape[1]
+            cache_head_dim = full_k0.shape[3]
+            header = struct.pack(
+                "!4sBIBIII",
+                _MAGIC,
+                _VERSION,
+                num_layers,
+                dtype_flag,
+                kv_send_cap,
+                cache_n_kv_heads,
+                cache_head_dim,
+            )
+            _sendall(sock, header)
+            sender.start()
+            header_sent = True
+
+        # Extract gathered delta to numpy (full heads after reshape)
+        t_extract_start = time.monotonic()
+        delta_tokens = current_offset - prev_offset
+        layer_keys_np: list[np.ndarray[Any, Any]] = []
+        layer_vals_np: list[np.ndarray[Any, Any]] = []
+        for gk, gv in zip(gathered_keys, gathered_vals, strict=True):
+            # [world, n_kv_heads/world, tokens, hd] → [1, n_kv_heads, tokens, hd]
+            full_k = gk.reshape(1, -1, gk.shape[2], gk.shape[3])
+            full_v = gv.reshape(1, -1, gv.shape[2], gv.shape[3])
+            layer_keys_np.append(_mlx_to_numpy(full_k).copy())
+            layer_vals_np.append(_mlx_to_numpy(full_v).copy())
+        del gathered_keys, gathered_vals
+
+        t_extract_end = time.monotonic()
+        logger.info(
+            f"DISAGG_TIMING pipelined_tp_extract_ms={(t_extract_end - t_extract_start) * 1000:.1f} "
+            f"gather_ms={(t_gather_end - t_extract_start) * 1000:.1f} "
+            f"chunk_index={chunk_index} tokens={delta_tokens}"
+        )
+
+        delta = KVChunkMessage(
+            chunk_index=chunk_index,
+            start_offset=prev_offset,
+            num_tokens=delta_tokens,
+            layer_keys=layer_keys_np,
+            layer_values=layer_vals_np,
+        )
+        send_queue.put(delta)
+        prev_offset = current_offset
+        chunk_index += 1
+
+    set_pipeline_prefill(model, is_prefill=True)
+
+    for _ in stream_generate(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt_tokens,
+        max_tokens=1,
+        sampler=sampler,
+        prompt_cache=cache,
+        prefill_step_size=prefill_step_size,
+        kv_group_size=KV_GROUP_SIZE,
+        kv_bits=KV_BITS,
+        prompt_progress_callback=on_prefill_chunk,
+    ):
+        break
+
+    set_pipeline_prefill(model, is_prefill=False)
+
+    t_prefill_end = time.monotonic()
+    prefill_ms = (t_prefill_end - t_prefill_start) * 1000
+
+    for c in cache:
+        c.trim(2)
+
+    if is_kv_sender:
+        assert sock is not None and sender is not None
+
+        # If the header was never sent (callback never fired), send it now
+        if not header_sent:
+            # Need to gather once to get full head count
+            gathered_keys_final: list[mx.array] = []
+            gathered_vals_final: list[mx.array] = []
+            for c in cache:
+                state = c.state
+                gathered_keys_final.append(
+                    mx.distributed.all_gather(state[0], group=group)  # pyright: ignore[reportArgumentType]
+                )
+                gathered_vals_final.append(
+                    mx.distributed.all_gather(state[1], group=group)  # pyright: ignore[reportArgumentType]
+                )
+            mx.eval(*gathered_keys_final, *gathered_vals_final)
+
+            full_k0 = gathered_keys_final[0].reshape(
+                1, -1, gathered_keys_final[0].shape[2], gathered_keys_final[0].shape[3]
+            )
+            uses_bfloat16 = full_k0.dtype == mx.bfloat16
+            dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
+            cache_n_kv_heads = full_k0.shape[1]
+            cache_head_dim = full_k0.shape[3]
+            header = struct.pack(
+                "!4sBIBIII",
+                _MAGIC,
+                _VERSION,
+                num_layers,
+                dtype_flag,
+                kv_send_cap,
+                cache_n_kv_heads,
+                cache_head_dim,
+            )
+            _sendall(sock, header)
+            sender.start()
+            header_sent = True
+            del gathered_keys_final, gathered_vals_final
+
+        # Extract final delta if any tokens remain unsent
+        final_offset = min(cache[0].offset, kv_send_cap)
+        if final_offset > prev_offset:
+            # Final chunk: need one more all_gather
+            gathered_keys_tail: list[mx.array] = []
+            gathered_vals_tail: list[mx.array] = []
+            for c in cache:
+                k_delta = c.keys[:, :, prev_offset:final_offset, :]
+                v_delta = c.values[:, :, prev_offset:final_offset, :]
+                gathered_keys_tail.append(
+                    mx.distributed.all_gather(k_delta, group=group)
+                )
+                gathered_vals_tail.append(
+                    mx.distributed.all_gather(v_delta, group=group)
+                )
+            mx.eval(*gathered_keys_tail, *gathered_vals_tail)
+
+            layer_keys_np_final: list[np.ndarray[Any, Any]] = []
+            layer_vals_np_final: list[np.ndarray[Any, Any]] = []
+            for gk, gv in zip(gathered_keys_tail, gathered_vals_tail, strict=True):
+                full_k = gk.reshape(1, -1, gk.shape[2], gk.shape[3])
+                full_v = gv.reshape(1, -1, gv.shape[2], gv.shape[3])
+                layer_keys_np_final.append(_mlx_to_numpy(full_k).copy())
+                layer_vals_np_final.append(_mlx_to_numpy(full_v).copy())
+            del gathered_keys_tail, gathered_vals_tail
+
+            delta = KVChunkMessage(
+                chunk_index=chunk_index,
+                start_offset=prev_offset,
+                num_tokens=final_offset - prev_offset,
+                layer_keys=layer_keys_np_final,
+                layer_values=layer_vals_np_final,
+            )
+            send_queue.put(delta)
+            logger.info(
+                f"DISAGG_TIMING pipelined_tp_final_chunk tokens={delta.num_tokens}"
+            )
+
+        # Send last_tokens frame
+        last_tokens_np: np.ndarray[Any, Any] = np.array(last_tokens, copy=False).astype(
+            np.int32
+        )
+        send_queue.put((len(last_tokens_np), last_tokens_np))
+
+        # Send end sentinel and wait for sender thread
+        try:
+            send_queue.put(None, timeout=10.0)
+        except queue.Full:
+            logger.warning(
+                "Pipelined TP KV send_queue full — sender thread likely stuck"
+            )
+            error_event.set()
+
+        sender.join(timeout=30.0)
+        if sender.is_alive():
+            logger.warning("Pipelined TP KV sender thread did not exit, closing socket")
+            sock.close()
+            sender.join(timeout=5.0)
+        else:
+            sock.close()
+
+        if error_event.is_set():
+            raise ConnectionError(
+                "Pipelined TP sender thread encountered a socket error"
+            )
+
+    prefill_tps = num_tokens / (prefill_ms / 1000) if prefill_ms > 0 else 0.0
+    logger.info(
+        f"DISAGG_TIMING pipelined_tp_prefill_ms={prefill_ms:.1f} "
+        f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens} "
+        f"chunks_sent={chunk_index} is_sender={is_kv_sender}"
+    )
+    return prefill_tps, num_tokens
+
+
+# ---------------------------------------------------------------------------
+# TCP relay pipelined TP — replaces NCCL all_gather with inter-Spark TCP
+# ---------------------------------------------------------------------------
+
+
+def _relay_send_chunk(
+    sock: socket.socket,
+    chunk: KVChunkMessage,
+) -> None:
+    """Send a KV chunk shard to the sender rank over the fast inter-Spark link.
+
+    Wire format per chunk: total_bytes(4) + chunk_index(4) + num_tokens(4)
+    + per-layer [key_flat_bytes, val_flat_bytes].
+    total_bytes == 0 is the end sentinel.
+    """
+    parts: list[bytes] = []
+    for layer_idx in range(len(chunk.layer_keys)):
+        parts.append(chunk.layer_keys[layer_idx].tobytes())
+        parts.append(chunk.layer_values[layer_idx].tobytes())
+    payload = b"".join(parts)
+    header = struct.pack("!III", len(payload) + 12, chunk.chunk_index, chunk.num_tokens)
+    _sendall(sock, header + payload)
+
+
+def _relay_recv_chunk(
+    conn: socket.socket,
+    num_layers: int,
+    n_kv_heads_per_rank: int,
+    head_dim: int,
+    wire_np_dtype: "type[np.uint16] | type[np.float16]",
+) -> KVChunkMessage | None:
+    """Receive a KV chunk shard from the non-sender rank.
+
+    Returns None on end sentinel (total_bytes == 0).
+    """
+    hdr = _recvall(conn, 12)
+    total_bytes: int
+    chunk_index: int
+    num_tokens: int
+    total_bytes, chunk_index, num_tokens = struct.unpack("!III", hdr)  # pyright: ignore[reportAny]
+    if total_bytes == 0:
+        return None
+
+    payload_len = total_bytes - 12
+    payload = _recvall(conn, payload_len)
+
+    # Parse per-layer key/value flat arrays
+    elem_size = 2  # uint16 or float16
+    layer_keys: list["np.ndarray[Any, Any]"] = []
+    layer_values: list["np.ndarray[Any, Any]"] = []
+    offset = 0
+    for _ in range(num_layers):
+        kv_flat_size = n_kv_heads_per_rank * num_tokens * head_dim * elem_size
+        k_np: np.ndarray[Any, Any] = np.frombuffer(
+            payload[offset : offset + kv_flat_size], dtype=wire_np_dtype
+        ).copy()
+        offset += kv_flat_size
+        v_np: np.ndarray[Any, Any] = np.frombuffer(
+            payload[offset : offset + kv_flat_size], dtype=wire_np_dtype
+        ).copy()
+        offset += kv_flat_size
+        layer_keys.append(k_np)
+        layer_values.append(v_np)
+
+    return KVChunkMessage(
+        chunk_index=chunk_index,
+        start_offset=0,  # not used by caller
+        num_tokens=num_tokens,
+        layer_keys=layer_keys,
+        layer_values=layer_values,
+    )
+
+
+def _combine_shards(
+    my_delta: KVChunkMessage,
+    other_delta: KVChunkMessage,
+    my_rank: int,
+    n_kv_heads_per_rank: int,
+    num_layers: int,
+) -> KVChunkMessage:
+    """Concatenate two rank shards into a full-headed KV chunk."""
+    combined_keys: list["np.ndarray[Any, Any]"] = []
+    combined_vals: list["np.ndarray[Any, Any]"] = []
+    for layer_idx in range(num_layers):
+        my_k = my_delta.layer_keys[layer_idx].reshape(n_kv_heads_per_rank, -1)
+        my_v = my_delta.layer_values[layer_idx].reshape(n_kv_heads_per_rank, -1)
+        other_k = other_delta.layer_keys[layer_idx].reshape(n_kv_heads_per_rank, -1)
+        other_v = other_delta.layer_values[layer_idx].reshape(n_kv_heads_per_rank, -1)
+
+        if my_rank == 0:
+            full_k = np.concatenate([my_k, other_k], axis=0)
+            full_v = np.concatenate([my_v, other_v], axis=0)
+        else:
+            full_k = np.concatenate([other_k, my_k], axis=0)
+            full_v = np.concatenate([other_v, my_v], axis=0)
+
+        combined_keys.append(full_k.reshape(-1))
+        combined_vals.append(full_v.reshape(-1))
+
+    return KVChunkMessage(
+        chunk_index=my_delta.chunk_index,
+        start_offset=my_delta.start_offset,
+        num_tokens=my_delta.num_tokens,
+        layer_keys=combined_keys,
+        layer_values=combined_vals,
+    )
+
+
+def send_kv_cache_pipelined_tp_relay_sync(
+    decode_host: str,
+    decode_port: int,
+    relay_host: str,
+    relay_port: int,
+    model: Model,
+    tokenizer: TokenizerWrapper,
+    prompt_tokens: mx.array,
+    last_tokens: mx.array,
+    cache: KVCacheType,
+    sampler: Callable[[mx.array], mx.array],
+    is_kv_sender: bool,
+    my_rank: int,
+    world_size: int,
+    prefill_step_size: int = 4096,
+) -> tuple[float, int]:
+    """Run TP prefill with TCP relay between Sparks instead of NCCL.
+
+    Uses callback-based pipelining: each rank extracts its KV delta in the
+    prefill callback, then the sender receives the other rank's shard via
+    the fast ConnectX relay link (~254-373ms) and enqueues the combined
+    chunk for the decode sender thread.  The non-sender sends its shard
+    in the callback.  This overlaps relay exchange + decode network I/O
+    with GPU compute for true pipelining.
+
+    Returns (prefill_tps, num_tokens).
+    """
+    from exo.worker.engines.mlx.auto_parallel import set_pipeline_prefill
+    from exo.worker.engines.mlx.constants import KV_BITS, KV_GROUP_SIZE
+
+    num_layers = len(cache)
+    num_tokens = len(prompt_tokens)
+    kv_send_cap = num_tokens + 1 - len(last_tokens)
+
+    # --- Relay connection setup ---
+    relay_conn: socket.socket | None = None
+    relay_listen: socket.socket | None = None
+
+    if is_kv_sender:
+        # Sender: listen for non-sender's relay connection
+        relay_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        relay_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        relay_listen.bind((relay_host, relay_port))
+        relay_listen.listen(1)
+        relay_listen.settimeout(60.0)
+        logger.info(f"KV relay server listening on {relay_host}:{relay_port}")
+    else:
+        # Non-sender: connect to sender's relay server (with retries)
+        relay_conn = _connect_with_retries(
+            relay_host, relay_port, retries=30, delay=1.0
+        )
+        logger.info(f"KV relay connected to {relay_host}:{relay_port}")
+
+    # Sender: accept the non-sender's connection (after it's been established)
+    if is_kv_sender:
+        assert relay_listen is not None
+        try:
+            relay_conn, relay_addr = relay_listen.accept()  # pyright: ignore[reportAny]
+            relay_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            relay_conn.settimeout(120.0)
+            logger.info(f"KV relay accepted connection from {relay_addr}")
+        finally:
+            relay_listen.close()
+
+    assert relay_conn is not None
+
+    # --- Decode connection + sender thread (sender rank only) ---
+    decode_sock: socket.socket | None = None
+    decode_queue: queue.Queue[_QueueItem] | None = None
+    decode_sender: threading.Thread | None = None
+    error_event = threading.Event()
+
+    if is_kv_sender:
+        decode_sock = _connect_with_retries(decode_host, decode_port)
+        decode_queue = queue.Queue(maxsize=2)
+        decode_sender = threading.Thread(
+            target=_sender_thread_fn,
+            args=(decode_sock, decode_queue, error_event),
+            daemon=True,
+        )
+        # decode_sender.start() deferred until after header is sent
+
+    # --- Callback-based prefill with inline relay exchange ---
+    prev_offset = 0
+    chunk_index = 0
+    header_sent = False
+    t_prefill_start = time.monotonic()
+
+    # Cache shape info (learned on first chunk)
+    n_kv_heads_per_rank: int = 0
+    head_dim_val: int = 0
+    wire_np_dtype_val: type[np.uint16] | type[np.float16] = np.uint16
+
+    def on_prefill_chunk(processed: int, total: int) -> None:
+        nonlocal prev_offset, chunk_index, header_sent
+        nonlocal n_kv_heads_per_rank, head_dim_val, wire_np_dtype_val
+
+        if error_event.is_set():
+            return
+
+        current_offset = min(cache[0].offset, kv_send_cap)
+        if current_offset <= prev_offset:
+            return
+
+        # Learn shapes from cache on first chunk
+        if n_kv_heads_per_rank == 0:
+            n_kv_heads_per_rank = cache[0].keys.shape[1]
+            head_dim_val = cache[0].keys.shape[3]
+            uses_bf16 = cache[0].keys is not None and cache[0].keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
+            wire_np_dtype_val = np.uint16 if uses_bf16 else np.float16
+
+        # Extract this rank's KV delta
+        t_extract_start = time.monotonic()
+        delta = extract_kv_delta(cache, prev_offset, current_offset, chunk_index)
+        t_extract_end = time.monotonic()
+
+        logger.info(
+            f"DISAGG_TIMING pipelined_tp_relay_extract_ms={(t_extract_end - t_extract_start) * 1000:.1f} "
+            f"chunk_index={chunk_index} tokens={delta.num_tokens}"
+        )
+
+        if is_kv_sender:
+            assert relay_conn is not None
+            assert decode_queue is not None
+            assert decode_sender is not None
+
+            # Send KVPS header to decode on first chunk
+            if not header_sent:
+                assert decode_sock is not None
+                full_n_kv_heads = n_kv_heads_per_rank * world_size
+                uses_bfloat16 = wire_np_dtype_val == np.uint16
+                dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
+                header = struct.pack(
+                    "!4sBIBIII",
+                    _MAGIC,
+                    _VERSION,
+                    num_layers,
+                    dtype_flag,
+                    kv_send_cap,
+                    full_n_kv_heads,
+                    head_dim_val,
+                )
+                _sendall(decode_sock, header)
+                decode_sender.start()
+                header_sent = True
+
+            # Receive other rank's shard via fast relay link
+            t_relay_start = time.monotonic()
+            other_delta = _relay_recv_chunk(
+                relay_conn,
+                num_layers,
+                n_kv_heads_per_rank,
+                head_dim_val,
+                wire_np_dtype_val,
+            )
+            t_relay_end = time.monotonic()
+            assert other_delta is not None, "Unexpected end sentinel during relay recv"
+
+            # Combine shards and enqueue for decode sender thread
+            combined_msg = _combine_shards(
+                delta, other_delta, my_rank, n_kv_heads_per_rank, num_layers
+            )
+            decode_queue.put(combined_msg)
+
+            logger.info(
+                f"DISAGG_TIMING pipelined_tp_relay_recv_ms={(t_relay_end - t_relay_start) * 1000:.1f} "
+                f"chunk_index={chunk_index} tokens={delta.num_tokens}"
+            )
+        else:
+            # Non-sender: send shard to sender via relay
+            assert relay_conn is not None
+            _relay_send_chunk(relay_conn, delta)
+
+        prev_offset = current_offset
+        chunk_index += 1
+
+    set_pipeline_prefill(model, is_prefill=True)
+
+    for _ in stream_generate(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt_tokens,
+        max_tokens=1,
+        sampler=sampler,
+        prompt_cache=cache,
+        prefill_step_size=prefill_step_size,
+        kv_group_size=KV_GROUP_SIZE,
+        kv_bits=KV_BITS,
+        prompt_progress_callback=on_prefill_chunk,
+    ):
+        break
+
+    set_pipeline_prefill(model, is_prefill=False)
+
+    t_prefill_end = time.monotonic()
+    prefill_ms = (t_prefill_end - t_prefill_start) * 1000
+
+    for c in cache:
+        c.trim(2)
+
+    # Extract final delta if tokens remain unsent after last callback
+    final_offset = min(cache[0].offset, kv_send_cap)
+    if final_offset > prev_offset:
+        if n_kv_heads_per_rank == 0:
+            n_kv_heads_per_rank = cache[0].keys.shape[1]
+            head_dim_val = cache[0].keys.shape[3]
+            uses_bf16 = cache[0].keys is not None and cache[0].keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
+            wire_np_dtype_val = np.uint16 if uses_bf16 else np.float16
+
+        delta = extract_kv_delta(cache, prev_offset, final_offset, chunk_index)
+
+        if is_kv_sender:
+            assert relay_conn is not None
+            assert decode_queue is not None
+            assert decode_sender is not None
+            assert decode_sock is not None
+
+            if not header_sent:
+                full_n_kv_heads = n_kv_heads_per_rank * world_size
+                uses_bfloat16 = wire_np_dtype_val == np.uint16
+                dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
+                header = struct.pack(
+                    "!4sBIBIII",
+                    _MAGIC,
+                    _VERSION,
+                    num_layers,
+                    dtype_flag,
+                    kv_send_cap,
+                    full_n_kv_heads,
+                    head_dim_val,
+                )
+                _sendall(decode_sock, header)
+                decode_sender.start()
+                header_sent = True
+
+            other_delta = _relay_recv_chunk(
+                relay_conn,
+                num_layers,
+                n_kv_heads_per_rank,
+                head_dim_val,
+                wire_np_dtype_val,
+            )
+            assert other_delta is not None, "Unexpected end sentinel during relay recv"
+            combined_msg = _combine_shards(
+                delta, other_delta, my_rank, n_kv_heads_per_rank, num_layers
+            )
+            decode_queue.put(combined_msg)
+        else:
+            assert relay_conn is not None
+            _relay_send_chunk(relay_conn, delta)
+
+        chunk_index += 1
+
+    # --- Finalize ---
+    if is_kv_sender:
+        assert decode_queue is not None
+        assert decode_sender is not None
+        assert decode_sock is not None
+
+        # Send last_tokens frame
+        last_tokens_np: np.ndarray[Any, Any] = np.array(last_tokens, copy=False).astype(
+            np.int32
+        )
+        decode_queue.put((len(last_tokens_np), last_tokens_np))
+
+        # Send end sentinel and wait for sender thread
+        try:
+            decode_queue.put(None, timeout=10.0)
+        except queue.Full:
+            logger.warning(
+                "Pipelined TP relay send_queue full — sender thread likely stuck"
+            )
+            error_event.set()
+
+        decode_sender.join(timeout=60.0)
+        if decode_sender.is_alive():
+            logger.warning(
+                "Pipelined TP relay sender thread did not exit, closing socket"
+            )
+            decode_sock.close()
+            decode_sender.join(timeout=5.0)
+        else:
+            decode_sock.close()
+
+        if error_event.is_set():
+            raise ConnectionError(
+                "Pipelined TP relay sender thread encountered a socket error"
+            )
+    else:
+        # Non-sender: send end sentinel
+        assert relay_conn is not None
+        _sendall(relay_conn, struct.pack("!III", 0, 0, 0))
+
+    # Close relay connection
+    relay_conn.close()
+
+    prefill_tps = num_tokens / (prefill_ms / 1000) if prefill_ms > 0 else 0.0
+    logger.info(
+        f"DISAGG_TIMING pipelined_tp_relay_prefill_ms={prefill_ms:.1f} "
+        f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens} "
+        f"chunks_sent={chunk_index} is_sender={is_kv_sender}"
+    )
+    return prefill_tps, num_tokens
+
+
 # ---------------------------------------------------------------------------
 # Pipelined receiver
 # ---------------------------------------------------------------------------

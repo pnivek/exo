@@ -284,6 +284,16 @@ class Runner:
             if self._cuda_pool is not None:
                 self._libcudart.cudaMemPoolTrimTo(self._cuda_pool, ctypes.c_size_t(0))
 
+        # Step 4: free CUDA graph workspace memory.
+        # clear_graph_caches destroys executables but their workspace lingers
+        # in a graph-specific pool that cudaMemPoolTrimTo doesn't reach.
+        # cudaDeviceGraphMemTrim (CUDA 11.4+) frees this pool — critical for
+        # TP where NCCL all_reduce ops captured in graphs inflate it.
+        if self._cuda_pool is not None:
+            trim_rc = cast(int, self._libcudart.cudaDeviceGraphMemTrim(ctypes.c_int(0)))
+            if trim_rc != 0:
+                logger.debug(f"cudaDeviceGraphMemTrim returned {trim_rc}")
+
     def update_status(self, status: RunnerStatus):
         self.current_status = status
         self.event_sender.send(
@@ -721,19 +731,15 @@ class Runner:
         assert gen.group is not None, "TP prefill requires distributed group"
 
         try:
-            from mlx_lm.models.cache import KVCache as PlainKVCache
             from mlx_lm.sample_utils import make_sampler
 
-            from exo.worker.engines.mlx.cache import encode_prompt
+            from exo.worker.engines.mlx.cache import encode_prompt, make_kv_cache
             from exo.worker.engines.mlx.constants import (
                 DISAGG_REPREFILL_TOKENS,
                 HARMONY_CHANNEL_TOKEN_ID,
-                KV_BITS,
-                KV_GROUP_SIZE,
             )
             from exo.worker.engines.mlx.kv_transfer import (
-                gather_sharded_kv_cache,
-                send_precomputed_kv_cache_sync,
+                send_kv_cache_pipelined_tp_relay_sync,
             )
             from exo.worker.engines.mlx.utils_mlx import apply_chat_template
 
@@ -752,81 +758,44 @@ class Runner:
                     ]
                 )
 
-            prompt_tokens = all_prompt_tokens[:-1]
             reprefill = min(DISAGG_REPREFILL_TOKENS, len(all_prompt_tokens))
             reprefill = max(reprefill, 2)
             last_tokens = all_prompt_tokens[-reprefill:]
 
-            caches = [PlainKVCache() for _ in cast(Model, gen.model).layers]
+            caches = make_kv_cache(model=cast(Model, gen.model))
             sampler = make_sampler(
                 temp=task_params.temperature
                 if task_params.temperature is not None
                 else 0.7,
             )
 
-            t_prefill_start = time.monotonic()
-            for _ in stream_generate(
-                model=cast(Model, gen.model),
-                tokenizer=gen.tokenizer,
-                prompt=prompt_tokens,
-                max_tokens=1,
-                sampler=sampler,
-                prompt_cache=caches,
-                prefill_step_size=4096,
-                kv_group_size=KV_GROUP_SIZE,
-                kv_bits=KV_BITS,
-            ):
-                break
-
-            t_prefill_end = time.monotonic()
-            prefill_ms = (t_prefill_end - t_prefill_start) * 1000
-
-            for c in caches:
-                c.trim(2)
-
-            num_tokens = caches[0].offset
-            prefill_tps = num_tokens / (prefill_ms / 1000) if prefill_ms > 0 else 0.0
-            logger.info(
-                f"DISAGG_TIMING tp_prefill_ms={prefill_ms:.1f} "
-                f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens}"
-            )
-
-            t_gather_start = time.monotonic()
-            gather_sharded_kv_cache(caches, gen.group)
-            t_gather_end = time.monotonic()
-            logger.info(
-                f"DISAGG_TIMING tp_kv_gather_ms={(t_gather_end - t_gather_start) * 1000:.1f}"
-            )
-
             is_kv_sender = (
                 isinstance(self.instance, TensorPrefillDisaggInstance)
                 and self.bound_instance.bound_node_id == self.instance.kv_sender_node_id
             )
-            if is_kv_sender:
-                t_send_start = time.monotonic()
-                send_precomputed_kv_cache_sync(
-                    host=decode_host,
-                    port=decode_port,
-                    cache=caches,
-                    last_tokens=last_tokens,
-                )
-                t_send_end = time.monotonic()
-                logger.info(
-                    f"DISAGG_TIMING tp_kv_send_ms={(t_send_end - t_send_start) * 1000:.1f}"
-                )
-            else:
-                # Non-sender rank: free the gathered cache immediately.
-                # After all_gather each rank holds the full KV cache
-                # but only the sender needs it for the network send.
-                # On unified-memory devices (GB10) these arrays consume
-                # GPU memory via page cache; releasing them here prevents
-                # the non-sender from holding ~2x the KV footprint until
-                # the sender finishes its network transfer.
-                for c in caches:
-                    c.state = (
-                        mx.zeros((1, 1, 1, 1)),
-                        mx.zeros((1, 1, 1, 1)),
-                    )
+            assert isinstance(self.instance, TensorPrefillDisaggInstance)
+
+            t_pipelined_start = time.monotonic()
+            prefill_tps, num_tokens = send_kv_cache_pipelined_tp_relay_sync(
+                decode_host=decode_host,
+                decode_port=decode_port,
+                relay_host=self.instance.kv_relay_host,
+                relay_port=self.instance.kv_relay_port,
+                model=cast(Model, gen.model),
+                tokenizer=gen.tokenizer,
+                prompt_tokens=all_prompt_tokens[:-1],
+                last_tokens=last_tokens,
+                cache=caches,
+                sampler=sampler,
+                is_kv_sender=is_kv_sender,
+                my_rank=gen.group.rank(),
+                world_size=gen.group.size(),
+            )
+            t_pipelined_end = time.monotonic()
+            logger.info(
+                f"DISAGG_TIMING pipelined_tp_relay_total_ms={(t_pipelined_end - t_pipelined_start) * 1000:.1f} "
+                f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens}"
+            )
 
             # Free KV cache and intermediate tensors to prevent
             # GPU memory accumulation across consecutive requests.
