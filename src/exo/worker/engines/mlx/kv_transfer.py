@@ -464,14 +464,20 @@ def gather_sharded_kv_cache(
     Uses c.state (not c.keys) to get only the valid data (trimmed to offset),
     since the raw c.keys buffer may have extra allocated space with garbage.
     """
+    # Batch all all_gather calls and evaluate once to minimize CUDA graph
+    # captures.  Per-layer mx.eval() creates ~60 separate graph entries
+    # whose shapes vary with sequence length, polluting the graph cache.
+    all_keys: list[mx.array] = []
+    all_vals: list[mx.array] = []
     for c in cache:
         # c.state returns trimmed arrays: [1, n_kv_heads_per_rank, offset, head_dim]
         state = c.state
-        full_k = mx.distributed.all_gather(state[0], group=group)  # pyright: ignore[reportArgumentType]
-        full_v = mx.distributed.all_gather(state[1], group=group)  # pyright: ignore[reportArgumentType]
-        mx.eval(full_k, full_v)
-        # all_gather concatenates along dim 0 → [world, n_kv_heads/world, seq, hd]
-        # Reshape to [1, n_kv_heads, seq, hd]
+        all_keys.append(mx.distributed.all_gather(state[0], group=group))  # pyright: ignore[reportArgumentType]
+        all_vals.append(mx.distributed.all_gather(state[1], group=group))  # pyright: ignore[reportArgumentType]
+    mx.eval(*all_keys, *all_vals)
+    # all_gather concatenates along dim 0 → [world, n_kv_heads/world, seq, hd]
+    # Reshape to [1, n_kv_heads, seq, hd]
+    for c, full_k, full_v in zip(cache, all_keys, all_vals, strict=True):
         c.state = (
             full_k.reshape(1, -1, full_k.shape[2], full_k.shape[3]),
             full_v.reshape(1, -1, full_v.shape[2], full_v.shape[3]),
@@ -955,12 +961,8 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
             assert full_keys is not None
             assert full_values is not None
             for layer_idx in range(num_layers):
-                k_chunk = chunk_layer_keys[layer_idx].reshape(
-                    n_kv_heads_wire, -1
-                )
-                v_chunk = chunk_layer_values[layer_idx].reshape(
-                    n_kv_heads_wire, -1
-                )
+                k_chunk = chunk_layer_keys[layer_idx].reshape(n_kv_heads_wire, -1)
+                v_chunk = chunk_layer_values[layer_idx].reshape(n_kv_heads_wire, -1)
                 s = start_offset * head_dim_wire
                 e = s + chunk_num_tokens * head_dim_wire
                 fk = full_keys[layer_idx].reshape(n_kv_heads_wire, -1)

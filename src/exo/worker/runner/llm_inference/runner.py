@@ -1,3 +1,4 @@
+import ctypes
 import gc
 import resource
 import time
@@ -107,7 +108,9 @@ def _align_received_caches(
     aligned: list[Any] = []
     converted_count = 0
     for expected, received_any in zip(  # pyright: ignore[reportAny]
-        expected_caches, received_caches, strict=True  # pyright: ignore[reportUnknownArgumentType]
+        expected_caches,  # pyright: ignore[reportUnknownArgumentType]
+        received_caches,
+        strict=True,
     ):
         if not isinstance(expected, RotatingKVCache):
             aligned.append(received_any)
@@ -123,9 +126,7 @@ def _align_received_caches(
 
         if seq_len <= max_size:
             # Sequence fits in the window — just wrap in RotatingKVCache.
-            rotating = RotatingKVCache(
-                max_size=max_size, keep=expected.keep
-            )
+            rotating = RotatingKVCache(max_size=max_size, keep=expected.keep)
             rotating.state = (keys, values)
             rotating.offset = received.offset
             rotating._idx = seq_len
@@ -133,9 +134,7 @@ def _align_received_caches(
             # Trim to the last max_size tokens for the sliding window.
             trimmed_keys = keys[:, :, -max_size:, :]
             trimmed_values = values[:, :, -max_size:, :]
-            rotating = RotatingKVCache(
-                max_size=max_size, keep=expected.keep
-            )
+            rotating = RotatingKVCache(max_size=max_size, keep=expected.keep)
             rotating.state = (trimmed_keys, trimmed_values)
             rotating.offset = received.offset
             # Buffer is full — next write wraps to keep position.
@@ -183,6 +182,7 @@ class Runner:
         self.device_rank = self.shard_metadata.device_rank
 
         logger.info("hello from the runner")
+        self._configure_cuda_memory_pool()
         if getattr(self.shard_metadata, "immediate_exception", False):
             raise Exception("Fake exception - runner failed to spin up.")
         if timeout := getattr(self.shard_metadata, "should_timeout", 0):
@@ -203,6 +203,86 @@ class Runner:
 
         logger.info("runner created")
         self.update_status(RunnerIdle())
+
+    def _configure_cuda_memory_pool(self) -> None:
+        """Cache a handle to the default CUDA memory pool for later trimming."""
+        if mx.default_device() != mx.Device(mx.gpu):
+            self._cuda_pool = None
+            return
+        try:
+            self._libcudart = ctypes.CDLL("libcudart.so")
+            pool = ctypes.c_void_p()
+            get_pool = self._libcudart.cudaDeviceGetDefaultMemPool
+            get_pool.restype = ctypes.c_int
+            if get_pool(ctypes.byref(pool), 0) != 0:
+                logger.debug("cudaDeviceGetDefaultMemPool failed")
+                self._cuda_pool = None
+                return
+            self._cuda_pool = pool
+            logger.info("CUDA memory pool handle acquired for post-prefill trimming")
+        except Exception as exc:
+            logger.debug(f"Could not get CUDA memory pool: {exc}")
+            self._cuda_pool = None
+
+    def _log_cuda_mem(self, label: str) -> None:
+        """Log CUDA free/total memory via cudaMemGetInfo."""
+        if self._cuda_pool is None:
+            return
+        try:
+            free = ctypes.c_size_t()
+            total = ctypes.c_size_t()
+            rc = cast(
+                int,
+                self._libcudart.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total)),
+            )
+            if rc == 0:
+                f_gb = free.value / (1024**3)
+                t_gb = total.value / (1024**3)
+                u_gb = t_gb - f_gb
+                logger.info(
+                    f"[CUDA MEM {label}] used={u_gb:.2f} GB  free={f_gb:.2f} GB  total={t_gb:.2f} GB"
+                )
+        except Exception:
+            pass
+
+    def _reclaim_gpu_memory(self) -> None:
+        """Reclaim GPU memory after prefill by flushing all caches.
+
+        The correct order is critical:
+        1. synchronize — flush GPU completion handlers that hold shared_ptr
+           temporaries to buffers.  Until these run, buffers are "active"
+           and invisible to clear_cache.
+        2. clear_cache — move freed buffers from MLX's buffer cache to the
+           CUDA allocator (cudaFree / cudaFreeAsync).
+        3. clear_graph_caches — destroy cached CUDA graph executables whose
+           workspace memory is pinned by the CUDA runtime.  This also calls
+           cudaMemPoolTrimTo internally.
+        """
+        # Step 1: ensure all GPU work is done and completion handlers have
+        # released their temporary references to arrays.
+        mx.synchronize()
+
+        # Step 2: free MLX's buffer cache (now populated with released buffers).
+        cache_before = mx.get_cache_memory()
+        active_before = mx.get_active_memory()
+        mx.clear_cache()
+        cache_after = mx.get_cache_memory()
+        active_after = mx.get_active_memory()
+        logger.info(
+            f"[MLX MEM] active: {active_before / (1024**3):.2f} -> {active_after / (1024**3):.2f} GB, "
+            f"cache: {cache_before / (1024**3):.2f} -> {cache_after / (1024**3):.2f} GB"
+        )
+
+        # Step 3: destroy cached CUDA graph execs to free workspace memory.
+        # mx.cuda.clear_graph_caches() also trims memory pools internally.
+        try:
+            mx.cuda.clear_graph_caches()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
+            logger.info("CUDA graph caches cleared")
+        except Exception as e:
+            # Binding not available in this MLX build — fall back to pool trim.
+            logger.warning(f"clear_graph_caches unavailable: {e}")
+            if self._cuda_pool is not None:
+                self._libcudart.cudaMemPoolTrimTo(self._cuda_pool, ctypes.c_size_t(0))
 
     def update_status(self, status: RunnerStatus):
         self.current_status = status
@@ -593,9 +673,11 @@ class Runner:
 
             # Free KV cache and intermediate tensors to prevent
             # GPU memory accumulation across consecutive requests.
+            self._log_cuda_mem("before-cleanup")
             del caches
             gc.collect()
-            mx.clear_cache()
+            self._reclaim_gpu_memory()
+            self._log_cuda_mem("after-cleanup")
 
         except Exception as e:
             logger.opt(exception=e).error("DisaggPrefill failed, recovering runner")
@@ -618,9 +700,7 @@ class Runner:
                     )
                 )
             gc.collect()
-            mx.clear_cache()
-            mx.synchronize()
-
+            self._reclaim_gpu_memory()
         self.send_task_status(task.task_id, TaskStatus.Complete)
         self.update_status(RunnerReady())
         logger.info("runner ready")
@@ -692,6 +772,7 @@ class Runner:
                 max_tokens=1,
                 sampler=sampler,
                 prompt_cache=caches,
+                prefill_step_size=4096,
                 kv_group_size=KV_GROUP_SIZE,
                 kv_bits=KV_BITS,
             ):
@@ -749,9 +830,11 @@ class Runner:
 
             # Free KV cache and intermediate tensors to prevent
             # GPU memory accumulation across consecutive requests.
+            self._log_cuda_mem("before-cleanup")
             del caches
             gc.collect()
-            mx.clear_cache()
+            self._reclaim_gpu_memory()
+            self._log_cuda_mem("after-cleanup")
 
         except Exception as e:
             logger.opt(exception=e).error(
@@ -776,9 +859,7 @@ class Runner:
                     )
                 )
             gc.collect()
-            mx.clear_cache()
-            mx.synchronize()
-
+            self._reclaim_gpu_memory()
         self.send_task_status(task.task_id, TaskStatus.Complete)
         self.update_status(RunnerReady())
         logger.info("runner ready")
@@ -840,9 +921,7 @@ class Runner:
             # KVCache, which makes sliding-attention layers attend to the
             # entire sequence instead of just max_size tokens — causing
             # Metal to hang on long contexts.
-            received_caches = _align_received_caches(
-                gen.model, received_caches
-            )
+            received_caches = _align_received_caches(gen.model, received_caches)
 
             sampler = make_sampler(
                 temp=task_params.temperature
