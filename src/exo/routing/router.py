@@ -107,7 +107,10 @@ class Router:
             try:
                 return cls(handle=NetworkingHandle(identity, listen_port=listen_port))
             except TypeError:
-                pass
+                logger.warning(
+                    f"--listen-port {listen_port} requested but exo_pyo3_bindings does not support it "
+                    f"(rebuild rust/exo_pyo3_bindings). Falling back to OS-assigned random port."
+                )
         return cls(handle=NetworkingHandle(identity))
 
     def __init__(self, handle: NetworkingHandle):
