@@ -652,7 +652,7 @@ def send_kv_cache_pipelined_sync(
     # After stream_generate + trim(2), cache has T-2 entries.  Cap extraction
     # to kv_send_cap so the decode side receives exactly T - len(last_tokens)
     # entries, and stream_generate(prompt=last_tokens) recomputes the rest.
-    kv_send_cap = num_tokens + 1 - len(last_tokens)
+    kv_send_cap = max(1, num_tokens + 1 - len(last_tokens))
 
     # Connect to decode node (start connecting while we prefill)
     sock = _connect_with_retries(host, port)
@@ -839,7 +839,7 @@ def send_kv_cache_pipelined_tp_sync(
 
     num_layers = len(cache)
     num_tokens = len(prompt_tokens)
-    kv_send_cap = num_tokens + 1 - len(last_tokens)
+    kv_send_cap = max(1, num_tokens + 1 - len(last_tokens))
 
     # Only the sender rank connects to the decode node.
     sock: socket.socket | None = None
@@ -1230,7 +1230,10 @@ def send_kv_cache_pipelined_tp_relay_sync(
 
     num_layers = len(cache)
     num_tokens = len(prompt_tokens)
-    kv_send_cap = num_tokens + 1 - len(last_tokens)
+    # Ensure at least 1 token is sent so the receiver always gets a chunk
+    # frame — without this, short prompts (< DISAGG_REPREFILL_TOKENS) produce
+    # kv_send_cap=0 and the receiver raises "No chunk frames received".
+    kv_send_cap = max(1, num_tokens + 1 - len(last_tokens))
 
     # --- Relay connection setup ---
     relay_conn: socket.socket | None = None
@@ -1461,31 +1464,66 @@ def send_kv_cache_pipelined_tp_relay_sync(
         last_tokens_np: np.ndarray[Any, Any] = np.array(last_tokens, copy=False).astype(
             np.int32
         )
-        decode_queue.put((len(last_tokens_np), last_tokens_np))
 
-        # Send end sentinel and wait for sender thread
-        try:
-            decode_queue.put(None, timeout=10.0)
-        except queue.Full:
-            logger.warning(
-                "Pipelined TP relay send_queue full — sender thread likely stuck"
-            )
-            error_event.set()
+        if header_sent:
+            # Normal path: sender thread is running, enqueue last_tokens + end sentinel
+            decode_queue.put((len(last_tokens_np), last_tokens_np))
 
-        decode_sender.join(timeout=60.0)
-        if decode_sender.is_alive():
-            logger.warning(
-                "Pipelined TP relay sender thread did not exit, closing socket"
-            )
-            decode_sock.close()
-            decode_sender.join(timeout=5.0)
+            # Send end sentinel and wait for sender thread
+            try:
+                decode_queue.put(None, timeout=10.0)
+            except queue.Full:
+                logger.warning(
+                    "Pipelined TP relay send_queue full — sender thread likely stuck"
+                )
+                error_event.set()
+
+            decode_sender.join(timeout=60.0)
+            if decode_sender.is_alive():
+                logger.warning(
+                    "Pipelined TP relay sender thread did not exit, closing socket"
+                )
+                decode_sock.close()
+                decode_sender.join(timeout=5.0)
+            else:
+                decode_sock.close()
+
+            if error_event.is_set():
+                raise ConnectionError(
+                    "Pipelined TP relay sender thread encountered a socket error"
+                )
         else:
-            decode_sock.close()
-
-        if error_event.is_set():
-            raise ConnectionError(
-                "Pipelined TP relay sender thread encountered a socket error"
+            # Short-prompt path: callback never fired, thread never started.
+            # Send header + last_tokens + end directly on the socket.
+            logger.info(
+                "TP relay short-prompt path: sending header + data directly (no sender thread)"
             )
+            uses_bfloat16 = cache[0].keys.dtype == mx.bfloat16
+            dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
+            cache_n_kv_heads = cache[0].keys.shape[1] * world_size
+            cache_head_dim = cache[0].keys.shape[3]
+            header = struct.pack(
+                "!4sBIBIII",
+                _MAGIC,
+                _VERSION,
+                num_layers,
+                dtype_flag,
+                kv_send_cap,
+                cache_n_kv_heads,
+                cache_head_dim,
+            )
+            _sendall(decode_sock, header)
+
+            # Send last_tokens frame directly (matches _sender_thread_fn wire format)
+            tok_bytes = last_tokens_np.astype(np.int32).tobytes()
+            _sendall(
+                decode_sock,
+                struct.pack("!BI", _FRAME_LAST_TOKENS, len(last_tokens_np)) + tok_bytes,
+            )
+
+            # Send end sentinel
+            _sendall(decode_sock, struct.pack("!B", _FRAME_END))
+            decode_sock.close()
     else:
         # Non-sender: send end sentinel
         assert relay_conn is not None
