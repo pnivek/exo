@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import mlx.core as mx
 import numpy as np
@@ -39,6 +39,7 @@ _MAGIC = b"KVPS"
 _VERSION = 0x02
 _FRAME_CHUNK = 0x01
 _FRAME_LAST_TOKENS = 0x02
+_FRAME_LAYER = 0x03
 _FRAME_ERROR = 0xFE
 _FRAME_END = 0xFF
 
@@ -450,6 +451,290 @@ def extract_kv_delta(
         layer_keys=layer_keys,
         layer_values=layer_values,
     )
+
+
+def extract_single_layer_kv(
+    c: "KVCache | Any",
+    num_tokens: int,
+) -> tuple["np.ndarray[Any, Any]", "np.ndarray[Any, Any]"]:
+    """Extract KV for one cache layer, all tokens up to num_tokens.
+
+    The cache state must already be materialized (mx.eval'd).
+    Returns (keys_np, values_np) as numpy copies ready for network transfer.
+    """
+    from mlx_lm.models.cache import RotatingKVCache
+
+    if isinstance(c, RotatingKVCache) and c._idx >= 0:
+        buf_end: int = min(c._idx, num_tokens)
+        k: mx.array = c.keys[:, :, :buf_end, :]
+        v: mx.array = c.values[:, :, :buf_end, :]
+    else:
+        k = c.keys[:, :, :num_tokens, :]
+        v = c.values[:, :, :num_tokens, :]
+    return _mlx_to_numpy(k).copy(), _mlx_to_numpy(v).copy()
+
+
+def _serialize_layer_frame(
+    layer_idx: int,
+    num_tokens: int,
+    k_np: "np.ndarray[Any, Any]",
+    v_np: "np.ndarray[Any, Any]",
+) -> bytes:
+    """Serialize a single layer's KV into a _FRAME_LAYER frame.
+
+    Frame layout: [0x03][4B layer_idx][4B num_tokens][K data][V data]
+    """
+    k_bytes = k_np.tobytes()
+    v_bytes = v_np.tobytes()
+    header = struct.pack("!BII", _FRAME_LAYER, layer_idx, num_tokens)
+    return header + k_bytes + v_bytes
+
+
+_LayerQueueItem = (
+    tuple[int, int, "np.ndarray[Any, Any]", "np.ndarray[Any, Any]"]
+    | tuple[int, "np.ndarray[Any, Any]"]
+    | None
+)
+
+
+def _layer_sender_thread_fn(
+    sock: socket.socket,
+    send_queue: "queue.Queue[_LayerQueueItem]",
+    error_event: threading.Event,
+) -> None:
+    """Background thread that drains per-layer KV frames from the queue and writes to socket."""
+    try:
+        while True:
+            item: _LayerQueueItem = send_queue.get()
+            if item is None:
+                # End sentinel — send END frame and exit
+                _sendall(sock, struct.pack("!B", _FRAME_END))
+                return
+            if len(item) == 2:
+                # LastTokensMessage: (n_tokens, int32 ndarray)
+                n_tokens = int(item[0])
+                tokens_np: np.ndarray[Any, Any] = item[1]
+                tok_bytes: bytes = tokens_np.astype(np.int32).tobytes()
+                _sendall(
+                    sock,
+                    struct.pack("!BI", _FRAME_LAST_TOKENS, n_tokens) + tok_bytes,
+                )
+                continue
+            # Per-layer KV: (layer_idx, num_tokens, k_np, v_np)
+            layer_idx = int(item[0])
+            num_tokens_val = int(item[1])
+            k_np: np.ndarray[Any, Any] = item[2]
+            v_np: np.ndarray[Any, Any] = item[3]
+            frame_data = _serialize_layer_frame(layer_idx, num_tokens_val, k_np, v_np)
+            del k_np, v_np
+            t_send_start = time.monotonic()
+            _sendall(sock, frame_data)
+            t_send_end = time.monotonic()
+            frame_mb = len(frame_data) / 1024 / 1024
+            del frame_data
+            logger.info(
+                f"DISAGG_TIMING per_layer_send_ms={(t_send_end - t_send_start) * 1000:.1f} "
+                f"layer_idx={layer_idx} frame_mb={frame_mb:.2f}"
+            )
+    except Exception as exc:
+        logger.error(f"Per-layer sender thread error: {exc}")
+        error_event.set()
+
+
+_PER_LAYER_PREFILL_STEP_SIZE: int = 8192
+
+
+def send_kv_cache_per_layer_sync(
+    host: str,
+    port: int,
+    model: Model,
+    tokenizer: TokenizerWrapper,
+    prompt_tokens: mx.array,
+    last_tokens: mx.array,
+    cache: KVCacheType,
+    sampler: Callable[[mx.array], mx.array],
+) -> tuple[float, int]:
+    """Run per-layer prefill, streaming each layer's KV as soon as it completes.
+
+    Decomposes the forward pass layer-by-layer: process prompt tokens through
+    layer 0, immediately start sending layer 0's KV while layer 1 computes.
+
+    Within each layer, tokens are processed in chunks of _PER_LAYER_PREFILL_STEP_SIZE
+    to bound attention memory (matching mlx_lm's prefill chunking) and keep CUDA
+    graph cache entries bounded (shapes repeat across layers for same chunk sizes).
+
+    Returns (prefill_tps, num_tokens).
+    """
+    from mlx_lm.models.base import (
+        create_attention_mask,  # pyright: ignore[reportUnknownVariableType]
+    )
+    from mlx_lm.models.gpt_oss import GptOssMoeModel
+
+    from exo.worker.engines.mlx.auto_parallel import set_pipeline_prefill
+
+    num_layers = len(cache)
+    num_tokens = len(prompt_tokens)
+    kv_send_cap = max(1, num_tokens + 1 - len(last_tokens))
+    step = _PER_LAYER_PREFILL_STEP_SIZE
+
+    # Connect to decode node
+    sock = _connect_with_retries(host, port)
+
+    # Set up sender thread
+    send_queue: queue.Queue[_LayerQueueItem] = queue.Queue(maxsize=4)
+    error_event = threading.Event()
+    sender = threading.Thread(
+        target=_layer_sender_thread_fn,
+        args=(sock, send_queue, error_event),
+        daemon=True,
+    )
+
+    set_pipeline_prefill(model, is_prefill=True)
+
+    t_prefill_start = time.monotonic()
+
+    # --- Per-layer prefill with chunking ---
+    # Access model internals to iterate layer-by-layer.
+    inner_model = cast(GptOssMoeModel, model.model)
+
+    # Embed tokens and materialize (needed before slicing into chunks)
+    x = inner_model.embed_tokens(prompt_tokens[None])
+    mx.eval(x)
+
+    # Determine dtype and send KVPS header after first layer populates cache
+    header_sent = False
+
+    layer_types: list[str] = cast(list[str], inner_model.layer_types)
+    for layer_idx, (layer, c, layer_type) in enumerate(
+        zip(inner_model.layers, cache, layer_types, strict=True)
+    ):
+        # Process tokens in chunks through this single layer, mirroring
+        # mlx_lm's _prefill pattern but one layer at a time.
+        chunk_outputs: list[mx.array] = []
+        remaining = x
+
+        while remaining.shape[1] > 0:
+            n = min(step, remaining.shape[1])
+            x_chunk: mx.array = remaining[:, :n, :]
+            remaining = remaining[:, n:, :]
+
+            # Create mask for this chunk using current cache state —
+            # cache.offset grows as each chunk is appended, so the mask
+            # correctly allows attending to previously-processed chunks.
+            if layer_type == "full_attention":
+                mask = create_attention_mask(x_chunk, c)
+            else:
+                mask = create_attention_mask(
+                    x_chunk,
+                    c,
+                    window_size=inner_model.window_size,
+                )
+
+            x_chunk = layer(x_chunk, mask, c)
+            # Materialize both the layer output and KV cache for this chunk
+            mx.eval(x_chunk, c.state)  # pyright: ignore[reportArgumentType]
+            chunk_outputs.append(x_chunk)
+
+        # Reassemble full sequence for next layer
+        if len(chunk_outputs) == 1:
+            x = chunk_outputs[0]
+        else:
+            x = mx.concatenate(chunk_outputs, axis=1)
+            mx.eval(x)
+        del chunk_outputs
+        mx.clear_cache()
+
+        if error_event.is_set():
+            break
+
+        # Send KVPS header on first layer (now cache keys are populated)
+        if not header_sent:
+            uses_bfloat16 = c.keys is not None and c.keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
+            dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
+            cache_n_kv_heads = c.keys.shape[1]
+            cache_head_dim = c.keys.shape[3]
+            header = struct.pack(
+                "!4sBIBIII",
+                _MAGIC,
+                _VERSION,
+                num_layers,
+                dtype_flag,
+                kv_send_cap,
+                cache_n_kv_heads,
+                cache_head_dim,
+            )
+            _sendall(sock, header)
+            sender.start()
+            header_sent = True
+
+        # Extract this layer's KV and queue for sending.
+        # For RotatingKVCache (sliding_attention), only max_size entries
+        # exist in the buffer — use the actual extracted shape, not c.offset.
+        tokens_to_extract = min(c.offset, kv_send_cap)
+        t_extract_start = time.monotonic()
+        k_np, v_np = extract_single_layer_kv(c, tokens_to_extract)
+        t_extract_end = time.monotonic()
+        actual_tokens: int = int(k_np.shape[2])  # pyright: ignore[reportAny]  # (1, n_kv_heads, tokens, head_dim)
+        logger.info(
+            f"DISAGG_TIMING per_layer_extract_ms={(t_extract_end - t_extract_start) * 1000:.1f} "
+            f"layer_idx={layer_idx} tokens={actual_tokens}"
+        )
+
+        try:
+            send_queue.put((layer_idx, actual_tokens, k_np, v_np), timeout=120.0)
+        except queue.Full:
+            logger.warning(f"Per-layer KV enqueue timed out for layer {layer_idx}")
+            error_event.set()
+            break
+
+    # Apply norm and compute logits (needed for consistency but we discard the result)
+    if not error_event.is_set():
+        x = inner_model.norm(x)
+        _logits: mx.array = model.lm_head(x)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        mx.eval(_logits)  # pyright: ignore[reportUnknownArgumentType]
+        del _logits
+
+    set_pipeline_prefill(model, is_prefill=False)
+
+    t_prefill_end = time.monotonic()
+    prefill_ms = (t_prefill_end - t_prefill_start) * 1000
+
+    # Send last_tokens frame
+    if not error_event.is_set():
+        last_tokens_np: np.ndarray[Any, Any] = np.array(last_tokens, copy=False).astype(
+            np.int32
+        )
+        try:
+            send_queue.put((len(last_tokens_np), last_tokens_np), timeout=10.0)
+        except queue.Full:
+            logger.warning("Per-layer KV last_tokens enqueue timed out")
+            error_event.set()
+
+    # Send end sentinel and wait for sender thread
+    try:
+        send_queue.put(None, timeout=10.0)
+    except queue.Full:
+        logger.warning("Per-layer KV send_queue full — sender thread likely stuck")
+        error_event.set()
+
+    sender.join(timeout=60.0)
+    if sender.is_alive():
+        logger.warning("Per-layer KV sender thread did not exit, closing socket")
+        sock.close()
+        sender.join(timeout=5.0)
+    else:
+        sock.close()
+
+    if error_event.is_set():
+        raise ConnectionError("Per-layer KV sender thread encountered a socket error")
+
+    prefill_tps = num_tokens / (prefill_ms / 1000) if prefill_ms > 0 else 0.0
+    logger.info(
+        f"DISAGG_TIMING per_layer_prefill_ms={prefill_ms:.1f} "
+        f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens} "
+        f"layers_sent={num_layers} step_size={step}"
+    )
+    return prefill_tps, num_tokens
 
 
 def gather_sharded_kv_cache(
@@ -1596,7 +1881,7 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
         )
     )
 
-    # Pre-allocated buffers (lazily initialized on first chunk)
+    # Pre-allocated buffers (lazily initialized on first chunk/layer frame)
     full_keys: list["np.ndarray[Any, Any]"] | None = None
     full_values: list["np.ndarray[Any, Any]"] | None = None
     head_dim_x_heads: int = 0
@@ -1622,6 +1907,70 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
             n_tokens: int = struct.unpack("!I", n_tokens_data)[0]  # pyright: ignore[reportAny]
             tok_data = _recvall(conn, n_tokens * 4)
             last_tokens = mx.array(np.frombuffer(tok_data, dtype=np.int32).copy())
+            continue
+
+        if frame_type == _FRAME_LAYER:
+            # Per-layer frame: [4B layer_idx][4B num_tokens][K data][V data]
+            layer_hdr = _recvall(conn, 8)
+            layer_frame_idx: int
+            layer_num_tokens: int
+            layer_frame_idx, layer_num_tokens = struct.unpack("!II", layer_hdr)  # pyright: ignore[reportAny]
+
+            t_layer_start = time.monotonic()
+
+            # Compute expected data size from header dimensions
+            assert header_n_kv_heads is not None and header_head_dim is not None, (
+                "Per-layer frames require v2 header with n_kv_heads and head_dim"
+            )
+            elem_size = 2  # uint16 or float16
+            kv_data_size = (
+                header_n_kv_heads * layer_num_tokens * header_head_dim * elem_size
+            )
+
+            k_data = _recvall(conn, kv_data_size)
+            v_data = _recvall(conn, kv_data_size)
+
+            layer_k_np: np.ndarray[Any, Any] = np.frombuffer(
+                k_data, dtype=wire_np_dtype
+            ).copy()
+            layer_v_np: np.ndarray[Any, Any] = np.frombuffer(
+                v_data, dtype=wire_np_dtype
+            ).copy()
+
+            # Initialize per-layer buffers on first frame
+            if full_keys is None:
+                head_dim_x_heads = header_n_kv_heads * header_head_dim
+                n_kv_heads_wire = header_n_kv_heads
+                head_dim_wire = header_head_dim
+                # Allocate empty lists — each layer may have a different
+                # token count (full_attention = all tokens, sliding_attention
+                # = max_size from RotatingKVCache).
+                full_keys = [
+                    np.zeros(0, dtype=wire_np_dtype)
+                    for _ in range(num_layers)
+                ]
+                full_values = [
+                    np.zeros(0, dtype=wire_np_dtype)
+                    for _ in range(num_layers)
+                ]
+
+            assert full_keys is not None and full_values is not None
+            # Each layer frame carries that layer's tokens — store directly.
+            # Token count varies per layer (RotatingKVCache stores fewer).
+            full_keys[layer_frame_idx] = layer_k_np
+            full_values[layer_frame_idx] = layer_v_np
+
+            # Track max tokens across layers for total_received_tokens
+            if layer_num_tokens > total_received_tokens:
+                total_received_tokens = layer_num_tokens
+
+            t_layer_end = time.monotonic()
+            layer_size_mb = (len(k_data) + len(v_data)) / 1024 / 1024
+            logger.info(
+                f"DISAGG_TIMING per_layer_recv_ms={(t_layer_end - t_layer_start) * 1000:.1f} "
+                f"layer_idx={layer_frame_idx} tokens={layer_num_tokens} "
+                f"layer_mb={layer_size_mb:.2f}"
+            )
             continue
 
         if frame_type == _FRAME_CHUNK:
@@ -1722,7 +2071,7 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
     if last_tokens is None:
         raise ValueError("No last_tokens frame received in pipelined stream")
     if full_keys is None or full_values is None:
-        raise ValueError("No chunk frames received in pipelined stream")
+        raise ValueError("No chunk or layer frames received in pipelined stream")
 
     # Determine n_kv_heads and head_dim
     if header_n_kv_heads is not None and header_head_dim is not None:
@@ -1739,10 +2088,38 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
                 break
 
     caches: list[KVCache] = []
+    elements_per_token = n_kv_heads * head_dim
     for layer_idx in range(num_layers):
         cache_entry = KVCache()
-        k_full = full_keys[layer_idx][: total_received_tokens * head_dim_x_heads]
-        v_full = full_values[layer_idx][: total_received_tokens * head_dim_x_heads]
+        layer_k = full_keys[layer_idx]
+        layer_v = full_values[layer_idx]
+        layer_n_tokens = len(layer_k) // elements_per_token if elements_per_token > 0 else 0
+
+        # Sliding-attention layers (RotatingKVCache) only have max_size entries
+        # (e.g. 128) instead of total_received_tokens.  Zero-pad them to the
+        # full length, placing the real data at the END (it represents the most
+        # recent tokens).  The sliding-window attention mask ensures the model
+        # only attends to these real positions.
+        if layer_n_tokens < total_received_tokens:
+            pad_count = total_received_tokens - layer_n_tokens
+            k_padded: np.ndarray[Any, Any] = np.zeros(
+                total_received_tokens * elements_per_token, dtype=wire_np_dtype
+            )
+            v_padded: np.ndarray[Any, Any] = np.zeros(
+                total_received_tokens * elements_per_token, dtype=wire_np_dtype
+            )
+            # Place real KV data at the tail (head-major: repeat per head)
+            k_reshaped = layer_k.reshape(n_kv_heads, -1)
+            v_reshaped = layer_v.reshape(n_kv_heads, -1)
+            k_pad_reshaped = k_padded.reshape(n_kv_heads, -1)
+            v_pad_reshaped = v_padded.reshape(n_kv_heads, -1)
+            k_pad_reshaped[:, pad_count * head_dim :] = k_reshaped
+            v_pad_reshaped[:, pad_count * head_dim :] = v_reshaped
+            k_full = k_padded
+            v_full = v_padded
+        else:
+            k_full = layer_k[: total_received_tokens * elements_per_token]
+            v_full = layer_v[: total_received_tokens * elements_per_token]
 
         k_shaped: np.ndarray[Any, Any] = k_full.reshape(
             1, n_kv_heads, total_received_tokens, head_dim
