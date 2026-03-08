@@ -48,6 +48,46 @@ def nodes_share_subnet(
     return False
 
 
+def _best_shared_link_score(
+    node_a: NodeId,
+    node_b: NodeId,
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> int:
+    """Score the best shared link between two nodes.
+
+    Returns:
+      3 = ethernet↔ethernet or thunderbolt (both wired)
+      2 = one side wired, neither WiFi
+      1 = any subnet match (wifi, unknown, etc.)
+      0 = no shared subnet
+    """
+    net_a = node_network.get(node_a, NodeNetworkInfo())
+    net_b = node_network.get(node_b, NodeNetworkInfo())
+    best = 0
+
+    for iface_a in net_a.interfaces:
+        network_a = _interface_network(iface_a)
+        if network_a is None:
+            continue
+        for iface_b in net_b.interfaces:
+            network_b = _interface_network(iface_b)
+            if network_b is None:
+                continue
+            if not network_a.overlaps(network_b):
+                continue
+
+            types = {iface_a.interface_type, iface_b.interface_type}
+            if types <= {"ethernet", "thunderbolt", "maybe_ethernet"}:
+                score = 3
+            elif "wifi" not in types and ("ethernet" in types or "thunderbolt" in types):
+                score = 2
+            else:
+                score = 1
+            best = max(best, score)
+
+    return best
+
+
 def pick_best_connected_node(
     candidates: Sequence[NodeId],
     target_node: NodeId,
@@ -56,13 +96,20 @@ def pick_best_connected_node(
     """From candidates, pick the one with best network path to target_node.
 
     Priority:
-    1. Shares a subnet with target_node (direct IP connectivity)
-    2. Falls back to first candidate (preserves current behavior)
+    1. Wired (ethernet/thunderbolt) shared subnet with target (10GbE, direct cable)
+    2. Any shared subnet with target (WiFi, etc.)
+    3. Falls back to first candidate
     """
+    best_candidate = candidates[0]
+    best_score = 0
+
     for candidate in candidates:
-        if nodes_share_subnet(candidate, target_node, node_network):
-            return candidate
-    return candidates[0]
+        score = _best_shared_link_score(candidate, target_node, node_network)
+        if score > best_score:
+            best_score = score
+            best_candidate = candidate
+
+    return best_candidate
 
 
 def find_nccl_coordinator_ip(

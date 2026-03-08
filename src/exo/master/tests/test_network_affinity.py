@@ -4,7 +4,7 @@ from exo.master.network_affinity import (
     pick_best_connected_node,
 )
 from exo.shared.types.common import NodeId
-from exo.shared.types.profiling import NetworkInterfaceInfo, NodeNetworkInfo
+from exo.shared.types.profiling import InterfaceType, NetworkInterfaceInfo, NodeNetworkInfo
 
 
 def _iface(
@@ -12,11 +12,12 @@ def _iface(
     ip: str,
     netmask: str | None = None,
     rdma: str | None = None,
+    iface_type: InterfaceType = "ethernet",
 ) -> NetworkInterfaceInfo:
     return NetworkInterfaceInfo(
         name=name,
         ip_address=ip,
-        interface_type="ethernet",
+        interface_type=iface_type,
         netmask=netmask,
         rdma_device_name=rdma,
     )
@@ -158,6 +159,40 @@ def test_find_nccl_coordinator_ip_generic_fallback() -> None:
     }
     result = find_nccl_coordinator_ip(coord, [coord], network)
     assert result == "192.168.0.101"
+
+
+def test_pick_best_connected_node_prefers_ethernet_over_wifi() -> None:
+    """Ethernet↔ethernet should beat wifi↔wifi when both share a subnet with target."""
+    sparkly = NodeId("sparkly")
+    sparky = NodeId("sparky")
+    mac = NodeId("mac")
+    network = {
+        sparkly: NodeNetworkInfo(
+            interfaces=[
+                _iface("enP7s7", "192.168.0.101", "255.255.255.0", iface_type="ethernet"),
+                _iface("enp1s0f0np0", "169.254.144.33", "255.255.0.0", iface_type="ethernet"),
+                _iface("wlP9s9", "192.168.0.172", "255.255.255.0", iface_type="wifi"),
+            ]
+        ),
+        sparky: NodeNetworkInfo(
+            interfaces=[
+                _iface("wlP9s9", "192.168.0.112", "255.255.255.0", iface_type="wifi"),
+                _iface("enp1s0f1np1", "169.254.249.25", "255.255.0.0", iface_type="ethernet"),
+            ]
+        ),
+        mac: NodeNetworkInfo(
+            interfaces=[
+                _iface("en0", "192.168.0.156", "255.255.255.0", iface_type="ethernet"),
+                _iface("en1", "192.168.0.100", "255.255.255.0", iface_type="wifi"),
+            ]
+        ),
+    }
+    # Sparkly has ethernet↔ethernet with Mac (score 3), sparky only has wifi↔wifi (score 1)
+    result = pick_best_connected_node([sparky, sparkly], mac, network)
+    assert result == sparkly
+    # Order shouldn't matter
+    result2 = pick_best_connected_node([sparkly, sparky], mac, network)
+    assert result2 == sparkly
 
 
 def test_find_nccl_coordinator_ip_skips_loopback() -> None:
