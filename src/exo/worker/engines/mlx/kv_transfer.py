@@ -605,6 +605,38 @@ def send_kv_cache_per_layer_sync(
     header_sent = False
 
     layer_types: list[str] = cast(list[str], inner_model.layer_types)
+
+    # Deferred extraction state: after computing layer N, we defer its KV
+    # extraction until layer N+1's first chunk is submitted to the GPU.
+    # This overlaps CPU extraction work with GPU compute.
+    # (layer_idx, cache_entry, tokens_to_extract)
+    pending_extract: tuple[int, Any, int] | None = None
+
+    def _flush_pending_extract() -> None:
+        """Extract and enqueue KV for the previously-computed layer."""
+        nonlocal pending_extract
+        if pending_extract is None:
+            return
+        p_layer_idx: int
+        p_cache: Any
+        p_tokens: int
+        p_layer_idx, p_cache, p_tokens = pending_extract  # pyright: ignore[reportAny]
+        pending_extract = None
+
+        t_extract_start = time.monotonic()
+        k_np, v_np = extract_single_layer_kv(p_cache, p_tokens)  # pyright: ignore[reportAny]
+        t_extract_end = time.monotonic()
+        actual_tokens: int = int(k_np.shape[2])  # pyright: ignore[reportAny]  # (1, n_kv_heads, tokens, head_dim)
+        logger.info(
+            f"DISAGG_TIMING per_layer_extract_ms={(t_extract_end - t_extract_start) * 1000:.1f} "
+            f"layer_idx={p_layer_idx} tokens={actual_tokens}"
+        )
+        try:
+            send_queue.put((p_layer_idx, actual_tokens, k_np, v_np), timeout=120.0)
+        except queue.Full:
+            logger.warning(f"Per-layer KV enqueue timed out for layer {p_layer_idx}")
+            error_event.set()
+
     for layer_idx, (layer, c, layer_type) in enumerate(
         zip(inner_model.layers, cache, layer_types, strict=True)
     ):
@@ -613,6 +645,7 @@ def send_kv_cache_per_layer_sync(
         chunk_outputs: list[mx.array] = []
         remaining = x
 
+        first_chunk_of_layer = True
         while remaining.shape[1] > 0:
             n = min(step, remaining.shape[1])
             x_chunk: mx.array = remaining[:, :n, :]
@@ -634,6 +667,13 @@ def send_kv_cache_per_layer_sync(
             # Materialize both the layer output and KV cache for this chunk
             mx.eval(x_chunk, c.state)  # pyright: ignore[reportArgumentType]
             chunk_outputs.append(x_chunk)
+
+            # After the first chunk of this layer is evaluated, the GPU is
+            # idle momentarily — overlap by extracting the previous layer's
+            # KV (pure CPU work) before the next mx.eval.
+            if first_chunk_of_layer and pending_extract is not None:
+                _flush_pending_extract()
+                first_chunk_of_layer = False
 
         # Reassemble full sequence for next layer
         if len(chunk_outputs) == 1:
@@ -667,25 +707,14 @@ def send_kv_cache_per_layer_sync(
             sender.start()
             header_sent = True
 
-        # Extract this layer's KV and queue for sending.
-        # For RotatingKVCache (sliding_attention), only max_size entries
-        # exist in the buffer — use the actual extracted shape, not c.offset.
+        # Defer KV extraction — it will be flushed while the next layer's
+        # first chunk is computing on the GPU, overlapping CPU↔GPU work.
         tokens_to_extract = min(c.offset, kv_send_cap)
-        t_extract_start = time.monotonic()
-        k_np, v_np = extract_single_layer_kv(c, tokens_to_extract)
-        t_extract_end = time.monotonic()
-        actual_tokens: int = int(k_np.shape[2])  # pyright: ignore[reportAny]  # (1, n_kv_heads, tokens, head_dim)
-        logger.info(
-            f"DISAGG_TIMING per_layer_extract_ms={(t_extract_end - t_extract_start) * 1000:.1f} "
-            f"layer_idx={layer_idx} tokens={actual_tokens}"
-        )
+        pending_extract = (layer_idx, c, tokens_to_extract)
 
-        try:
-            send_queue.put((layer_idx, actual_tokens, k_np, v_np), timeout=120.0)
-        except queue.Full:
-            logger.warning(f"Per-layer KV enqueue timed out for layer {layer_idx}")
-            error_event.set()
-            break
+    # Flush the last layer's deferred extraction (no next layer to overlap with)
+    if not error_event.is_set():
+        _flush_pending_extract()
 
     # Apply norm and compute logits (needed for consistency but we discard the result)
     if not error_event.is_set():
@@ -733,6 +762,255 @@ def send_kv_cache_per_layer_sync(
         f"DISAGG_TIMING per_layer_prefill_ms={prefill_ms:.1f} "
         f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens} "
         f"layers_sent={num_layers} step_size={step}"
+    )
+    return prefill_tps, num_tokens
+
+
+def send_kv_cache_per_layer_tp_sync(
+    host: str,
+    port: int,
+    model: Model,
+    tokenizer: TokenizerWrapper,
+    prompt_tokens: mx.array,
+    last_tokens: mx.array,
+    cache: KVCacheType,
+    sampler: Callable[[mx.array], mx.array],
+    group: mx.distributed.Group,
+    is_kv_sender: bool,
+) -> tuple[float, int]:
+    """Run per-layer TP prefill, NCCL all_gather per layer, stream KV to decode.
+
+    Extends send_kv_cache_per_layer_sync for tensor-parallel: both ranks process
+    each layer's full sequence in chunks, then do NCCL all_gather (~0.5ms) to merge
+    the sharded KV heads.  Only the sender rank connects to decode and streams frames.
+
+    This replaces send_kv_cache_pipelined_tp_relay_sync which used synchronous TCP
+    relay (~250-600ms per exchange) inside the prefill callback, causing GPU idle gaps.
+
+    Returns (prefill_tps, num_tokens).
+    """
+    from mlx_lm.models.base import (
+        create_attention_mask,  # pyright: ignore[reportUnknownVariableType]
+    )
+    from mlx_lm.models.gpt_oss import GptOssMoeModel
+
+    from exo.worker.engines.mlx.auto_parallel import set_pipeline_prefill
+
+    num_layers = len(cache)
+    num_tokens = len(prompt_tokens)
+    kv_send_cap = max(1, num_tokens + 1 - len(last_tokens))
+    step = _PER_LAYER_PREFILL_STEP_SIZE
+    # --- Sender rank: connect to decode node and set up sender thread ---
+    sock: socket.socket | None = None
+    send_queue: queue.Queue[_LayerQueueItem] | None = None
+    error_event = threading.Event()
+    sender: threading.Thread | None = None
+
+    if is_kv_sender:
+        sock = _connect_with_retries(host, port)
+        send_queue = queue.Queue(maxsize=4)
+        sender = threading.Thread(
+            target=_layer_sender_thread_fn,
+            args=(sock, send_queue, error_event),
+            daemon=True,
+        )
+
+    set_pipeline_prefill(model, is_prefill=True)
+
+    t_prefill_start = time.monotonic()
+
+    # --- Per-layer prefill with chunking + NCCL all_gather ---
+    inner_model = cast(GptOssMoeModel, model.model)
+
+    # Embed tokens and materialize
+    x = inner_model.embed_tokens(prompt_tokens[None])
+    mx.eval(x)
+
+    header_sent = False
+    layer_types: list[str] = cast(list[str], inner_model.layer_types)
+
+    # Deferred extraction state: after gathering layer N, we defer extraction
+    # until layer N+1's first chunk is evaluating on the GPU.
+    # (layer_idx, full_k_gathered, full_v_gathered, tokens_to_extract)
+    pending_extract: tuple[int, mx.array, mx.array, int] | None = None
+
+    def _flush_pending_extract() -> None:
+        """Extract and enqueue gathered KV for the previously-computed layer."""
+        nonlocal pending_extract
+        if pending_extract is None or send_queue is None:
+            return
+        p_layer_idx: int
+        p_full_k: mx.array
+        p_full_v: mx.array
+        p_tokens: int
+        p_layer_idx, p_full_k, p_full_v, p_tokens = pending_extract
+        pending_extract = None
+
+        t_extract_start = time.monotonic()
+        k_np: np.ndarray[Any, Any] = _mlx_to_numpy(p_full_k[:, :, :p_tokens, :]).copy()
+        v_np: np.ndarray[Any, Any] = _mlx_to_numpy(p_full_v[:, :, :p_tokens, :]).copy()
+        del p_full_k, p_full_v
+        t_extract_end = time.monotonic()
+        actual_tokens: int = k_np.shape[2]  # pyright: ignore[reportAny]
+        logger.info(
+            f"DISAGG_TIMING per_layer_tp_extract_ms={(t_extract_end - t_extract_start) * 1000:.1f} "
+            f"layer_idx={p_layer_idx} tokens={actual_tokens}"
+        )
+        try:
+            send_queue.put((p_layer_idx, actual_tokens, k_np, v_np), timeout=120.0)
+        except queue.Full:
+            logger.warning(f"Per-layer TP KV enqueue timed out for layer {p_layer_idx}")
+            error_event.set()
+
+    for layer_idx, (layer, c, layer_type) in enumerate(
+        zip(inner_model.layers, cache, layer_types, strict=True)
+    ):
+        # Process tokens in chunks through this single layer
+        chunk_outputs: list[mx.array] = []
+        remaining = x
+
+        first_chunk_of_layer = True
+        while remaining.shape[1] > 0:
+            n = min(step, remaining.shape[1])
+            x_chunk: mx.array = remaining[:, :n, :]
+            remaining = remaining[:, n:, :]
+
+            if layer_type == "full_attention":
+                mask = create_attention_mask(x_chunk, c)
+            else:
+                mask = create_attention_mask(
+                    x_chunk,
+                    c,
+                    window_size=inner_model.window_size,
+                )
+
+            x_chunk = layer(x_chunk, mask, c)
+            mx.eval(x_chunk, c.state)  # pyright: ignore[reportArgumentType]
+            chunk_outputs.append(x_chunk)
+
+            # Overlap: flush previous layer's extract during GPU idle
+            if first_chunk_of_layer and pending_extract is not None:
+                _flush_pending_extract()
+                first_chunk_of_layer = False
+
+        # Reassemble full sequence for next layer
+        if len(chunk_outputs) == 1:
+            x = chunk_outputs[0]
+        else:
+            x = mx.concatenate(chunk_outputs, axis=1)
+            mx.eval(x)
+        del chunk_outputs
+        mx.clear_cache()
+
+        if error_event.is_set():
+            break
+
+        # --- NCCL all_gather this layer's KV (both ranks participate) ---
+        state = c.state
+        t_gather_start = time.monotonic()
+        # state[0] shape: [1, n_kv_heads/world, seq, hd]
+        # all_gather concatenates on dim 0 → [world, n_kv_heads/world, seq, hd]
+        full_k = mx.distributed.all_gather(state[0], group=group)  # pyright: ignore[reportArgumentType]
+        full_v = mx.distributed.all_gather(state[1], group=group)  # pyright: ignore[reportArgumentType]
+        mx.eval(full_k, full_v)
+        t_gather_end = time.monotonic()
+        # Reshape to [1, n_kv_heads, seq, hd]
+        full_k = full_k.reshape(1, -1, full_k.shape[2], full_k.shape[3])
+        full_v = full_v.reshape(1, -1, full_v.shape[2], full_v.shape[3])
+        logger.info(
+            f"DISAGG_TIMING per_layer_tp_gather_ms={(t_gather_end - t_gather_start) * 1000:.1f} "
+            f"layer_idx={layer_idx} shape={full_k.shape}"
+        )
+
+        if is_kv_sender:
+            assert sock is not None
+            assert send_queue is not None
+            assert sender is not None
+
+            # Send KVPS header on first layer (now we know shapes)
+            if not header_sent:
+                uses_bfloat16 = c.keys is not None and c.keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
+                dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
+                full_n_kv_heads = int(full_k.shape[1])
+                cache_head_dim = int(full_k.shape[3])
+                header = struct.pack(
+                    "!4sBIBIII",
+                    _MAGIC,
+                    _VERSION,
+                    num_layers,
+                    dtype_flag,
+                    kv_send_cap,
+                    full_n_kv_heads,
+                    cache_head_dim,
+                )
+                _sendall(sock, header)
+                sender.start()
+                header_sent = True
+
+            # Defer extraction for overlap with next layer's compute
+            tokens_to_extract = min(c.offset, kv_send_cap)
+            pending_extract = (layer_idx, full_k, full_v, tokens_to_extract)
+        # Non-sender: discard gathered result (participation in all_gather was required)
+        else:
+            del full_k, full_v
+
+    # Flush the last layer's deferred extraction
+    if is_kv_sender and not error_event.is_set():
+        _flush_pending_extract()
+
+    # Apply norm and compute logits (needed for consistency)
+    if not error_event.is_set():
+        x = inner_model.norm(x)
+        _logits: mx.array = model.lm_head(x)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        mx.eval(_logits)  # pyright: ignore[reportUnknownArgumentType]
+        del _logits
+
+    set_pipeline_prefill(model, is_prefill=False)
+
+    t_prefill_end = time.monotonic()
+    prefill_ms = (t_prefill_end - t_prefill_start) * 1000
+
+    # --- Sender: finalize by sending last_tokens + end sentinel ---
+    if is_kv_sender:
+        assert sock is not None
+        assert send_queue is not None
+        assert sender is not None
+
+        if not error_event.is_set():
+            last_tokens_np: np.ndarray[Any, Any] = np.array(
+                last_tokens, copy=False
+            ).astype(np.int32)
+            try:
+                send_queue.put((len(last_tokens_np), last_tokens_np), timeout=10.0)
+            except queue.Full:
+                logger.warning("Per-layer TP KV last_tokens enqueue timed out")
+                error_event.set()
+
+        # Send end sentinel and wait for sender thread
+        try:
+            send_queue.put(None, timeout=10.0)
+        except queue.Full:
+            logger.warning("Per-layer TP KV send_queue full — sender thread likely stuck")
+            error_event.set()
+
+        sender.join(timeout=60.0)
+        if sender.is_alive():
+            logger.warning("Per-layer TP KV sender thread did not exit, closing socket")
+            sock.close()
+            sender.join(timeout=5.0)
+        else:
+            sock.close()
+
+        if error_event.is_set():
+            raise ConnectionError(
+                "Per-layer TP KV sender thread encountered a socket error"
+            )
+
+    prefill_tps = num_tokens / (prefill_ms / 1000) if prefill_ms > 0 else 0.0
+    logger.info(
+        f"DISAGG_TIMING per_layer_tp_prefill_ms={prefill_ms:.1f} "
+        f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens} "
+        f"layers_sent={num_layers} step_size={step} is_kv_sender={is_kv_sender}"
     )
     return prefill_tps, num_tokens
 
@@ -1946,12 +2224,10 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
                 # token count (full_attention = all tokens, sliding_attention
                 # = max_size from RotatingKVCache).
                 full_keys = [
-                    np.zeros(0, dtype=wire_np_dtype)
-                    for _ in range(num_layers)
+                    np.zeros(0, dtype=wire_np_dtype) for _ in range(num_layers)
                 ]
                 full_values = [
-                    np.zeros(0, dtype=wire_np_dtype)
-                    for _ in range(num_layers)
+                    np.zeros(0, dtype=wire_np_dtype) for _ in range(num_layers)
                 ]
 
             assert full_keys is not None and full_values is not None
@@ -2087,13 +2363,16 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
                 n_kv_heads = head_dim_x_heads // head_dim
                 break
 
+    t_convert_start = time.monotonic()
     caches: list[KVCache] = []
     elements_per_token = n_kv_heads * head_dim
     for layer_idx in range(num_layers):
         cache_entry = KVCache()
         layer_k = full_keys[layer_idx]
         layer_v = full_values[layer_idx]
-        layer_n_tokens = len(layer_k) // elements_per_token if elements_per_token > 0 else 0
+        layer_n_tokens = (
+            len(layer_k) // elements_per_token if elements_per_token > 0 else 0
+        )
 
         # Sliding-attention layers (RotatingKVCache) only have max_size entries
         # (e.g. 128) instead of total_received_tokens.  Zero-pad them to the
@@ -2142,9 +2421,19 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
         cache_entry.offset = total_received_tokens
         caches.append(cache_entry)
 
+    t_convert_end = time.monotonic()
+    total_kv_mb = (
+        sum(len(full_keys[i]) * 2 + len(full_values[i]) * 2 for i in range(num_layers))
+        / 1024
+        / 1024
+    )
     logger.info(
         f"Pipelined receive complete: {num_layers} layers, "
         f"{total_received_tokens} tokens, {n_kv_heads} kv_heads, head_dim={head_dim}"
+    )
+    logger.info(
+        f"DISAGG_TIMING numpy_to_mlx_ms={(t_convert_end - t_convert_start) * 1000:.1f} "
+        f"kv_mb={total_kv_mb:.2f}"
     )
     return caches, last_tokens
 

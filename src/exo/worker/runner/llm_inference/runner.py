@@ -630,6 +630,7 @@ class Runner:
                 HARMONY_CHANNEL_TOKEN_ID,
             )
             from exo.worker.engines.mlx.kv_transfer import (
+                send_kv_cache_per_layer_sync,
                 send_kv_cache_pipelined_sync,
             )
             from exo.worker.engines.mlx.utils_mlx import apply_chat_template
@@ -665,16 +666,32 @@ class Runner:
             reprefill = max(reprefill, 2)
             last_tokens = all_prompt_tokens[-reprefill:]
             t_pipelined_start = time.monotonic()
-            prefill_tps, num_tokens = send_kv_cache_pipelined_sync(
-                host=decode_host,
-                port=decode_port,
-                model=cast(Model, gen.model),
-                tokenizer=gen.tokenizer,
-                prompt_tokens=all_prompt_tokens[:-1],
-                last_tokens=last_tokens,
-                cache=caches,
-                sampler=sampler,
-            )
+
+            # Use per-layer streaming for gpt_oss models (streams each layer's
+            # KV as soon as it completes, overlapping network with compute).
+            # Fall back to per-chunk pipelining for other model types.
+            if isinstance(gen.model, GptOssModel):
+                prefill_tps, num_tokens = send_kv_cache_per_layer_sync(
+                    host=decode_host,
+                    port=decode_port,
+                    model=gen.model,
+                    tokenizer=gen.tokenizer,
+                    prompt_tokens=all_prompt_tokens[:-1],
+                    last_tokens=last_tokens,
+                    cache=caches,
+                    sampler=sampler,
+                )
+            else:
+                prefill_tps, num_tokens = send_kv_cache_pipelined_sync(
+                    host=decode_host,
+                    port=decode_port,
+                    model=gen.model,
+                    tokenizer=gen.tokenizer,
+                    prompt_tokens=all_prompt_tokens[:-1],
+                    last_tokens=last_tokens,
+                    cache=caches,
+                    sampler=sampler,
+                )
             t_pipelined_end = time.monotonic()
             logger.info(
                 f"DISAGG_TIMING pipelined_total_ms={(t_pipelined_end - t_pipelined_start) * 1000:.1f} "
@@ -738,9 +755,6 @@ class Runner:
                 DISAGG_REPREFILL_TOKENS,
                 HARMONY_CHANNEL_TOKEN_ID,
             )
-            from exo.worker.engines.mlx.kv_transfer import (
-                send_kv_cache_pipelined_tp_relay_sync,
-            )
             from exo.worker.engines.mlx.utils_mlx import apply_chat_template
 
             prompt = apply_chat_template(gen.tokenizer, task_params)
@@ -776,24 +790,51 @@ class Runner:
             assert isinstance(self.instance, TensorPrefillDisaggInstance)
 
             t_pipelined_start = time.monotonic()
-            prefill_tps, num_tokens = send_kv_cache_pipelined_tp_relay_sync(
-                decode_host=decode_host,
-                decode_port=decode_port,
-                relay_host=self.instance.kv_relay_host,
-                relay_port=self.instance.kv_relay_port,
-                model=cast(Model, gen.model),
-                tokenizer=gen.tokenizer,
-                prompt_tokens=all_prompt_tokens[:-1],
-                last_tokens=last_tokens,
-                cache=caches,
-                sampler=sampler,
-                is_kv_sender=is_kv_sender,
-                my_rank=gen.group.rank(),
-                world_size=gen.group.size(),
-            )
+
+            if isinstance(gen.model, GptOssModel):
+                # Per-layer TP prefill with NCCL all_gather — eliminates
+                # TCP relay bottleneck (~250-600ms) that caused GPU idle gaps.
+                from exo.worker.engines.mlx.kv_transfer import (
+                    send_kv_cache_per_layer_tp_sync,
+                )
+
+                prefill_tps, num_tokens = send_kv_cache_per_layer_tp_sync(
+                    host=decode_host,
+                    port=decode_port,
+                    model=cast(Model, gen.model),
+                    tokenizer=gen.tokenizer,
+                    prompt_tokens=all_prompt_tokens[:-1],
+                    last_tokens=last_tokens,
+                    cache=caches,
+                    sampler=sampler,
+                    group=gen.group,
+                    is_kv_sender=is_kv_sender,
+                )
+            else:
+                # Fallback to TCP relay for non-GptOss models
+                from exo.worker.engines.mlx.kv_transfer import (
+                    send_kv_cache_pipelined_tp_relay_sync,
+                )
+
+                prefill_tps, num_tokens = send_kv_cache_pipelined_tp_relay_sync(
+                    decode_host=decode_host,
+                    decode_port=decode_port,
+                    relay_host=self.instance.kv_relay_host,
+                    relay_port=self.instance.kv_relay_port,
+                    model=gen.model,
+                    tokenizer=gen.tokenizer,
+                    prompt_tokens=all_prompt_tokens[:-1],
+                    last_tokens=last_tokens,
+                    cache=caches,
+                    sampler=sampler,
+                    is_kv_sender=is_kv_sender,
+                    my_rank=gen.group.rank(),
+                    world_size=gen.group.size(),
+                )
+
             t_pipelined_end = time.monotonic()
             logger.info(
-                f"DISAGG_TIMING pipelined_tp_relay_total_ms={(t_pipelined_end - t_pipelined_start) * 1000:.1f} "
+                f"DISAGG_TIMING tp_prefill_total_ms={(t_pipelined_end - t_pipelined_start) * 1000:.1f} "
                 f"prefill_tps={prefill_tps:.1f} num_tokens={num_tokens}"
             )
 
@@ -890,7 +931,12 @@ class Runner:
             # KVCache, which makes sliding-attention layers attend to the
             # entire sequence instead of just max_size tokens — causing
             # Metal to hang on long contexts.
+            t_align_start = time.monotonic()
             received_caches = _align_received_caches(gen.model, received_caches)
+            t_align_end = time.monotonic()
+            logger.info(
+                f"DISAGG_TIMING decode_align_caches_ms={(t_align_end - t_align_start) * 1000:.1f}"
+            )
 
             sampler = make_sampler(
                 temp=task_params.temperature
@@ -960,9 +1006,20 @@ class Runner:
                 parsed = parse_deepseek_v32(parsed)
 
             tokens_since_last_cancel_check = gen.check_for_cancel_every
+            t_first_token: float | None = None
+            decode_token_count = 0
             for response in parsed:
                 if response is None:
                     continue
+
+                decode_token_count += 1
+                if t_first_token is None:
+                    t_first_token = time.monotonic()
+                    logger.info(
+                        f"DISAGG_TIMING decode_ttfr_ms={(t_first_token - t_decode_start) * 1000:.1f} "
+                        f"(includes reprefill of {len(last_tokens)} tokens)"
+                    )
+
                 tokens_since_last_cancel_check += 1
                 if tokens_since_last_cancel_check >= gen.check_for_cancel_every:
                     tokens_since_last_cancel_check = 0
@@ -979,6 +1036,28 @@ class Runner:
                     and response.finish_reason is not None
                 ):
                     break
+
+            t_decode_end = time.monotonic()
+            if t_first_token is not None and decode_token_count > 1:
+                steady_state_ms = (t_decode_end - t_first_token) * 1000
+                steady_state_tps = (
+                    (decode_token_count - 1) / (steady_state_ms / 1000)
+                    if steady_state_ms > 0
+                    else 0.0
+                )
+                total_decode_ms = (t_decode_end - t_decode_start) * 1000
+                overall_tps = (
+                    decode_token_count / (total_decode_ms / 1000)
+                    if total_decode_ms > 0
+                    else 0.0
+                )
+                logger.info(
+                    f"DISAGG_TIMING decode_steady_state_tps={steady_state_tps:.1f} "
+                    f"overall_tps={overall_tps:.1f} "
+                    f"tokens={decode_token_count} "
+                    f"steady_state_ms={steady_state_ms:.1f} "
+                    f"total_decode_ms={total_decode_ms:.1f}"
+                )
 
             # Free received KV caches and intermediate tensors.
             del received_caches

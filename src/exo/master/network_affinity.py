@@ -79,7 +79,9 @@ def _best_shared_link_score(
             types = {iface_a.interface_type, iface_b.interface_type}
             if types <= {"ethernet", "thunderbolt", "maybe_ethernet"}:
                 score = 3
-            elif "wifi" not in types and ("ethernet" in types or "thunderbolt" in types):
+            elif "wifi" not in types and (
+                "ethernet" in types or "thunderbolt" in types
+            ):
                 score = 2
             else:
                 score = 1

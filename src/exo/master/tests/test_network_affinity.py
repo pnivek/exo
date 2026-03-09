@@ -4,7 +4,11 @@ from exo.master.network_affinity import (
     pick_best_connected_node,
 )
 from exo.shared.types.common import NodeId
-from exo.shared.types.profiling import InterfaceType, NetworkInterfaceInfo, NodeNetworkInfo
+from exo.shared.types.profiling import (
+    InterfaceType,
+    NetworkInterfaceInfo,
+    NodeNetworkInfo,
+)
 
 
 def _iface(
@@ -169,15 +173,27 @@ def test_pick_best_connected_node_prefers_ethernet_over_wifi() -> None:
     network = {
         sparkly: NodeNetworkInfo(
             interfaces=[
-                _iface("enP7s7", "192.168.0.101", "255.255.255.0", iface_type="ethernet"),
-                _iface("enp1s0f0np0", "169.254.144.33", "255.255.0.0", iface_type="ethernet"),
+                _iface(
+                    "enP7s7", "192.168.0.101", "255.255.255.0", iface_type="ethernet"
+                ),
+                _iface(
+                    "enp1s0f0np0",
+                    "169.254.144.33",
+                    "255.255.0.0",
+                    iface_type="ethernet",
+                ),
                 _iface("wlP9s9", "192.168.0.172", "255.255.255.0", iface_type="wifi"),
             ]
         ),
         sparky: NodeNetworkInfo(
             interfaces=[
                 _iface("wlP9s9", "192.168.0.112", "255.255.255.0", iface_type="wifi"),
-                _iface("enp1s0f1np1", "169.254.249.25", "255.255.0.0", iface_type="ethernet"),
+                _iface(
+                    "enp1s0f1np1",
+                    "169.254.249.25",
+                    "255.255.0.0",
+                    iface_type="ethernet",
+                ),
             ]
         ),
         mac: NodeNetworkInfo(
