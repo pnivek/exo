@@ -640,6 +640,8 @@ def send_kv_cache_per_layer_sync(
     for layer_idx, (layer, c, layer_type) in enumerate(
         zip(inner_model.layers, cache, layer_types, strict=True)
     ):
+        t_layer_start = time.monotonic()
+
         # Process tokens in chunks through this single layer, mirroring
         # mlx_lm's _prefill pattern but one layer at a time.
         chunk_outputs: list[mx.array] = []
@@ -684,6 +686,12 @@ def send_kv_cache_per_layer_sync(
         del chunk_outputs
         mx.clear_cache()
 
+        t_layer_end = time.monotonic()
+        logger.info(
+            f"DISAGG_TIMING per_layer_compute_ms={(t_layer_end - t_layer_start) * 1000:.1f} "
+            f"layer_idx={layer_idx} type={layer_type} chunks={1 + (num_tokens - 1) // step}"
+        )
+
         if error_event.is_set():
             break
 
@@ -716,12 +724,9 @@ def send_kv_cache_per_layer_sync(
     if not error_event.is_set():
         _flush_pending_extract()
 
-    # Apply norm and compute logits (needed for consistency but we discard the result)
-    if not error_event.is_set():
-        x = inner_model.norm(x)
-        _logits: mx.array = model.lm_head(x)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-        mx.eval(_logits)  # pyright: ignore[reportUnknownArgumentType]
-        del _logits
+    # Skip norm + lm_head — disagg prefill doesn't need logits.
+    # The decode node runs its own model for generation.
+    del x
 
     set_pipeline_prefill(model, is_prefill=False)
 
@@ -958,12 +963,8 @@ def send_kv_cache_per_layer_tp_sync(
     if is_kv_sender and not error_event.is_set():
         _flush_pending_extract()
 
-    # Apply norm and compute logits (needed for consistency)
-    if not error_event.is_set():
-        x = inner_model.norm(x)
-        _logits: mx.array = model.lm_head(x)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-        mx.eval(_logits)  # pyright: ignore[reportUnknownArgumentType]
-        del _logits
+    # Skip norm + lm_head — disagg prefill doesn't need logits.
+    del x
 
     set_pipeline_prefill(model, is_prefill=False)
 
