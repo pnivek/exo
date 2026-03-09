@@ -1,6 +1,6 @@
 import ctypes
 import gc
-import resource
+import os
 import time
 from collections.abc import Generator
 from dataclasses import dataclass
@@ -72,12 +72,13 @@ from exo.worker.engines.mlx.utils_mlx import (
 )
 from exo.worker.runner.bootstrap import logger
 from exo.worker.runner.llm_inference.batch_generator import (
+    BatchGenerator,
     InferenceGenerator,
     SequentialGenerator,
 )
 
 from .batch_generator import Cancelled, Finished
-from .tool_parsers import ToolParser, make_mlx_parser
+from .tool_parsers import make_mlx_parser
 
 
 def _align_received_caches(
@@ -169,9 +170,6 @@ class Runner:
         self.task_receiver = task_receiver
         self.cancel_receiver = cancel_receiver
         self.bound_instance = bound_instance
-
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (min(max(soft, 2048), hard), hard))
 
         self.instance, self.runner_id, self.shard_metadata = (
             self.bound_instance.instance,
@@ -382,16 +380,6 @@ class Runner:
                         on_layer_loaded=on_layer_loaded,
                     )
                 )
-                logger.info(
-                    f"model has_tool_calling={self.generator.tokenizer.has_tool_calling} using tokens {self.generator.tokenizer.tool_call_start}, {self.generator.tokenizer.tool_call_end}"
-                )
-                tok = self.generator.tokenizer
-                if tok.tool_call_start and tok.tool_call_end and tok.tool_parser:  # pyright: ignore[reportAny]
-                    self.generator.tool_parser = make_mlx_parser(
-                        tok.tool_call_start,
-                        tok.tool_call_end,
-                        tok.tool_parser,  # pyright: ignore[reportAny]
-                    )
 
                 self.generator = self.generator.build()
 
@@ -522,7 +510,7 @@ class Runner:
                         )
 
             for task_id in finished:
-                del self.active_tasks[task_id]
+                self.active_tasks.pop(task_id, None)
 
             try:
                 task = self.task_receiver.receive_nowait()
@@ -1093,9 +1081,7 @@ class Builder:
     cancel_receiver: MpReceiver[TaskId]
     inference_model: Model | None = None
     tokenizer: TokenizerWrapper | None = None
-    tool_parser: ToolParser | None = None
     group: mx.distributed.Group | None = None
-    kv_prefix_cache: KVPrefixCache | None = None
 
     def build(
         self,
@@ -1104,14 +1090,46 @@ class Builder:
         assert self.inference_model
         assert self.tokenizer
 
-        return SequentialGenerator(
+        tool_parser = None
+        logger.info(
+            f"model has_tool_calling={self.tokenizer.has_tool_calling} using tokens {self.tokenizer.tool_call_start}, {self.tokenizer.tool_call_end}"
+        )
+        if (
+            self.tokenizer.tool_call_start
+            and self.tokenizer.tool_call_end
+            and self.tokenizer.tool_parser  # type: ignore
+        ):
+            tool_parser = make_mlx_parser(
+                self.tokenizer.tool_call_start,
+                self.tokenizer.tool_call_end,
+                self.tokenizer.tool_parser,  # type: ignore
+            )
+
+        kv_prefix_cache = KVPrefixCache(self.group)
+
+        device_rank = 0 if self.group is None else self.group.rank()
+        if os.environ.get("EXO_NO_BATCH"):
+            logger.info("using SequentialGenerator (batching disabled)")
+            return SequentialGenerator(
+                model=self.inference_model,
+                tokenizer=self.tokenizer,
+                group=self.group,
+                tool_parser=tool_parser,
+                kv_prefix_cache=kv_prefix_cache,
+                model_id=self.model_id,
+                device_rank=device_rank,
+                cancel_receiver=self.cancel_receiver,
+                event_sender=self.event_sender,
+            )
+        logger.info("using BatchGenerator")
+        return BatchGenerator(
             model=self.inference_model,
             tokenizer=self.tokenizer,
             group=self.group,
-            tool_parser=self.tool_parser,
-            kv_prefix_cache=self.kv_prefix_cache,
+            tool_parser=tool_parser,
+            kv_prefix_cache=kv_prefix_cache,
             model_id=self.model_id,
-            device_rank=0 if self.group is None else self.group.rank(),
+            device_rank=device_rank,
             cancel_receiver=self.cancel_receiver,
             event_sender=self.event_sender,
         )

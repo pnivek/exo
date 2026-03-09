@@ -1,5 +1,6 @@
 import atexit
 import os
+import resource
 from pathlib import Path
 
 import loguru
@@ -62,6 +63,9 @@ def entrypoint(
 ) -> None:
     global logger
     logger = _logger
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(max(soft, 2048), hard), hard))
 
     def _cleanup_gpu() -> None:
         """Release GPU memory on runner exit (runs even on unhandled exceptions)."""

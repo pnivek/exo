@@ -991,7 +991,9 @@ def send_kv_cache_per_layer_tp_sync(
         try:
             send_queue.put(None, timeout=10.0)
         except queue.Full:
-            logger.warning("Per-layer TP KV send_queue full — sender thread likely stuck")
+            logger.warning(
+                "Per-layer TP KV send_queue full — sender thread likely stuck"
+            )
             error_event.set()
 
         sender.join(timeout=60.0)
