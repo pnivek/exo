@@ -1,0 +1,27 @@
+services:
+  exo:
+    image: exo-spark:latest
+    container_name: exo_spark
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    privileged: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ${MODELS_PATH:-/root/.local/share/exo/models}:/models
+    environment:
+      - HF_TOKEN=[[HF_TOKEN]]
+      - MLX_CUDA_GRAPH_CACHE_SIZE=3000
+      - EXO_MODELS_PATH=/models
+    # Override ENTRYPOINT args per-node — set these in .env or via Komodo env vars:
+    # LISTEN_PORT, DIAL_ADDR
+    command: >
+      -v
+      --listen-port ${LISTEN_PORT:-55001}
+      ${DIAL_ADDR:+--dial ${DIAL_ADDR}}
