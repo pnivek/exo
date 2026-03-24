@@ -42,6 +42,9 @@
     setSelectedChatModel,
     selectedChatModel,
     sendMessage,
+    generateImage,
+    editImage,
+    editingImage,
     messages,
     debugMode,
     toggleDebugMode,
@@ -49,6 +52,12 @@
     toggleTopologyOnlyMode,
     chatSidebarVisible,
     toggleChatSidebarVisible,
+    mobileChatSidebarOpen,
+    toggleMobileChatSidebar,
+    setMobileChatSidebarOpen,
+    mobileRightSidebarOpen,
+    toggleMobileRightSidebar,
+    setMobileRightSidebarOpen,
     nodeThunderbolt,
     nodeRdmaCtl,
     thunderboltBridgeCycles,
@@ -79,6 +88,8 @@
   const debugEnabled = $derived(debugMode());
   const topologyOnlyEnabled = $derived(topologyOnlyMode());
   const sidebarVisible = $derived(chatSidebarVisible());
+  const mobileChatOpen = $derived(mobileChatSidebarOpen());
+  const mobileRightOpen = $derived(mobileRightSidebarOpen());
   const tbBridgeCycles = $derived(thunderboltBridgeCycles());
   const tbBridgeData = $derived(nodeThunderboltBridge());
   const identitiesData = $derived(nodeIdentities());
@@ -849,6 +860,52 @@
     if (!model?.tasks) return false;
     return model.tasks.includes("ImageToImage");
   }
+
+  // Route a message to the correct endpoint based on model capabilities.
+  // Image models go to generateImage/editImage; text models go to sendMessage.
+  function routeMessage(
+    content: string,
+    files?: {
+      id: string;
+      name: string;
+      type: string;
+      textContent?: string;
+      preview?: string;
+    }[],
+  ) {
+    const model = selectedChatModel();
+    if (!model) {
+      sendMessage(content, files, null);
+      return;
+    }
+
+    const currentEditImage = editingImage();
+
+    // Image editing mode (explicit edit or attached image with ImageToImage model)
+    if (currentEditImage && content && modelSupportsImageEditing(model)) {
+      editImage(content, currentEditImage.imageDataUrl);
+      return;
+    }
+    if (
+      modelSupportsImageEditing(model) &&
+      files?.length &&
+      files[0].preview &&
+      content
+    ) {
+      editImage(content, files[0].preview);
+      return;
+    }
+
+    // Text-to-image generation
+    if (modelSupportsImageGeneration(model) && content) {
+      generateImage(content);
+      return;
+    }
+
+    // Default: text chat
+    sendMessage(content, files, null);
+  }
+
   let selectedSharding = $state<"Pipeline" | "Tensor">("Pipeline");
   type InstanceMeta =
     | "MlxRing"
@@ -1581,34 +1638,44 @@
   }
 
   // Helper to get download status for a model (checks all downloads for matching model ID)
-  function getModelDownloadStatus(modelId: string): {
+  type NodeDownloadStatus = {
+    nodeId: string;
+    nodeName: string;
+    status: "completed" | "partial" | "pending" | "downloading";
+    percentage: number;
+    progress: DownloadProgress | null;
+  };
+
+  // Shared helper: collect per-node download status for a model across a set of nodes.
+  // Handles deduplication, entry parsing, and aggregation in one place.
+  function collectDownloadStatus(
+    modelId: string,
+    nodeIds?: string[],
+  ): {
     isDownloading: boolean;
     progress: DownloadProgress | null;
-    perNode: Array<{
-      nodeId: string;
-      nodeName: string;
-      progress: DownloadProgress;
-    }>;
+    perNode: NodeDownloadStatus[];
+    failedError: string | null;
   } {
+    const empty = {
+      isDownloading: false,
+      progress: null,
+      perNode: [] as NodeDownloadStatus[],
+      failedError: null,
+    };
+
     if (!downloadsData || Object.keys(downloadsData).length === 0) {
-      return { isDownloading: false, progress: null, perNode: [] };
+      return empty;
     }
 
-    let totalBytes = 0;
-    let downloadedBytes = 0;
-    let totalSpeed = 0;
-    let completedFiles = 0;
-    let totalFiles = 0;
-    let isDownloading = false;
-    const allFiles: DownloadProgress["files"] = [];
-    const perNode: Array<{
-      nodeId: string;
-      nodeName: string;
-      progress: DownloadProgress;
-    }> = [];
+    // Deduplicate by nodeId — a node can have multiple entries for the same model
+    // (e.g. PipelineShardMetadata + TensorShardMetadata). Keep the last entry,
+    // which is the most recently applied event.
+    const perNodeMap = new Map<string, NodeDownloadStatus>();
 
-    // Check all nodes for downloads matching this model
+    const nodeIdSet = nodeIds ? new Set(nodeIds) : null;
     for (const [nodeId, nodeDownloads] of Object.entries(downloadsData)) {
+      if (nodeIdSet && !nodeIdSet.has(nodeId)) continue;
       if (!Array.isArray(nodeDownloads)) continue;
 
       for (const downloadWrapped of nodeDownloads) {
@@ -1621,46 +1688,118 @@
         const downloadPayload = (downloadWrapped as Record<string, unknown>)[
           downloadKind
         ] as Record<string, unknown>;
-
-        if (downloadKind !== "DownloadOngoing") continue;
         if (!downloadPayload) continue;
 
         const downloadModelId = extractModelIdFromDownload(downloadPayload);
+        if (!downloadModelId || downloadModelId !== modelId) continue;
 
-        // Match if the model ID contains or equals the requested model
-        // (handles cases like "mlx-community/Meta-Llama..." matching)
+        // DownloadFailed — return with any data collected so far
+        if (downloadKind === "DownloadFailed") {
+          return {
+            isDownloading: false,
+            progress: null,
+            perNode: Array.from(perNodeMap.values()),
+            failedError:
+              (downloadPayload.errorMessage as string) ||
+              (downloadPayload.error_message as string) ||
+              "Download failed",
+          };
+        }
+
         if (
-          !downloadModelId ||
-          !downloadModelId.includes(modelId.split("/").pop() || modelId)
-        ) {
-          // Try exact match or partial match
-          if (downloadModelId !== modelId) continue;
+          downloadKind !== "DownloadOngoing" &&
+          downloadKind !== "DownloadPending" &&
+          downloadKind !== "DownloadCompleted"
+        )
+          continue;
+
+        const nodeName =
+          data?.nodes?.[nodeId]?.friendly_name ?? nodeId.slice(0, 8);
+
+        if (downloadKind === "DownloadCompleted") {
+          perNodeMap.set(nodeId, {
+            nodeId,
+            nodeName,
+            status: "completed",
+            percentage: 100,
+            progress: null,
+          });
+          continue;
         }
 
-        isDownloading = true;
+        if (downloadKind === "DownloadPending") {
+          const pendingDownloaded = getBytes(
+            downloadPayload.downloaded ??
+              downloadPayload.downloaded_bytes ??
+              downloadPayload.downloadedBytes,
+          );
+          const pendingTotal = getBytes(
+            downloadPayload.total ??
+              downloadPayload.total_bytes ??
+              downloadPayload.totalBytes,
+          );
+          if (pendingDownloaded <= 0 && pendingTotal <= 0) continue;
+          const pct =
+            pendingTotal > 0 ? (pendingDownloaded / pendingTotal) * 100 : 0;
+          perNodeMap.set(nodeId, {
+            nodeId,
+            nodeName,
+            status: pendingDownloaded > 0 ? "partial" : "pending",
+            percentage: pct,
+            progress: null,
+          });
+          continue;
+        }
 
+        // DownloadOngoing
         const progress = parseDownloadProgress(downloadPayload);
-        if (progress) {
-          // Sum all values across nodes - each node downloads independently
-          totalBytes += progress.totalBytes;
-          downloadedBytes += progress.downloadedBytes;
-          totalSpeed += progress.speed;
-          completedFiles += progress.completedFiles;
-          totalFiles += progress.totalFiles;
-          allFiles.push(...progress.files);
+        if (
+          !progress ||
+          (progress.downloadedBytes <= 0 && progress.totalBytes <= 0)
+        )
+          continue;
 
-          const nodeName =
-            data?.nodes?.[nodeId]?.friendly_name ?? nodeId.slice(0, 8);
-          perNode.push({ nodeId, nodeName, progress });
-        }
+        perNodeMap.set(nodeId, {
+          nodeId,
+          nodeName,
+          status: "downloading",
+          percentage: progress.percentage,
+          progress,
+        });
+      }
+    }
+
+    // Aggregate from deduplicated per-node entries
+    const perNode = Array.from(perNodeMap.values());
+    let totalBytes = 0;
+    let downloadedBytes = 0;
+    let totalSpeed = 0;
+    let completedFiles = 0;
+    let totalFiles = 0;
+    let isDownloading = false;
+    const allFiles: DownloadProgress["files"] = [];
+
+    for (const node of perNode) {
+      if (node.status === "downloading" && node.progress) {
+        isDownloading = true;
+        totalBytes += node.progress.totalBytes;
+        downloadedBytes += node.progress.downloadedBytes;
+        totalSpeed += node.progress.speed;
+        completedFiles += node.progress.completedFiles;
+        totalFiles += node.progress.totalFiles;
+        allFiles.push(...node.progress.files);
       }
     }
 
     if (!isDownloading) {
-      return { isDownloading: false, progress: null, perNode: [] };
+      return {
+        isDownloading: false,
+        progress: null,
+        perNode,
+        failedError: null,
+      };
     }
 
-    // ETA = total remaining bytes / total speed across all nodes
     const remainingBytes = totalBytes - downloadedBytes;
     const etaMs = totalSpeed > 0 ? (remainingBytes / totalSpeed) * 1000 : 0;
 
@@ -1677,7 +1816,19 @@
         files: allFiles,
       },
       perNode,
+      failedError: null,
     };
+  }
+
+  function getModelDownloadStatus(
+    modelId: string,
+    nodeIds?: string[],
+  ): {
+    isDownloading: boolean;
+    progress: DownloadProgress | null;
+    perNode: NodeDownloadStatus[];
+  } {
+    return collectDownloadStatus(modelId, nodeIds);
   }
 
   // Helper to get download status for an instance
@@ -1690,26 +1841,9 @@
     errorMessage: string | null;
     progress: DownloadProgress | null;
     statusText: string;
-    perNode: Array<{
-      nodeId: string;
-      nodeName: string;
-      progress: DownloadProgress;
-    }>;
+    perNode: NodeDownloadStatus[];
   } {
-    if (!downloadsData || Object.keys(downloadsData).length === 0) {
-      // No download data yet — defer to runner status instead of assuming RUNNING
-      const statusInfo = deriveInstanceStatus(instanceWrapped);
-      return {
-        isDownloading: false,
-        isFailed: false,
-        errorMessage: null,
-        progress: null,
-        statusText: statusInfo.statusText,
-        perNode: [],
-      };
-    }
-
-    // Unwrap the instance
+    // Unwrap the instance to get shard assignments
     const [instanceTag, instance] = getTagged(instanceWrapped);
     if (!instance || typeof instance !== "object") {
       return {
@@ -1729,100 +1863,9 @@
         modelId?: string;
       };
     };
-    const nodeToRunner = inst.shardAssignments?.nodeToRunner || {};
-    const runnerToShard = inst.shardAssignments?.runnerToShard || {};
     const instanceModelId = inst.shardAssignments?.modelId;
 
-    // Build reverse mapping: runnerId -> nodeId
-    const runnerToNode: Record<string, string> = {};
-    for (const [nodeId, runnerId] of Object.entries(nodeToRunner)) {
-      runnerToNode[runnerId] = nodeId;
-    }
-
-    let totalBytes = 0;
-    let downloadedBytes = 0;
-    let totalSpeed = 0;
-    let completedFiles = 0;
-    let totalFiles = 0;
-    let isDownloading = false;
-    const allFiles: DownloadProgress["files"] = [];
-    const perNode: Array<{
-      nodeId: string;
-      nodeName: string;
-      progress: DownloadProgress;
-    }> = [];
-
-    // Check downloads for nodes that are part of this instance
-    for (const runnerId of Object.keys(runnerToShard)) {
-      const nodeId = runnerToNode[runnerId];
-      if (!nodeId) continue;
-
-      const nodeDownloads = downloadsData[nodeId];
-      if (!Array.isArray(nodeDownloads)) continue;
-
-      for (const downloadWrapped of nodeDownloads) {
-        if (!downloadWrapped || typeof downloadWrapped !== "object") continue;
-
-        const keys = Object.keys(downloadWrapped as Record<string, unknown>);
-        if (keys.length !== 1) continue;
-
-        const downloadKind = keys[0];
-        const downloadPayload = (downloadWrapped as Record<string, unknown>)[
-          downloadKind
-        ] as Record<string, unknown>;
-
-        // Handle DownloadFailed - return immediately with error info
-        if (downloadKind === "DownloadFailed") {
-          const downloadModelId = extractModelIdFromDownload(downloadPayload);
-          if (
-            instanceModelId &&
-            downloadModelId &&
-            downloadModelId === instanceModelId
-          ) {
-            return {
-              isDownloading: false,
-              isFailed: true,
-              errorMessage:
-                (downloadPayload.errorMessage as string) || "Download failed",
-              progress: null,
-              statusText: "FAILED",
-              perNode: [],
-            };
-          }
-        }
-
-        if (downloadKind !== "DownloadOngoing") continue;
-        if (!downloadPayload) continue;
-
-        // Check if this download is for this instance's model
-        const downloadModelId = extractModelIdFromDownload(downloadPayload);
-        if (
-          instanceModelId &&
-          downloadModelId &&
-          downloadModelId === instanceModelId
-        ) {
-          isDownloading = true;
-
-          const progress = parseDownloadProgress(downloadPayload);
-          if (progress) {
-            // Sum all values across nodes - each node downloads independently
-            totalBytes += progress.totalBytes;
-            downloadedBytes += progress.downloadedBytes;
-            totalSpeed += progress.speed;
-            completedFiles += progress.completedFiles;
-            totalFiles += progress.totalFiles;
-            allFiles.push(...progress.files);
-
-            const nodeName =
-              data?.nodes?.[nodeId]?.friendly_name ?? nodeId.slice(0, 8);
-            perNode.push({ nodeId, nodeName, progress });
-          }
-        }
-      }
-    }
-
-    if (!isDownloading) {
-      // Check runner status for other states
+    if (!instanceModelId) {
       const statusInfo = deriveInstanceStatus(instanceWrapped);
       return {
         isDownloading: false,
@@ -1834,26 +1877,49 @@
       };
     }
 
-    // ETA = total remaining bytes / total speed across all nodes
-    const remainingBytes = totalBytes - downloadedBytes;
-    const etaMs = totalSpeed > 0 ? (remainingBytes / totalSpeed) * 1000 : 0;
+    // Get node IDs assigned to this instance
+    const nodeToRunner = inst.shardAssignments?.nodeToRunner || {};
+    const runnerToShard = inst.shardAssignments?.runnerToShard || {};
+    const runnerToNode: Record<string, string> = {};
+    for (const [nodeId, runnerId] of Object.entries(nodeToRunner)) {
+      runnerToNode[runnerId] = nodeId;
+    }
+    const instanceNodeIds = Object.keys(runnerToShard)
+      .map((runnerId) => runnerToNode[runnerId])
+      .filter(Boolean);
+
+    const result = collectDownloadStatus(instanceModelId, instanceNodeIds);
+
+    if (result.failedError) {
+      return {
+        isDownloading: false,
+        isFailed: true,
+        errorMessage: result.failedError,
+        progress: null,
+        statusText: "FAILED",
+        perNode: [],
+      };
+    }
+
+    if (!result.isDownloading) {
+      const statusInfo = deriveInstanceStatus(instanceWrapped);
+      return {
+        isDownloading: false,
+        isFailed: statusInfo.statusText === "FAILED",
+        errorMessage: null,
+        progress: null,
+        statusText: statusInfo.statusText,
+        perNode: result.perNode,
+      };
+    }
 
     return {
       isDownloading: true,
       isFailed: false,
       errorMessage: null,
-      progress: {
-        totalBytes,
-        downloadedBytes,
-        speed: totalSpeed,
-        etaMs,
-        percentage: totalBytes > 0 ? (downloadedBytes / totalBytes) * 100 : 0,
-        completedFiles,
-        totalFiles,
-        files: allFiles,
-      },
+      progress: result.progress,
       statusText: "DOWNLOADING",
-      perNode,
+      perNode: result.perNode,
     };
   }
 
@@ -2894,7 +2960,7 @@
         // Running model is same or better tier — use it directly
         setSelectedChatModel(bestRunning.id);
         if (!chatStarted) createConversation();
-        sendMessage(content, files);
+        routeMessage(content, files);
         return;
       }
     }
@@ -2911,7 +2977,7 @@
     if (hasRunningInstance(autoModel.id)) {
       setSelectedChatModel(autoModel.id);
       if (!chatStarted) createConversation();
-      sendMessage(content, files);
+      routeMessage(content, files);
       return;
     }
 
@@ -3064,7 +3130,7 @@
       if (pendingAutoMessage) {
         const msg = pendingAutoMessage;
         pendingAutoMessage = null;
-        sendMessage(msg.content, msg.files);
+        routeMessage(msg.content, msg.files);
       }
       return;
     }
@@ -3143,7 +3209,7 @@
     // Model is selected and running — send directly
     if (model && hasRunningInstance(model)) {
       chatLaunchState = "ready";
-      sendMessage(content, files, null);
+      routeMessage(content, files);
       return;
     }
 
@@ -4729,17 +4795,36 @@
       showSidebarToggle={true}
       {sidebarVisible}
       onToggleSidebar={toggleChatSidebarVisible}
+      showMobileMenuToggle={true}
+      mobileMenuOpen={mobileChatOpen}
+      onToggleMobileMenu={toggleMobileChatSidebar}
+      showMobileRightToggle={!chatStarted && !topologyOnlyEnabled}
+      {mobileRightOpen}
+      onToggleMobileRight={toggleMobileRightSidebar}
       downloadProgress={activeDownloadSummary}
       disaggMode={effectiveInferenceMode === "pd"}
     />
   {/if}
 
+  <!-- Mobile Chat Sidebar Drawer -->
+  {#if !topologyOnlyEnabled}
+    <ChatSidebar
+      isMobileDrawer={true}
+      isOpen={mobileChatOpen}
+      onClose={() => setMobileChatSidebarOpen(false)}
+      onNewChat={handleNewChat}
+      onSelectConversation={() => {
+        userForcedIdle = false;
+      }}
+    />
+  {/if}
+
   <!-- Main Content -->
   <main class="flex-1 flex overflow-hidden relative">
-    <!-- Left: Conversation History Sidebar (hidden in topology-only mode, welcome state, or when toggled off) -->
+    <!-- Left: Conversation History Sidebar (hidden in topology-only mode, welcome state, or when toggled off) - Desktop only -->
     {#if !topologyOnlyEnabled && sidebarVisible}
       <div
-        class="w-80 flex-shrink-0 border-r border-exo-yellow/10"
+        class="hidden md:block w-80 flex-shrink-0 border-r border-exo-yellow/10"
         role="complementary"
         aria-label="Conversation history"
       >
@@ -5063,11 +5148,33 @@
           </div>
         </div>
 
-        <!-- Right Sidebar: Instance Controls (wider on welcome page for better visibility) -->
+        <!-- Mobile Right Sidebar Drawer (Instances) -->
+        {#if mobileRightOpen}
+          <!-- Overlay backdrop -->
+          <button
+            type="button"
+            class="fixed inset-0 bg-black/60 backdrop-blur-sm z-40 md:hidden"
+            onclick={() => setMobileRightSidebarOpen(false)}
+            aria-label="Close instances panel"
+          ></button>
+          <!-- Drawer panel -->
+          <aside
+            class="fixed right-0 top-0 bottom-0 w-80 bg-exo-dark-gray border-l border-exo-yellow/10 z-50 flex flex-col md:hidden overflow-y-auto"
+            aria-label="Instance controls mobile"
+          >
+            {@render rightSidebarContent()}
+          </aside>
+        {/if}
+
+        <!-- Right Sidebar: Instance Controls (wider on welcome page for better visibility) - Desktop only -->
         <aside
-          class="w-80 border-l border-exo-yellow/10 bg-exo-dark-gray flex flex-col flex-shrink-0"
+          class="hidden md:flex w-80 border-l border-exo-yellow/10 bg-exo-dark-gray flex-col flex-shrink-0"
           aria-label="Instance controls"
         >
+          {@render rightSidebarContent()}
+        </aside>
+
+        {#snippet rightSidebarContent()}
           <!-- Running Instances Panel (only shown when instances exist) - Scrollable -->
           {#if instanceCount > 0}
             <div class="p-4 flex-shrink-0">
@@ -5346,10 +5453,10 @@
                             <div
                               class="mt-2 space-y-2 max-h-48 overflow-y-auto pr-1"
                             >
-                              {#each downloadInfo.perNode as nodeProg}
+                              {#each downloadInfo.perNode.filter((n) => n.status === "downloading" && n.progress) as nodeProg}
                                 {@const nodePercent = Math.min(
                                   100,
-                                  Math.max(0, nodeProg.progress.percentage),
+                                  Math.max(0, nodeProg.percentage),
                                 )}
                                 {@const isExpanded =
                                   instanceDownloadExpandedNodes.has(
@@ -5405,15 +5512,17 @@
                                     >
                                       <span
                                         >{formatBytes(
-                                          nodeProg.progress.downloadedBytes,
+                                          nodeProg.progress?.downloadedBytes ??
+                                            0,
                                         )} / {formatBytes(
-                                          nodeProg.progress.totalBytes,
+                                          nodeProg.progress?.totalBytes ?? 0,
                                         )}</span
                                       >
                                       <span
-                                        >{formatSpeed(nodeProg.progress.speed)} •
-                                        ETA {formatEta(
-                                          nodeProg.progress.etaMs,
+                                        >{formatSpeed(
+                                          nodeProg.progress?.speed ?? 0,
+                                        )} • ETA {formatEta(
+                                          nodeProg.progress?.etaMs ?? 0,
                                         )}</span
                                       >
                                     </div>
@@ -5421,14 +5530,14 @@
 
                                   {#if isExpanded}
                                     <div class="mt-2 space-y-1.5">
-                                      {#if nodeProg.progress.files.length === 0}
+                                      {#if nodeProg.progress?.files ?? [].length === 0}
                                         <div
                                           class="text-[11px] font-mono text-exo-light-gray/70"
                                         >
                                           No file details reported.
                                         </div>
                                       {:else}
-                                        {#each nodeProg.progress.files as f}
+                                        {#each nodeProg.progress?.files ?? [] as f}
                                           {@const filePercent = Math.min(
                                             100,
                                             Math.max(0, f.percentage ?? 0),
@@ -5951,12 +6060,15 @@
                 )}
                 {@const allPreviews = filteredPreviews()}
                 {#if selectedModel && allPreviews.length > 0}
-                  {@const downloadStatus = getModelDownloadStatus(
-                    selectedModel.id,
-                  )}
                   {@const tags = modelTags()[selectedModel.id] || []}
                   <div class="space-y-3">
                     {#each allPreviews as apiPreview, i}
+                      {@const downloadStatus = getModelDownloadStatus(
+                        selectedModel.id,
+                        apiPreview.memory_delta_by_node
+                          ? Object.keys(apiPreview.memory_delta_by_node)
+                          : undefined,
+                      )}
                       <div
                         role="group"
                         onmouseenter={() => {
@@ -5999,7 +6111,7 @@
               {/if}
             </div>
           </div>
-        </aside>
+        {/snippet}
       </div>
     {:else}
       <!-- CHAT STATE: Chat + Mini-Map -->
@@ -6212,10 +6324,10 @@
           {/if}
         </div>
 
-        <!-- Right: Mini-Map Sidebar -->
+        <!-- Right: Mini-Map Sidebar - Desktop only -->
         {#if minimized}
           <aside
-            class="w-80 border-l border-exo-yellow/20 bg-exo-dark-gray flex flex-col flex-shrink-0 overflow-y-auto"
+            class="hidden md:flex w-80 border-l border-exo-yellow/20 bg-exo-dark-gray flex-col flex-shrink-0 overflow-y-auto"
             in:fly={{ x: 100, duration: 400, easing: cubicInOut }}
             aria-label="Cluster topology"
           >
@@ -6240,7 +6352,7 @@
               </div>
 
               <div
-                class="relative aspect-square bg-exo-dark-gray rounded-lg overflow-hidden"
+                class="relative aspect-square bg-exo-dark-gray rounded-lg overflow-hidden pointer-events-none"
               >
                 <TopologyGraph
                   highlightedNodes={highlightedNodes()}
@@ -6540,10 +6652,10 @@
                               <div
                                 class="mt-2 space-y-2 max-h-48 overflow-y-auto pr-1"
                               >
-                                {#each downloadInfo.perNode as nodeProg}
+                                {#each downloadInfo.perNode.filter((n) => n.status === "downloading" && n.progress) as nodeProg}
                                   {@const nodePercent = Math.min(
                                     100,
-                                    Math.max(0, nodeProg.progress.percentage),
+                                    Math.max(0, nodeProg.percentage),
                                   )}
                                   {@const isExpanded =
                                     instanceDownloadExpandedNodes.has(
@@ -6602,16 +6714,17 @@
                                       >
                                         <span
                                           >{formatBytes(
-                                            nodeProg.progress.downloadedBytes,
+                                            nodeProg.progress
+                                              ?.downloadedBytes ?? 0,
                                           )} / {formatBytes(
-                                            nodeProg.progress.totalBytes,
+                                            nodeProg.progress?.totalBytes ?? 0,
                                           )}</span
                                         >
                                         <span
                                           >{formatSpeed(
-                                            nodeProg.progress.speed,
+                                            nodeProg.progress?.speed ?? 0,
                                           )} • ETA {formatEta(
-                                            nodeProg.progress.etaMs,
+                                            nodeProg.progress?.etaMs ?? 0,
                                           )}</span
                                         >
                                       </div>
@@ -6619,14 +6732,14 @@
 
                                     {#if isExpanded}
                                       <div class="mt-2 space-y-1.5">
-                                        {#if nodeProg.progress.files.length === 0}
+                                        {#if nodeProg.progress?.files ?? [].length === 0}
                                           <div
                                             class="text-[11px] font-mono text-exo-light-gray/70"
                                           >
                                             No file details reported.
                                           </div>
                                         {:else}
-                                          {#each nodeProg.progress.files as f}
+                                          {#each nodeProg.progress?.files ?? [] as f}
                                             {@const filePercent = Math.min(
                                               100,
                                               Math.max(0, f.percentage ?? 0),

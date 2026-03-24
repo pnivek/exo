@@ -224,6 +224,10 @@ class Router:
             async for topic, data in networked_items:
                 try:
                     logger.trace(f"Sending message on {topic} with payload {data}")
+                    if len(data) > 1024 * 1024:
+                        logger.warning(
+                            "Sending overlarge payload, network performance may be temporarily degraded"
+                        )
                     await self._net.gossipsub_publish(topic, data)
                 except NoPeersSubscribedToTopicError:
                     pass
@@ -263,6 +267,6 @@ def get_node_id_keypair(
 
         # if no valid credentials, create new ones and persist
         with open(path, "w+b") as f:
-            keypair = Keypair.generate_ed25519()
+            keypair = Keypair.generate()
             f.write(keypair.to_bytes())
             return keypair

@@ -73,9 +73,12 @@ def serialize_kv_cache(cache: KVCacheType, last_tokens: mx.array) -> bytes:
     """
     arrays: dict[str, "np.ndarray[Any, Any]"] = {}
     # Track if original dtype was bfloat16 so deserializer can convert back
-    uses_bfloat16 = len(cache) > 0 and cache[0].keys.dtype == mx.bfloat16
+    uses_bfloat16 = len(cache) > 0 and cache[0].keys is not None and cache[0].keys.dtype == mx.bfloat16
 
     for i, c in enumerate(cache):
+        assert c.keys is not None and c.values is not None, (
+            f"Layer {i} has uninitialized KV cache"
+        )
         keys_np: np.ndarray[Any, Any] = _mlx_to_numpy(c.keys)
         values_np: np.ndarray[Any, Any] = _mlx_to_numpy(c.values)
         arrays[f"layer_{i}_keys"] = keys_np
@@ -394,6 +397,7 @@ def extract_kv_delta(
     layer_keys: list["np.ndarray[Any, Any]"] = []
     layer_values: list["np.ndarray[Any, Any]"] = []
     for c in cache:
+        assert c.keys is not None and c.values is not None
         # keys/values shape: [1, n_kv_heads, offset, head_dim]
         k_slice = c.keys[:, :, prev_offset:current_offset, :]
         v_slice = c.values[:, :, prev_offset:current_offset, :]
@@ -457,7 +461,8 @@ def send_precomputed_kv_cache_sync(
     sock = _connect_with_retries(host, port)
 
     # Send header
-    uses_bfloat16 = cache[0].keys is not None and cache[0].keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
+    assert cache[0].keys is not None and cache[0].values is not None
+    uses_bfloat16 = cache[0].keys.dtype == mx.bfloat16
     dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
     cache_n_kv_heads = cache[0].keys.shape[1]
     cache_head_dim = cache[0].keys.shape[3]
@@ -487,7 +492,15 @@ def send_precomputed_kv_cache_sync(
     t_send_start = time.monotonic()
 
     # Capture KV size before we free the cache arrays.
-    kv_size_mb = sum(c.keys.nbytes + c.values.nbytes for c in cache) / 1024 / 1024
+    kv_size_mb = (
+        sum(
+            (c.keys.nbytes if c.keys is not None else 0)
+            + (c.values.nbytes if c.values is not None else 0)
+            for c in cache
+        )
+        / 1024
+        / 1024
+    )
 
     extracted_chunks: list[KVChunkMessage] = []
     for start in range(0, num_tokens, chunk_size):
@@ -641,9 +654,8 @@ def send_kv_cache_pipelined_sync(
 
         # Send header on first chunk (cache keys are now populated)
         if not header_sent:
-            uses_bfloat16 = (
-                cache[0].keys is not None and cache[0].keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
-            )
+            assert cache[0].keys is not None
+            uses_bfloat16 = cache[0].keys.dtype == mx.bfloat16
             dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
             # keys shape: [1, n_kv_heads, offset, head_dim]
             cache_n_kv_heads = cache[0].keys.shape[1]
@@ -704,7 +716,8 @@ def send_kv_cache_pipelined_sync(
 
     # If the header was never sent (e.g. callback never fired), send it now
     if not header_sent:
-        uses_bfloat16 = cache[0].keys is not None and cache[0].keys.dtype == mx.bfloat16  # pyright: ignore[reportUnnecessaryComparison]
+        assert cache[0].keys is not None
+        uses_bfloat16 = cache[0].keys.dtype == mx.bfloat16
         dtype_flag = _DTYPE_BFLOAT16 if uses_bfloat16 else _DTYPE_FLOAT16
         cache_n_kv_heads = cache[0].keys.shape[1]
         cache_head_dim = cache[0].keys.shape[3]

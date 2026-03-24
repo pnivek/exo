@@ -1,7 +1,12 @@
 import asyncio
 
 import pytest
-from exo_pyo3_bindings import Keypair, NetworkingHandle, NoPeersSubscribedToTopicError
+from exo_pyo3_bindings import (
+    Keypair,
+    NetworkingHandle,
+    NoPeersSubscribedToTopicError,
+    PyFromSwarm,
+)
 
 
 @pytest.mark.asyncio
@@ -23,5 +28,9 @@ async def test_sleep_on_multiple_items() -> None:
 
 async def _await_recv(h: NetworkingHandle):
     while True:
-        msg = await h.recv()
-        print(f"PYTHON: received: {msg}")
+        event = await h.recv()
+        match event:
+            case PyFromSwarm.Connection() as c:
+                print(f"PYTHON: connection update: {c}")
+            case PyFromSwarm.Message() as m:
+                print(f"PYTHON: message: {m}")

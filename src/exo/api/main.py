@@ -3,7 +3,7 @@ import contextlib
 import json
 import random
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
@@ -21,17 +21,17 @@ from hypercorn.config import Config
 from hypercorn.typing import ASGIFramework
 from loguru import logger
 
-from exo.master.adapters.chat_completions import (
+from exo.api.adapters.chat_completions import (
     chat_request_to_text_generation,
     collect_chat_response,
     generate_chat_stream,
 )
-from exo.master.adapters.claude import (
+from exo.api.adapters.claude import (
     claude_request_to_text_generation,
     collect_claude_response,
     generate_claude_stream,
 )
-from exo.master.adapters.ollama import (
+from exo.api.adapters.ollama import (
     collect_ollama_chat_response,
     collect_ollama_generate_response,
     generate_ollama_chat_stream,
@@ -39,44 +39,19 @@ from exo.master.adapters.ollama import (
     ollama_generate_request_to_text_generation,
     ollama_request_to_text_generation,
 )
-from exo.master.adapters.responses import (
+from exo.api.adapters.responses import (
     collect_responses_response,
     generate_responses_stream,
     responses_request_to_text_generation,
 )
-from exo.master.event_log import DiskEventLog
-from exo.master.image_store import ImageStore
-from exo.master.placement import (
-    place_disaggregated_instance,
-    place_tensor_prefill_disagg_instance,
-)
-from exo.master.placement import place_instance as get_instance_placements
-from exo.shared.apply import apply
-from exo.shared.constants import (
-    DASHBOARD_DIR,
-    EXO_CACHE_HOME,
-    EXO_EVENT_LOG_DIR,
-    EXO_IMAGE_CACHE_DIR,
-    EXO_MAX_CHUNK_SIZE,
-    EXO_TRACING_CACHE_DIR,
-)
-from exo.shared.election import ElectionMessage
-from exo.shared.logging import InterceptLogger
-from exo.shared.models.model_cards import (
-    ModelCard,
-    ModelId,
-    delete_custom_card,
-    get_model_cards,
-    is_custom_card,
-)
-from exo.shared.tracing import TraceEvent, compute_stats, export_trace, load_trace_file
-from exo.shared.types.api import (
+from exo.api.types import (
     AddCustomModelParams,
     AdvancedImageParams,
     BenchChatCompletionRequest,
     BenchChatCompletionResponse,
     BenchImageGenerationResponse,
     BenchImageGenerationTaskParams,
+    CancelCommandResponse,
     ChatCompletionChoice,
     ChatCompletionMessage,
     ChatCompletionRequest,
@@ -117,6 +92,52 @@ from exo.shared.types.api import (
     TraceStatsResponse,
     normalize_image_size,
 )
+from exo.api.types.claude_api import (
+    ClaudeMessagesRequest,
+    ClaudeMessagesResponse,
+)
+from exo.api.types.ollama_api import (
+    OllamaChatRequest,
+    OllamaChatResponse,
+    OllamaGenerateRequest,
+    OllamaGenerateResponse,
+    OllamaModelDetails,
+    OllamaModelTag,
+    OllamaPsModel,
+    OllamaPsResponse,
+    OllamaShowRequest,
+    OllamaShowResponse,
+    OllamaTagsResponse,
+)
+from exo.api.types.openai_responses import (
+    ResponsesRequest,
+    ResponsesResponse,
+)
+from exo.master.image_store import ImageStore
+from exo.master.placement import (
+    place_disaggregated_instance,
+    place_tensor_prefill_disagg_instance,
+)
+from exo.master.placement import place_instance as get_instance_placements
+from exo.shared.apply import apply
+from exo.shared.constants import (
+    DASHBOARD_DIR,
+    EXO_CACHE_HOME,
+    EXO_EVENT_LOG_DIR,
+    EXO_IMAGE_CACHE_DIR,
+    EXO_MAX_CHUNK_SIZE,
+    EXO_TRACING_CACHE_DIR,
+)
+from exo.shared.election import ElectionMessage
+from exo.shared.logging import InterceptLogger
+from exo.shared.models.model_cards import (
+    ModelCard,
+    ModelId,
+    delete_custom_card,
+    get_model_cards,
+    is_custom_card,
+)
+from exo.shared.tracing import TraceEvent, compute_stats, export_trace, load_trace_file
 from exo.shared.types.chunks import (
     ErrorChunk,
     ImageChunk,
@@ -124,10 +145,6 @@ from exo.shared.types.chunks import (
     PrefillProgressChunk,
     TokenChunk,
     ToolCallChunk,
-)
-from exo.shared.types.claude_api import (
-    ClaudeMessagesRequest,
-    ClaudeMessagesResponse,
 )
 from exo.shared.types.commands import (
     Command,
@@ -154,29 +171,14 @@ from exo.shared.types.events import (
     TracesMerged,
 )
 from exo.shared.types.memory import Memory
-from exo.shared.types.ollama_api import (
-    OllamaChatRequest,
-    OllamaChatResponse,
-    OllamaGenerateRequest,
-    OllamaGenerateResponse,
-    OllamaModelDetails,
-    OllamaModelTag,
-    OllamaPsModel,
-    OllamaPsResponse,
-    OllamaShowRequest,
-    OllamaShowResponse,
-    OllamaTagsResponse,
-)
-from exo.shared.types.openai_responses import (
-    ResponsesRequest,
-    ResponsesResponse,
-)
 from exo.shared.types.state import State
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
 from exo.shared.types.worker.shards import Sharding
 from exo.utils.banner import print_startup_banner
 from exo.utils.channels import Receiver, Sender, channel
+from exo.utils.disk_event_log import DiskEventLog
+from exo.utils.power_sampler import PowerSampler
 from exo.utils.task_group import TaskGroup
 
 _API_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "api"
@@ -326,6 +328,7 @@ class API:
         self.app.get("/images/{image_id}")(self.get_image)
         self.app.post("/v1/messages", response_model=None)(self.claude_messages)
         self.app.post("/v1/responses", response_model=None)(self.openai_responses)
+        self.app.post("/v1/cancel/{command_id}")(self.cancel_command)
 
         # Ollama API
         self.app.head("/ollama/")(self.ollama_version)
@@ -654,6 +657,25 @@ class API:
             instance_id=instance_id,
         )
 
+    async def cancel_command(self, command_id: CommandId) -> CancelCommandResponse:
+        """Cancel an active command by closing its stream and notifying workers."""
+        sender = self._text_generation_queues.get(
+            command_id
+        ) or self._image_generation_queues.get(command_id)
+        if sender is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Command not found or already completed",
+            )
+
+        await self._send(TaskCancelled(cancelled_command_id=command_id))
+        sender.close()
+
+        return CancelCommandResponse(
+            message="Command cancelled.",
+            command_id=command_id,
+        )
+
     async def _token_chunk_stream(
         self, command_id: CommandId
     ) -> AsyncGenerator[
@@ -691,6 +713,7 @@ class API:
     async def _collect_text_generation_with_stats(
         self, command_id: CommandId
     ) -> BenchChatCompletionResponse:
+        sampler = PowerSampler(get_node_system=lambda: self.state.node_system)
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         model: ModelId | None = None
@@ -698,41 +721,46 @@ class API:
 
         stats: GenerationStats | None = None
 
-        async for chunk in self._token_chunk_stream(command_id):
-            if isinstance(chunk, PrefillProgressChunk):
-                continue
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(sampler.run)
 
-            if chunk.finish_reason == "error":
-                raise HTTPException(
-                    status_code=500,
-                    detail=chunk.error_message or "Internal server error",
-                )
+            async for chunk in self._token_chunk_stream(command_id):
+                if isinstance(chunk, PrefillProgressChunk):
+                    continue
 
-            if model is None:
-                model = chunk.model
-
-            if isinstance(chunk, TokenChunk):
-                text_parts.append(chunk.text)
-
-            if isinstance(chunk, ToolCallChunk):
-                tool_calls.extend(
-                    ToolCall(
-                        id=str(uuid4()),
-                        index=i,
-                        function=tool,
+                if chunk.finish_reason == "error":
+                    raise HTTPException(
+                        status_code=500,
+                        detail=chunk.error_message or "Internal server error",
                     )
-                    for i, tool in enumerate(chunk.tool_calls)
-                )
 
-            stats = chunk.stats or stats
+                if model is None:
+                    model = chunk.model
 
-            if chunk.finish_reason is not None:
-                finish_reason = chunk.finish_reason
+                if isinstance(chunk, TokenChunk):
+                    text_parts.append(chunk.text)
+
+                if isinstance(chunk, ToolCallChunk):
+                    tool_calls.extend(
+                        ToolCall(
+                            id=str(uuid4()),
+                            index=i,
+                            function=tool,
+                        )
+                        for i, tool in enumerate(chunk.tool_calls)
+                    )
+
+                stats = chunk.stats or stats
+
+                if chunk.finish_reason is not None:
+                    finish_reason = chunk.finish_reason
+
+            tg.cancel_scope.cancel()
 
         combined_text = "".join(text_parts)
         assert model is not None
 
-        resp = BenchChatCompletionResponse(
+        return BenchChatCompletionResponse(
             id=command_id,
             created=int(time.time()),
             model=model,
@@ -748,8 +776,8 @@ class API:
                 )
             ],
             generation_stats=stats,
+            power_usage=sampler.result(),
         )
-        return resp
 
     async def _trigger_notify_user_to_download_model(self, model_id: ModelId) -> None:
         logger.warning(
@@ -841,7 +869,7 @@ class API:
         return resolved_model
 
     def stream_events(self) -> StreamingResponse:
-        def _generate_json_array(events: Iterator[Event]) -> Iterator[str]:
+        def _generate_json_array(events: Iterable[Event]) -> Iterable[str]:
             yield "["
             first = True
             for event in events:
@@ -1142,10 +1170,18 @@ class API:
         num_images: int,
         response_format: str,
     ) -> BenchImageGenerationResponse:
-        images, stats = await self._collect_image_chunks(
-            request, command_id, num_images, response_format, capture_stats=True
+        sampler = PowerSampler(get_node_system=lambda: self.state.node_system)
+        images: list[ImageData] = []
+        stats: ImageGenerationStats | None = None
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(sampler.run)
+            images, stats = await self._collect_image_chunks(
+                request, command_id, num_images, response_format, capture_stats=True
+            )
+            tg.cancel_scope.cancel()
+        return BenchImageGenerationResponse(
+            data=images, generation_stats=stats, power_usage=sampler.result()
         )
-        return BenchImageGenerationResponse(data=images, generation_stats=stats)
 
     async def bench_image_generations(
         self, request: Request, payload: BenchImageGenerationTaskParams
@@ -1652,26 +1688,42 @@ class API:
     async def search_models(
         self, query: str = "", limit: int = 20
     ) -> list[HuggingFaceSearchResult]:
-        """Search HuggingFace Hub for mlx-community models."""
-        from huggingface_hub import list_models
+        """Search HuggingFace Hub — tries mlx-community first, falls back to all of HuggingFace."""
+        from huggingface_hub import ModelInfo, list_models
 
-        results = list_models(
-            search=query or None,
-            author="mlx-community",
-            sort="downloads",
-            limit=limit,
-        )
-        return [
-            HuggingFaceSearchResult(
-                id=m.id,
-                author=m.author or "",
-                downloads=m.downloads or 0,
-                likes=m.likes or 0,
-                last_modified=str(m.last_modified or ""),
-                tags=list(m.tags or []),
+        def _to_results(models: Iterable[ModelInfo]) -> list[HuggingFaceSearchResult]:
+            return [
+                HuggingFaceSearchResult(
+                    id=m.id,
+                    author=m.author or "",
+                    downloads=m.downloads or 0,
+                    likes=m.likes or 0,
+                    last_modified=str(m.last_modified or ""),
+                    tags=list(m.tags or []),
+                )
+                for m in models
+            ]
+
+        # Search mlx-community first
+        mlx_results = _to_results(
+            list_models(
+                search=query or None,
+                author="mlx-community",
+                sort="downloads",
+                limit=limit,
             )
-            for m in results
-        ]
+        )
+        if mlx_results:
+            return mlx_results
+
+        # Fall back to searching all of HuggingFace
+        return _to_results(
+            list_models(
+                search=query or None,
+                sort="downloads",
+                limit=limit,
+            )
+        )
 
     async def run(self):
         shutdown_ev = anyio.Event()

@@ -5,7 +5,17 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .cache import ArraysCache, KVCache
 from .switch_layers import SwitchGLU
+
+class Qwen3NextRMSNormGated(nn.Module):
+    eps: float
+    weight: mx.array
+
+    def __init__(self, hidden_size: int, eps: float = ...) -> None: ...
+    def __call__(
+        self, hidden_states: mx.array, gate: mx.array | None = None
+    ) -> mx.array: ...
 
 class Qwen3NextMLP(nn.Module):
     gate_proj: nn.Linear
@@ -90,6 +100,8 @@ class Qwen3NextModel(nn.Module):
     embed_tokens: nn.Embedding
     layers: list[Qwen3NextDecoderLayer]
     norm: nn.RMSNorm
+    ssm_idx: int
+    fa_idx: int
 
     def __init__(self, args: Any) -> None: ...
     def __call__(
@@ -112,3 +124,4 @@ class Model(nn.Module):
     def sanitize(self, weights: dict[str, Any]) -> dict[str, Any]: ...
     @property
     def layers(self) -> list[Qwen3NextDecoderLayer]: ...
+    def make_cache(self) -> list[ArraysCache | KVCache]: ...

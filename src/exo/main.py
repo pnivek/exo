@@ -12,9 +12,9 @@ from loguru import logger
 from pydantic import PositiveInt
 
 import exo.routing.topics as topics
+from exo.api.main import API
 from exo.download.coordinator import DownloadCoordinator
 from exo.download.impl_shard_downloader import exo_shard_downloader
-from exo.master.api import API  # TODO: should API be in master?
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
 from exo.routing.router import Router, get_node_id_keypair
@@ -207,6 +207,17 @@ class Node:
                 # - Shutdown and re-create the worker
                 # - Shut down and re-create the API
 
+                if result.is_new_master:
+                    await anyio.sleep(0)
+                    self.event_router.shutdown()
+                    self.event_router = EventRouter(
+                        result.session_id,
+                        self.router.sender(topics.COMMANDS),
+                        self.router.receiver(topics.GLOBAL_EVENTS),
+                        self.router.sender(topics.LOCAL_EVENTS),
+                    )
+                    self._tg.start_soon(self.event_router.run)
+
                 if (
                     result.session_id.master_node_id == self.node_id
                     and self.master is not None
@@ -296,11 +307,17 @@ def main():
     mp.set_start_method("spawn", force=True)
     # TODO: Refactor the current verbosity system
     logger_setup(EXO_LOG, args.verbosity)
-    logger.info("Starting EXO")
+    logger.info(f"{'=' * 40}")
+    logger.info(f"Starting EXO | pid={os.getpid()}")
+    logger.info(f"{'=' * 40}")
     logger.info(f"EXO_LIBP2P_NAMESPACE: {os.getenv('EXO_LIBP2P_NAMESPACE')}")
 
     if args.offline:
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
+
+    if args.no_batch:
+        os.environ["EXO_NO_BATCH"] = "1"
+        logger.info("Continuous batching disabled (--no-batch)")
 
     # Set FAST_SYNCH override env var for runner subprocesses
     if args.fast_synch is True:
@@ -344,6 +361,7 @@ class Args(CamelCaseModel):
     no_worker: bool = False
     no_downloads: bool = False
     offline: bool = os.getenv("EXO_OFFLINE", "false").lower() == "true"
+    no_batch: bool = False
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
     listen_port: int = 0  # 0 = OS-assigned random port
     dial: list[str] = []
@@ -398,6 +416,11 @@ class Args(CamelCaseModel):
             action="store_true",
             default=os.getenv("EXO_OFFLINE", "false").lower() == "true",
             help="Run in offline/air-gapped mode: skip internet checks, use only pre-staged local models",
+        )
+        parser.add_argument(
+            "--no-batch",
+            action="store_true",
+            help="Disable continuous batching, use sequential generation",
         )
         fast_synch_group = parser.add_mutually_exclusive_group()
         fast_synch_group.add_argument(

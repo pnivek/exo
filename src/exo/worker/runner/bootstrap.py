@@ -1,5 +1,6 @@
 import atexit
 import os
+import resource
 from pathlib import Path
 
 import loguru
@@ -63,6 +64,9 @@ def entrypoint(
     global logger
     logger = _logger
 
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(max(soft, 2048), hard), hard))
+
     def _cleanup_gpu() -> None:
         """Release GPU memory on runner exit (runs even on unhandled exceptions)."""
         try:
@@ -106,11 +110,19 @@ def entrypoint(
     # Import main after setting global logger - this lets us just import logger from this module
     try:
         if bound_instance.is_image_model:
-            from exo.worker.runner.image_models.runner import main
-        else:
-            from exo.worker.runner.llm_inference.runner import main
+            from exo.worker.runner.image_models.runner import Runner as ImageRunner
 
-        main(bound_instance, event_sender, task_receiver, cancel_receiver)
+            runner = ImageRunner(
+                bound_instance, event_sender, task_receiver, cancel_receiver
+            )
+            runner.main()
+        else:
+            from exo.worker.runner.llm_inference.runner import Runner
+
+            runner = Runner(
+                bound_instance, event_sender, task_receiver, cancel_receiver
+            )
+            runner.main()
 
     except ClosedResourceError:
         logger.warning("Runner communication closed unexpectedly")

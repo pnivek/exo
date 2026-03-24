@@ -4,15 +4,8 @@ from collections.abc import AsyncGenerator
 from itertools import count
 from typing import Any
 
-from exo.shared.types.api import Usage
-from exo.shared.types.chunks import (
-    ErrorChunk,
-    PrefillProgressChunk,
-    TokenChunk,
-    ToolCallChunk,
-)
-from exo.shared.types.common import CommandId
-from exo.shared.types.openai_responses import (
+from exo.api.types import Usage
+from exo.api.types.openai_responses import (
     FunctionCallInputItem,
     ResponseCompletedEvent,
     ResponseContentPart,
@@ -42,7 +35,18 @@ from exo.shared.types.openai_responses import (
     ResponseTextDoneEvent,
     ResponseUsage,
 )
-from exo.shared.types.text_generation import InputMessage, TextGenerationTaskParams
+from exo.shared.types.chunks import (
+    ErrorChunk,
+    PrefillProgressChunk,
+    TokenChunk,
+    ToolCallChunk,
+)
+from exo.shared.types.common import CommandId
+from exo.shared.types.text_generation import (
+    InputMessage,
+    TextGenerationTaskParams,
+    resolve_reasoning_params,
+)
 
 
 def _format_sse(event: ResponsesStreamEvent) -> str:
@@ -119,6 +123,33 @@ def responses_request_to_text_generation(
         )
         built_chat_template = chat_template_messages if chat_template_messages else None
 
+    effort_from_reasoning = request.reasoning.effort if request.reasoning else None
+    resolved_effort, resolved_thinking = resolve_reasoning_params(
+        effort_from_reasoning, request.enable_thinking
+    )
+
+    # The responses API often does not provide tool args nested under a "function" field.
+    # Since we follow the chat completions format of tools in the backend (for MLX chat templates)
+    # we need to normalise to this format.
+    normalised_tools: list[dict[str, Any]] | None = None
+    if request.tools:
+        normalised_tools = []
+        for tool in request.tools:
+            if "function" in tool:
+                normalised_tools.append(tool)
+            else:
+                normalised_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool.get("name", ""),
+                            "description": tool.get("description", ""),
+                            "parameters": tool.get("parameters", {}),
+                            **({"strict": tool["strict"]} if "strict" in tool else {}),
+                        },
+                    }
+                )
+
     return TextGenerationTaskParams(
         model=request.model,
         input=input_value,
@@ -127,11 +158,13 @@ def responses_request_to_text_generation(
         temperature=request.temperature,
         top_p=request.top_p,
         stream=request.stream,
-        tools=request.tools,
+        tools=normalised_tools,
         top_k=request.top_k,
         stop=request.stop,
         seed=request.seed,
         chat_template_messages=built_chat_template or request.chat_template_messages,
+        reasoning_effort=resolved_effort,
+        enable_thinking=resolved_thinking,
     )
 
 

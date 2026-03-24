@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.shared.types.common import CommandId, NodeId
 from exo.shared.types.memory import Memory
+from exo.shared.types.text_generation import ReasoningEffort
 from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
 from exo.shared.types.worker.shards import Sharding, ShardMetadata
 from exo.utils.pydantic_ext import CamelCaseModel
@@ -171,8 +172,22 @@ class ImageGenerationStats(BaseModel):
     peak_memory_usage: Memory
 
 
+class NodePowerStats(BaseModel, frozen=True):
+    node_id: NodeId
+    samples: int
+    avg_sys_power: float
+
+
+class PowerUsage(BaseModel, frozen=True):
+    elapsed_seconds: float
+    nodes: list[NodePowerStats]
+    total_avg_sys_power_watts: float
+    total_energy_joules: float
+
+
 class BenchChatCompletionResponse(ChatCompletionResponse):
     generation_stats: GenerationStats | None = None
+    power_usage: PowerUsage | None = None
 
 
 class StreamOptions(BaseModel):
@@ -198,7 +213,11 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = None
     top_k: int | None = None
     tools: list[dict[str, Any]] | None = None
+    reasoning_effort: ReasoningEffort | None = None
     enable_thinking: bool | None = None
+    min_p: float | None = None
+    repetition_penalty: float | None = None
+    repetition_context_size: int | None = None
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
     user: str | None = None
@@ -260,6 +279,11 @@ class DeleteInstanceResponse(BaseModel):
     message: str
     command_id: CommandId
     instance_id: InstanceId
+
+
+class CancelCommandResponse(BaseModel):
+    message: str
+    command_id: CommandId
 
 
 ImageSize = Literal[
@@ -371,6 +395,7 @@ class ImageGenerationResponse(BaseModel):
 
 class BenchImageGenerationResponse(ImageGenerationResponse):
     generation_stats: ImageGenerationStats | None = None
+    power_usage: PowerUsage | None = None
 
 
 class ImageListItem(BaseModel, frozen=True):

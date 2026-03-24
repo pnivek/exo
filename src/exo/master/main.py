@@ -5,7 +5,6 @@ import anyio
 from anyio import BrokenResourceError
 from loguru import logger
 
-from exo.master.event_log import DiskEventLog
 from exo.master.placement import (
     add_instance_to_placements,
     cancel_unnecessary_downloads,
@@ -80,6 +79,7 @@ from exo.shared.types.worker.instances import (
     TensorPrefillDisaggInstance,
 )
 from exo.utils.channels import Receiver, Sender
+from exo.utils.disk_event_log import DiskEventLog
 from exo.utils.event_buffer import MultiSourceBuffer
 from exo.utils.task_group import TaskGroup
 
@@ -472,6 +472,10 @@ class Master:
                                             task_id=task.paired_task_id,
                                         )
                                     )
+                            else:
+                                logger.warning(
+                                    f"Nonexistent command {command.cancelled_command_id} cancelled"
+                                )
                         case TaskFinished():
                             if (
                                 task_id := self.command_task_mapping.pop(
@@ -491,6 +495,11 @@ class Master:
                                             task_id=finished_task.paired_task_id
                                         )
                                     )
+                            else:
+                                logger.warning(
+                                    f"Finished command {command.finished_command_id} finished"
+                                )
+
                         case RequestEventLog():
                             # We should just be able to send everything, since other buffers will ignore old messages
                             # rate limit to 1000 at a time
