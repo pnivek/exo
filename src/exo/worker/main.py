@@ -11,7 +11,7 @@ from loguru import logger
 from exo.api.types import ImageEditsTaskParams
 from exo.download.download_utils import resolve_model_in_path
 from exo.shared.apply import apply
-from exo.shared.models.model_cards import ModelId
+from exo.shared.models.model_cards import ModelId, add_to_card_cache, delete_custom_card
 from exo.shared.types.commands import (
     ForwarderCommand,
     ForwarderDownloadCommand,
@@ -20,6 +20,8 @@ from exo.shared.types.commands import (
 from exo.shared.types.common import CommandId, NodeId, SystemId
 from exo.shared.types.events import (
     ChunkGenerated,
+    CustomModelCardAdded,
+    CustomModelCardDeleted,
     Event,
     IndexedEvent,
     InputChunkReceived,
@@ -171,6 +173,14 @@ class Worker:
                     self.input_chunk_buffer[cmd_id][raw.chunk.chunk_index] = (
                         raw.chunk.data
                     )
+
+                # Handle custom model card sync
+                if isinstance(raw, CustomModelCardAdded):
+                    await raw.model_card.save_to_custom_dir()
+                    add_to_card_cache(raw.model_card)
+
+                if isinstance(raw, CustomModelCardDeleted):
+                    await delete_custom_card(raw.model_id)
 
                 # Wake plan_step for state-mutating events
                 if not isinstance(raw, self._PASSTHROUGH_EVENTS):

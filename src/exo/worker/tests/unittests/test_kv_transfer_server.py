@@ -6,7 +6,7 @@ Verifies that:
 - Server port stays open between requests
 """
 
-# pyright: reportPrivateUsage=false, reportAny=false, reportUnknownMemberType=false
+# pyright: reportPrivateUsage=false, reportAny=false, reportUnknownMemberType=false, reportOptionalMemberAccess=false, reportOptionalSubscript=false, reportUnknownArgumentType=false
 # ruff: noqa: E402
 import socket
 import struct

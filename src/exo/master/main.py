@@ -17,7 +17,9 @@ from exo.master.placement import (
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_EVENT_LOG_DIR, EXO_TRACING_ENABLED
 from exo.shared.types.commands import (
+    AddCustomModelCard,
     CreateInstance,
+    DeleteCustomModelCard,
     DeleteInstance,
     ForwarderCommand,
     ForwarderDownloadCommand,
@@ -33,6 +35,8 @@ from exo.shared.types.commands import (
 )
 from exo.shared.types.common import CommandId, NodeId, SessionId, SystemId
 from exo.shared.types.events import (
+    CustomModelCardAdded,
+    CustomModelCardDeleted,
     Event,
     GlobalForwarderEvent,
     IndexedEvent,
@@ -425,6 +429,7 @@ class Master:
                                     self.state.instances,
                                     self.state.node_memory,
                                     self.state.node_network,
+                                    download_status=self.state.downloads,
                                 )
                             transition_events = get_transition_events(
                                 self.state.instances, placement, self.state.tasks
@@ -500,6 +505,14 @@ class Master:
                                     f"Finished command {command.finished_command_id} finished"
                                 )
 
+                        case AddCustomModelCard():
+                            generated_events.append(
+                                CustomModelCardAdded(model_card=command.model_card)
+                            )
+                        case DeleteCustomModelCard():
+                            generated_events.append(
+                                CustomModelCardDeleted(model_id=command.model_id)
+                            )
                         case RequestEventLog():
                             # We should just be able to send everything, since other buffers will ignore old messages
                             # rate limit to 1000 at a time
