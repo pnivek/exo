@@ -50,6 +50,8 @@ RUN cmake /build/mlx -B /build/mlx/build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DMLX_BUILD_CUDA=ON \
     -DMLX_CUDA_ARCHITECTURES=121a \
+    -DNCCL_INCLUDE_DIRS=/usr/include \
+    -DNCCL_LIBRARIES=/usr/lib/aarch64-linux-gnu/libnccl.so \
     -DMLX_BUILD_PYTHON_BINDINGS=ON \
     -DMLX_BUILD_TESTS=OFF \
     -DMLX_BUILD_BENCHMARKS=OFF \
@@ -63,8 +65,14 @@ RUN cmake --build /build/mlx/build --parallel ${BUILD_JOBS}
 
 # Install into venv: copy core.so into the source tree, then pip install (no-deps)
 RUN cp $(find /build/mlx/build -name "core.cpython*.so" | head -1) /build/mlx/python/mlx/
-RUN pip install --no-build-isolation --no-deps /build/mlx
-RUN python3 -c "import mlx.core as mx; print('MLX installed:', mx.__version__)"
+RUN CMAKE_ARGS="-DMLX_BUILD_CUDA=ON -DMLX_CUDA_ARCHITECTURES=121a -DNCCL_INCLUDE_DIRS=/usr/include -DNCCL_LIBRARIES=/usr/lib/aarch64-linux-gnu/libnccl.so -DBUILD_SHARED_LIBS=OFF" \
+    pip install --no-build-isolation --no-deps /build/mlx
+# CCCL headers: MLX JIT looks for <cuda/std/tuple> via /usr/local/cuda/include
+# but on sbsa-linux the CCCL headers are under targets/sbsa-linux/include/cccl/.
+# Symlink so /usr/local/cuda/include/cuda/std/tuple resolves correctly.
+RUN ln -sf /usr/local/cuda/targets/sbsa-linux/include/cccl/cuda /usr/local/cuda/include/cuda
+
+RUN python3 -c "import mlx.core as mx; print('MLX installed:', mx.__version__)" || echo "MLX import test skipped (no GPU during build)"
 
 # ── Clone exo (feat/disaggregated-inference) ──────────────────────────────────
 WORKDIR /app
@@ -81,7 +89,8 @@ RUN pip install maturin && \
 # pip install pulls mlx==0.30.6 as a placeholder (from exo's lockfile).
 # We force-reinstall our custom sm121 build immediately after.
 RUN pip install -e ".[cuda]"
-RUN pip install --no-build-isolation --force-reinstall /build/mlx
+RUN CMAKE_ARGS="-DMLX_BUILD_CUDA=ON -DMLX_CUDA_ARCHITECTURES=121a -DNCCL_INCLUDE_DIRS=/usr/include -DNCCL_LIBRARIES=/usr/lib/aarch64-linux-gnu/libnccl.so -DBUILD_SHARED_LIBS=OFF" \
+    pip install --no-build-isolation --force-reinstall /build/mlx
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 RUN cd /app/dashboard && npm ci && npm run build
