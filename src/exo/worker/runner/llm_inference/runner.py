@@ -428,7 +428,7 @@ class Runner:
 
     def _handle_disagg_prefill(self, task: DisaggPrefill) -> None:
         """Handle disaggregated prefill: prefill on this node, send KV cache to decode node."""
-        assert isinstance(self.generator, SequentialGenerator)
+        assert isinstance(self.generator, (SequentialGenerator, BatchGenerator))
         logger.info(f"received disaggregated prefill request: {task}")
         self.update_status(RunnerRunning())
         self.acknowledge_task(task)
@@ -525,7 +525,7 @@ class Runner:
 
     def _handle_tp_disagg_prefill(self, task: TensorParallelDisaggPrefill) -> None:
         """Handle tensor-parallel disaggregated prefill."""
-        assert isinstance(self.generator, SequentialGenerator)
+        assert isinstance(self.generator, (SequentialGenerator, BatchGenerator))
         logger.info(f"received tensor-parallel disagg prefill request: {task}")
         self.update_status(RunnerRunning())
         self.acknowledge_task(task)
@@ -667,7 +667,7 @@ class Runner:
 
     def _handle_disagg_decode(self, task: DisaggDecode) -> None:
         """Handle disaggregated decode: receive KV cache and generate tokens."""
-        assert isinstance(self.generator, SequentialGenerator)
+        assert isinstance(self.generator, (SequentialGenerator, BatchGenerator))
         logger.info(
             f"received disaggregated decode request, waiting for KV cache on port {task.kv_transfer_port}"
         )
