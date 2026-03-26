@@ -19,6 +19,7 @@ services:
       - HF_TOKEN=[[HF_TOKEN]]
       - MLX_CUDA_GRAPH_CACHE_SIZE=3000
       - EXO_MODELS_PATH=/models
+      - NCCL_NET=IB
     # Override ENTRYPOINT args per-node — set these in .env or via Komodo env vars:
     # LISTEN_PORT, DIAL_ADDR
     command: >

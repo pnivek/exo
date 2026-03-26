@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.13 python3.13-venv python3.13-dev python3-pip \
     libopenblas-dev liblapack-dev liblapacke-dev libgfortran5 \
     libnccl2 libnccl-dev \
+    libibverbs1 libibverbs-dev rdma-core \
     libcudnn9-cuda-13 libcudnn9-dev-cuda-13 \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
