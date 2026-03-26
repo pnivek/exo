@@ -74,6 +74,7 @@ from exo.worker.engines.mlx.cache import KVPrefixCache
 from exo.worker.engines.mlx.utils_mlx import (
     initialize_mlx,
     load_mlx_items,
+    mx_barrier,
 )
 from exo.worker.runner.bootstrap import logger
 from exo.worker.runner.llm_inference.batch_generator import (
@@ -577,6 +578,11 @@ class Runner:
                 else 0.7,
             )
 
+            # Sync NCCL state before prefill — upstream's warmup_inference
+            # added an all_gather that advances the NCCL op counter. Without
+            # this barrier, ranks can desync across consecutive requests.
+            mx_barrier(group)
+
             t_prefill_start = time.monotonic()
             for _ in stream_generate(
                 model=inference_model,
@@ -609,6 +615,10 @@ class Runner:
             logger.info(
                 f"DISAGG_TIMING tp_kv_gather_ms={(t_gather_end - t_gather_start) * 1000:.1f}"
             )
+
+            # Sync after gather — ensure both ranks finish before
+            # sender/non-sender paths diverge
+            mx_barrier(group)
 
             instance = self.bound_instance.instance
             is_kv_sender = (
