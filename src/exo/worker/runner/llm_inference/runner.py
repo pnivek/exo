@@ -638,6 +638,11 @@ class Runner:
             # Use per-layer streaming for gpt_oss models (streams each layer's
             # KV as soon as it completes, overlapping network with compute).
             # Fall back to per-chunk pipelining for other model types.
+            logger.info(
+                f"DisaggPrefill: model type={type(inference_model).__module__}.{type(inference_model).__name__}, "
+                f"GptOssModel={GptOssModel.__module__}.{GptOssModel.__name__}, "
+                f"isinstance={isinstance(inference_model, GptOssModel)}"
+            )
             if isinstance(inference_model, GptOssModel):
                 prefill_tps, num_tokens = send_kv_cache_per_layer_sync(
                     host=task.decode_node_host,
@@ -708,6 +713,11 @@ class Runner:
         tokenizer = self.generator.tokenizer
         group = self.generator.group
         assert group is not None, "TP prefill requires distributed group"
+        logger.info(
+            f"TPDisaggPrefill: model type={type(inference_model).__module__}.{type(inference_model).__name__}, "
+            f"GptOssModel={GptOssModel.__module__}.{GptOssModel.__name__}, "
+            f"isinstance={isinstance(inference_model, GptOssModel)}"
+        )
 
         try:
             from mlx_lm.models.cache import KVCache as PlainKVCache

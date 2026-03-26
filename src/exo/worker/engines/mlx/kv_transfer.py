@@ -1439,6 +1439,9 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
         if frame_type == _FRAME_END:
             break
 
+        if frame_type == _FRAME_ERROR:
+            raise ConnectionError("Prefill node sent error frame (_FRAME_ERROR): prefill failed")
+
         if frame_type == _FRAME_LAST_TOKENS:
             n_tokens_data = _recvall(conn, 4)
             n_tokens: int = struct.unpack("!I", n_tokens_data)[0]  # pyright: ignore[reportAny]
