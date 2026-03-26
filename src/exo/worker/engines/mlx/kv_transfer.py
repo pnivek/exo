@@ -627,12 +627,17 @@ def send_kv_cache_per_layer_sync(
     ):
         t_layer_start = time.monotonic()
 
+        # Flush previous layer's deferred KV extraction at the top of
+        # each iteration — this overlaps CPU extraction with GPU work
+        # regardless of how many chunks this layer needs.
+        if pending_extract is not None:
+            _flush_pending_extract()
+
         # Process tokens in chunks through this single layer, mirroring
         # mlx_lm's _prefill pattern but one layer at a time.
         chunk_outputs: list[mx.array] = []
         remaining = x
 
-        first_chunk_of_layer = True
         while remaining.shape[1] > 0:
             n = min(step, remaining.shape[1])
             x_chunk: mx.array = remaining[:, :n, :]
@@ -655,13 +660,6 @@ def send_kv_cache_per_layer_sync(
             mx.eval(x_chunk, c.state)  # pyright: ignore[reportArgumentType]
             chunk_outputs.append(x_chunk)
 
-            # After the first chunk of this layer is evaluated, the GPU is
-            # idle momentarily — overlap by extracting the previous layer's
-            # KV (pure CPU work) before the next mx.eval.
-            if first_chunk_of_layer and pending_extract is not None:
-                _flush_pending_extract()
-                first_chunk_of_layer = False
-
         # Reassemble full sequence for next layer
         if len(chunk_outputs) == 1:
             x = chunk_outputs[0]
@@ -669,7 +667,6 @@ def send_kv_cache_per_layer_sync(
             x = mx.concatenate(chunk_outputs, axis=1)
             mx.eval(x)
         del chunk_outputs
-        mx.clear_cache()
 
         t_layer_end = time.monotonic()
         logger.info(
@@ -856,11 +853,15 @@ def send_kv_cache_per_layer_tp_sync(
     for layer_idx, (layer, c, layer_type) in enumerate(
         zip(inner_model.layers, cache, layer_types, strict=True)
     ):
+        # Flush previous layer's deferred KV extraction at the top —
+        # overlaps CPU extraction with GPU work regardless of chunk count.
+        if pending_extract is not None:
+            _flush_pending_extract()
+
         # Process tokens in chunks through this single layer
         chunk_outputs: list[mx.array] = []
         remaining = x
 
-        first_chunk_of_layer = True
         while remaining.shape[1] > 0:
             n = min(step, remaining.shape[1])
             x_chunk: mx.array = remaining[:, :n, :]
@@ -879,11 +880,6 @@ def send_kv_cache_per_layer_tp_sync(
             mx.eval(x_chunk, c.state)  # pyright: ignore[reportArgumentType]
             chunk_outputs.append(x_chunk)
 
-            # Overlap: flush previous layer's extract during GPU idle
-            if first_chunk_of_layer and pending_extract is not None:
-                _flush_pending_extract()
-                first_chunk_of_layer = False
-
         # Reassemble full sequence for next layer
         if len(chunk_outputs) == 1:
             x = chunk_outputs[0]
@@ -891,7 +887,6 @@ def send_kv_cache_per_layer_tp_sync(
             x = mx.concatenate(chunk_outputs, axis=1)
             mx.eval(x)
         del chunk_outputs
-        mx.clear_cache()
 
         if error_event.is_set():
             break
