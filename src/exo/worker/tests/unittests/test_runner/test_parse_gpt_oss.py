@@ -251,4 +251,3 @@ class TestParseGptOssMaxTokensTruncation:
         # due to Harmony encoding, so we just check something was emitted)
         all_text = "".join(r.text for r in gen_responses)
         assert len(all_text) > 0
-
