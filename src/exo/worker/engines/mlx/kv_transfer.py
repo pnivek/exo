@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any, Callable
 
 import mlx.core as mx
 import numpy as np
@@ -553,7 +553,6 @@ def send_kv_cache_per_layer_sync(
     from mlx_lm.models.base import (
         create_attention_mask,  # pyright: ignore[reportUnknownVariableType]
     )
-    from mlx_lm.models.gpt_oss import GptOssMoeModel
 
     from exo.worker.engines.mlx.auto_parallel import set_pipeline_prefill
 
@@ -580,16 +579,22 @@ def send_kv_cache_per_layer_sync(
 
     # --- Per-layer prefill with chunking ---
     # Access model internals to iterate layer-by-layer.
-    inner_model = cast(GptOssMoeModel, model.model)
+    # inner_model exposes .layers, .embed_tokens, and optionally
+    # .layer_types / .window_size.  Typed as Any since the concrete
+    # type varies across model families (LlamaModel, Qwen3Model, etc.).
+    inner_model: Any = getattr(model, "model", model)
 
     # Embed tokens and materialize (needed before slicing into chunks)
-    x = inner_model.embed_tokens(prompt_tokens[None])
+    x: mx.array = inner_model.embed_tokens(prompt_tokens[None])  # pyright: ignore[reportAny]
     mx.eval(x)
 
     # Determine dtype and send KVPS header after first layer populates cache
     header_sent = False
 
-    layer_types: list[str] = cast(list[str], inner_model.layer_types)
+    _raw_layer_types: list[str] | None = getattr(inner_model, "layer_types", None)  # pyright: ignore[reportAny]
+    _n_layers: int = len(inner_model.layers)  # pyright: ignore[reportAny]
+    layer_types: list[str] = _raw_layer_types or ["full_attention"] * _n_layers
+    window_size: int | None = getattr(inner_model, "window_size", None)  # pyright: ignore[reportAny]
 
     # Deferred extraction state: after computing layer N, we defer its KV
     # extraction until layer N+1's first chunk is submitted to the GPU.
@@ -622,8 +627,8 @@ def send_kv_cache_per_layer_sync(
             logger.warning(f"Per-layer KV enqueue timed out for layer {p_layer_idx}")
             error_event.set()
 
-    for layer_idx, (layer, c, layer_type) in enumerate(
-        zip(inner_model.layers, cache, layer_types, strict=True)
+    for layer_idx, (layer, c, layer_type) in enumerate(  # pyright: ignore[reportAny]
+        zip(inner_model.layers, cache, layer_types, strict=True)  # pyright: ignore[reportAny]
     ):
         t_layer_start = time.monotonic()
 
@@ -636,7 +641,7 @@ def send_kv_cache_per_layer_sync(
         # Process tokens in chunks through this single layer, mirroring
         # mlx_lm's _prefill pattern but one layer at a time.
         chunk_outputs: list[mx.array] = []
-        remaining = x
+        remaining: mx.array = x
 
         while remaining.shape[1] > 0:
             n = min(step, remaining.shape[1])
@@ -646,16 +651,16 @@ def send_kv_cache_per_layer_sync(
             # Create mask for this chunk using current cache state —
             # cache.offset grows as each chunk is appended, so the mask
             # correctly allows attending to previously-processed chunks.
-            if layer_type == "full_attention":
-                mask = create_attention_mask(x_chunk, c)
+            if layer_type == "full_attention" or window_size is None:
+                mask: Any = create_attention_mask(x_chunk, c)  # pyright: ignore[reportUnknownVariableType]
             else:
-                mask = create_attention_mask(
+                mask = create_attention_mask(  # pyright: ignore[reportUnknownVariableType]
                     x_chunk,
                     c,
-                    window_size=inner_model.window_size,
+                    window_size=window_size,
                 )
 
-            x_chunk = layer(x_chunk, mask, c)
+            x_chunk = layer(x_chunk, mask, c)  # pyright: ignore[reportAny]
             # Materialize both the layer output and KV cache for this chunk
             mx.eval(x_chunk, c.state)  # pyright: ignore[reportArgumentType]
             chunk_outputs.append(x_chunk)
@@ -780,7 +785,6 @@ def send_kv_cache_per_layer_tp_sync(
     from mlx_lm.models.base import (
         create_attention_mask,  # pyright: ignore[reportUnknownVariableType]
     )
-    from mlx_lm.models.gpt_oss import GptOssMoeModel
 
     from exo.worker.engines.mlx.auto_parallel import set_pipeline_prefill
 
@@ -808,14 +812,17 @@ def send_kv_cache_per_layer_tp_sync(
     t_prefill_start = time.monotonic()
 
     # --- Per-layer prefill with chunking + NCCL all_gather ---
-    inner_model = cast(GptOssMoeModel, model.model)
+    inner_model: Any = getattr(model, "model", model)
 
     # Embed tokens and materialize
-    x = inner_model.embed_tokens(prompt_tokens[None])
+    x: mx.array = inner_model.embed_tokens(prompt_tokens[None])  # pyright: ignore[reportAny]
     mx.eval(x)
 
     header_sent = False
-    layer_types: list[str] = cast(list[str], inner_model.layer_types)
+    _raw_layer_types: list[str] | None = getattr(inner_model, "layer_types", None)  # pyright: ignore[reportAny]
+    _n_layers: int = len(inner_model.layers)  # pyright: ignore[reportAny]
+    layer_types: list[str] = _raw_layer_types or ["full_attention"] * _n_layers
+    window_size: int | None = getattr(inner_model, "window_size", None)  # pyright: ignore[reportAny]
 
     # Deferred extraction state: after gathering layer N, we defer extraction
     # until layer N+1's first chunk is evaluating on the GPU.
@@ -850,8 +857,8 @@ def send_kv_cache_per_layer_tp_sync(
             logger.warning(f"Per-layer TP KV enqueue timed out for layer {p_layer_idx}")
             error_event.set()
 
-    for layer_idx, (layer, c, layer_type) in enumerate(
-        zip(inner_model.layers, cache, layer_types, strict=True)
+    for layer_idx, (layer, c, layer_type) in enumerate(  # pyright: ignore[reportAny]
+        zip(inner_model.layers, cache, layer_types, strict=True)  # pyright: ignore[reportAny]
     ):
         # Flush previous layer's deferred KV extraction at the top —
         # overlaps CPU extraction with GPU work regardless of chunk count.
@@ -860,23 +867,23 @@ def send_kv_cache_per_layer_tp_sync(
 
         # Process tokens in chunks through this single layer
         chunk_outputs: list[mx.array] = []
-        remaining = x
+        remaining: mx.array = x
 
         while remaining.shape[1] > 0:
             n = min(step, remaining.shape[1])
             x_chunk: mx.array = remaining[:, :n, :]
             remaining = remaining[:, n:, :]
 
-            if layer_type == "full_attention":
-                mask = create_attention_mask(x_chunk, c)
+            if layer_type == "full_attention" or window_size is None:
+                mask: Any = create_attention_mask(x_chunk, c)  # pyright: ignore[reportUnknownVariableType]
             else:
-                mask = create_attention_mask(
+                mask = create_attention_mask(  # pyright: ignore[reportUnknownVariableType]
                     x_chunk,
                     c,
-                    window_size=inner_model.window_size,
+                    window_size=window_size,
                 )
 
-            x_chunk = layer(x_chunk, mask, c)
+            x_chunk = layer(x_chunk, mask, c)  # pyright: ignore[reportAny]
             mx.eval(x_chunk, c.state)  # pyright: ignore[reportArgumentType]
             chunk_outputs.append(x_chunk)
 
@@ -1440,7 +1447,9 @@ def _receive_pipelined(conn: socket.socket) -> tuple[list[KVCache], mx.array]:
             break
 
         if frame_type == _FRAME_ERROR:
-            raise ConnectionError("Prefill node sent error frame (_FRAME_ERROR): prefill failed")
+            raise ConnectionError(
+                "Prefill node sent error frame (_FRAME_ERROR): prefill failed"
+            )
 
         if frame_type == _FRAME_LAST_TOKENS:
             n_tokens_data = _recvall(conn, 4)

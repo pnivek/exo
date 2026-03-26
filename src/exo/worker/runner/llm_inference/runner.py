@@ -88,6 +88,20 @@ from .batch_generator import Cancelled, Finished
 from .tool_parsers import make_mlx_parser
 
 
+def _is_gpt_oss_model(model: object) -> bool:
+    """Check if model is a gpt_oss Model, robust to module path mismatches.
+
+    In containers, mlx_lm may be installed via a different path than the
+    host, causing ``isinstance(model, GptOssModel)`` to return False even
+    though it's the same class.  Fall back to checking the module name.
+    """
+    if isinstance(model, GptOssModel):
+        return True
+    module = type(model).__module__ or ""
+    name = type(model).__name__
+    return "gpt_oss" in module and name == "Model"
+
+
 def _align_received_caches(
     model: Model,
     received_caches: list[Any],
@@ -615,7 +629,7 @@ class Runner:
             # decode node's first generated token is the channel
             # name, not a protocol marker that MoE routing
             # divergence might corrupt.
-            if isinstance(inference_model, GptOssModel):
+            if _is_gpt_oss_model(inference_model):
                 all_prompt_tokens = mx.concatenate(
                     [
                         all_prompt_tokens,
@@ -635,15 +649,21 @@ class Runner:
             last_tokens = all_prompt_tokens[-reprefill:]
             t_pipelined_start = time.monotonic()
 
-            # Use per-layer streaming for gpt_oss models (streams each layer's
-            # KV as soon as it completes, overlapping network with compute).
-            # Fall back to per-chunk pipelining for other model types.
-            logger.info(
-                f"DisaggPrefill: model type={type(inference_model).__module__}.{type(inference_model).__name__}, "
-                f"GptOssModel={GptOssModel.__module__}.{GptOssModel.__name__}, "
-                f"isinstance={isinstance(inference_model, GptOssModel)}"
+            # Per-layer streaming is the default: streams each layer's KV
+            # as it completes, overlapping network with GPU compute.
+            # Set EXO_DISAGG_PER_CHUNK=1 to force the old per-chunk path.
+            inner: object | None = getattr(inference_model, "model", None)
+            use_per_layer = (
+                inner is not None
+                and hasattr(inner, "layers")
+                and hasattr(inner, "embed_tokens")
+                and os.environ.get("EXO_DISAGG_PER_CHUNK") != "1"
             )
-            if isinstance(inference_model, GptOssModel):
+            logger.info(
+                f"DisaggPrefill: model={type(inference_model).__module__}.{type(inference_model).__name__}, "
+                f"use_per_layer={use_per_layer}, is_gpt_oss={_is_gpt_oss_model(inference_model)}"
+            )
+            if use_per_layer:
                 prefill_tps, num_tokens = send_kv_cache_per_layer_sync(
                     host=task.decode_node_host,
                     port=task.decode_node_port,
@@ -714,9 +734,8 @@ class Runner:
         group = self.generator.group
         assert group is not None, "TP prefill requires distributed group"
         logger.info(
-            f"TPDisaggPrefill: model type={type(inference_model).__module__}.{type(inference_model).__name__}, "
-            f"GptOssModel={GptOssModel.__module__}.{GptOssModel.__name__}, "
-            f"isinstance={isinstance(inference_model, GptOssModel)}"
+            f"TPDisaggPrefill: model={type(inference_model).__module__}.{type(inference_model).__name__}, "
+            f"is_gpt_oss={_is_gpt_oss_model(inference_model)}"
         )
 
         try:
@@ -735,7 +754,7 @@ class Runner:
             prompt = apply_chat_template(tokenizer, task.task_params)
             all_prompt_tokens = encode_prompt(tokenizer, prompt)
 
-            if isinstance(inference_model, GptOssModel):
+            if _is_gpt_oss_model(inference_model):
                 all_prompt_tokens = mx.concatenate(
                     [
                         all_prompt_tokens,
@@ -776,7 +795,7 @@ class Runner:
             prefill_tps, num_tokens = send_kv_cache_per_layer_tp_sync(
                 host=task.decode_node_host,
                 port=task.decode_node_port,
-                model=cast(Model, inference_model),
+                model=inference_model,
                 tokenizer=tokenizer,
                 prompt_tokens=all_prompt_tokens[:-1],
                 last_tokens=last_tokens,
@@ -917,7 +936,7 @@ class Runner:
                 )
             )
 
-            if isinstance(inference_model, GptOssModel):
+            if _is_gpt_oss_model(inference_model):
 
                 def _prepend_channel(
                     stream: Generator[GenerationResponse | None, None, None],
@@ -942,7 +961,7 @@ class Runner:
             parsed: Generator[
                 GenerationResponse | ToolCallResponse | None, None, None
             ] = gen
-            if isinstance(inference_model, GptOssModel):
+            if _is_gpt_oss_model(inference_model):
                 parsed = parse_gpt_oss(gen)
 
             t_first_token: float | None = None
