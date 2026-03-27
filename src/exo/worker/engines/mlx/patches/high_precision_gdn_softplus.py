@@ -23,5 +23,8 @@ def patch_gdn_softplus() -> None:
     for mod in list(sys.modules.values()):
         if mod is gated_delta:
             continue
-        if getattr(mod, "compute_g", None) is compute_g:
-            object.__setattr__(mod, "compute_g", _compute_g_f32)
+        try:
+            if getattr(mod, "compute_g", None) is compute_g:
+                object.__setattr__(mod, "compute_g", _compute_g_f32)
+        except (ImportError, ModuleNotFoundError):
+            continue
