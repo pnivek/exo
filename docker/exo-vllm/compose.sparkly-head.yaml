@@ -1,0 +1,52 @@
+# exo + vLLM disaggregated inference — Sparkly (prefill head node)
+#
+# Phase 1: Single Spark prefill + Mac decode
+#   - Sparkly runs exo with VllmBuilder (in-process vLLM engine)
+#   - Mac runs exo natively with MLX decode
+#   - KV cache streamed over TCP from Sparkly to Mac
+#
+# Image: exo-vllm (built from docker/exo-vllm/Dockerfile on top of eugr's vllm-node)
+# Deploy via Komodo on sparkly (192.168.0.172)
+
+services:
+  exo-vllm:
+    image: 192.168.0.181:5000/pnivek/exo-vllm:latest
+    container_name: exo_vllm_sparkly
+    restart: "no"
+    privileged: true
+    network_mode: host
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      # Model caches (shared with standalone vLLM stacks)
+      - /root/.cache/huggingface:/root/.cache/huggingface
+      - /root/.cache/vllm:/root/.cache/vllm
+      - /root/.cache/flashinfer:/root/.cache/flashinfer
+      - /root/.triton:/root/.triton
+      # eugr mods (chat template fixes, etc.)
+      - /etc/komodo/repos/eugr/spark-vllm-docker:/workspace/spark-vllm-docker:ro
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      # NCCL networking (RDMA between Sparks via enp1s0f0np0)
+      - NCCL_IGNORE_CPU_AFFINITY=1
+      - NCCL_SOCKET_IFNAME=enp1s0f0np0
+      - NCCL_IB_HCA=rocep1s0f0
+      - NCCL_IB_DISABLE=0
+      - GLOO_SOCKET_IFNAME=enp1s0f0np0
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "=== exo-vllm sparkly (prefill head) ==="
+        # Apply model-specific patches from eugr
+        cd /workspace/spark-vllm-docker/mods/fix-qwen3.5-chat-template && bash run.sh || true
+        cd /workspace/exo
+        exec python3 -m exo \
+          --listen-port 55001 \
+          --dial /ip4/192.168.0.100/tcp/55000 \
+          -v
