@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
 # Build the exo-vllm Docker image on a DGX Spark.
 #
-# Prerequisites:
-#   1. Copy FlashInfer wheels from eugr into docker/exo-vllm/wheels/:
-#      cp /etc/komodo/repos/eugr/spark-vllm-docker/wheels/flashinfer_*.whl docker/exo-vllm/wheels/
-#
-#   2. Build the dashboard on a machine with Node.js:
-#      cd dashboard && npm ci && npm run build && cd ..
-#
 # Run from the exo repo root:
 #   bash docker/exo-vllm/build.sh
 #
@@ -27,26 +20,20 @@ VLLM_REF="${VLLM_REF:-main}"
 NO_PUSH="${NO_PUSH:-0}"
 
 FULL_TAG="${REGISTRY}/pnivek/exo-vllm:${TAG}"
-
-# Check FlashInfer wheels exist
 WHEELS_DIR="docker/exo-vllm/wheels"
-if [ ! -d "$WHEELS_DIR" ] || [ -z "$(ls $WHEELS_DIR/flashinfer_*.whl 2>/dev/null)" ]; then
-    echo "FlashInfer wheels not found in $WHEELS_DIR/"
-    echo ""
-    echo "Copying from eugr's spark-vllm-docker..."
-    mkdir -p "$WHEELS_DIR"
-    cp /etc/komodo/repos/eugr/spark-vllm-docker/wheels/flashinfer_*.whl "$WHEELS_DIR/" 2>/dev/null || {
-        echo "ERROR: Could not find FlashInfer wheels."
-        echo "Copy them manually: cp /etc/komodo/repos/eugr/spark-vllm-docker/wheels/flashinfer_*.whl $WHEELS_DIR/"
-        exit 1
-    }
-    echo "Copied FlashInfer wheels."
-fi
+EUGR_WHEELS="/etc/komodo/repos/eugr/spark-vllm-docker/wheels"
 
-# Check dashboard is built
-if [ ! -d "dashboard/build" ]; then
-    echo "WARNING: dashboard/build not found. The image will not have the web UI."
-    echo "Build it first: cd dashboard && npm ci && npm run build && cd .."
+# Copy FlashInfer wheels from eugr if not already present
+mkdir -p "$WHEELS_DIR"
+if [ ! -f "$WHEELS_DIR/.copied" ]; then
+    if [ -d "$EUGR_WHEELS" ] && ls "$EUGR_WHEELS"/flashinfer_*.whl 1>/dev/null 2>&1; then
+        echo "Copying FlashInfer wheels from eugr..."
+        cp "$EUGR_WHEELS"/flashinfer_*.whl "$WHEELS_DIR/"
+        touch "$WHEELS_DIR/.copied"
+    else
+        echo "WARNING: eugr FlashInfer wheels not found at $EUGR_WHEELS"
+        echo "FlashInfer will be installed from PyPI (may need to compile)."
+    fi
 fi
 
 echo "============================================"
@@ -60,6 +47,7 @@ echo ""
 docker build \
   --build-arg "EXO_BASE=${EXO_BASE}" \
   --build-arg "VLLM_REF=${VLLM_REF}" \
+  --build-arg "BUILD_JOBS=16" \
   -t "${FULL_TAG}" \
   -f docker/exo-vllm/Dockerfile \
   .
