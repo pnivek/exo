@@ -69,10 +69,10 @@ def _patch_vllm_for_connector(connector_class: type[Any]) -> None:  # pyright: i
     original_get = factory.KVConnectorFactory._get_connector_class_with_compat  # type: ignore
 
     @classmethod
-    def patched_get(cls: Any, kv_transfer_config: Any) -> tuple[Any, Any]:  # pyright: ignore[reportAny]
+    def patched_get(cls: Any, kv_transfer_config: Any) -> tuple[Any, bool]:  # pyright: ignore[reportAny]
         kv_conn = getattr(kv_transfer_config, "kv_connector", None) or ""  # pyright: ignore[reportAny]
         if "streaming_connector" in kv_conn or "batch_connector" in kv_conn:
-            return connector_class, None
+            return connector_class, False
         return original_get.__func__(cls, kv_transfer_config)  # type: ignore
 
     factory.KVConnectorFactory._get_connector_class_with_compat = patched_get  # pyright: ignore[reportUnknownMemberType]
