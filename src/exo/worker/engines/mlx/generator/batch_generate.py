@@ -361,7 +361,7 @@ class ExoBatchGenerator:
 
         _step_elapsed = time.perf_counter() - _step_tic
         _overhead = _step_elapsed - _next_elapsed
-        if self._mlx_gen._next_count % 64 == 0 and responses:
+        if getattr(self._mlx_gen, "_next_count", 0) % 64 == 0 and responses:
             logger.debug(
                 f"step overhead: {_overhead * 1000:.2f}ms (next={_next_elapsed * 1000:.2f}ms total={_step_elapsed * 1000:.2f}ms)"
             )
