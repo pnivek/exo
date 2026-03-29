@@ -25,19 +25,15 @@ ARG TORCH_CUDA_ARCH_LIST="12.1a"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
-# ── Install FlashInfer from eugr's pre-built wheels ───────────────────────────
-# These are py3-none (pure Python) and cp39-abi3 (stable ABI) — work on 3.13.
-# eugr's wheels are at /etc/komodo/repos/eugr/spark-vllm-docker/wheels/ on Sparks.
-# The build script (or Komodo pre_build) copies them into the build context.
-# Fallback: install from PyPI if wheels dir doesn't exist.
+# ── Install FlashInfer ─────────────────────────────────────────────────────────
+# eugr has pre-built wheels but the cubin wheel fails pip 26's strict validation.
+# Install flashinfer_python (pure Python) and flashinfer_jit_cache (abi3) from
+# local wheels. Skip flashinfer_cubin — FlashInfer JIT-compiles kernels on first
+# run and caches them at /root/.cache/flashinfer (volume-mounted from host).
 COPY docker/exo-vllm/wheels/ /tmp/wheels/
-RUN if ls /tmp/wheels/flashinfer_*.whl 1>/dev/null 2>&1; then \
-        echo "Installing FlashInfer from local wheels" && \
-        pip install /tmp/wheels/flashinfer_*.whl; \
-    else \
-        echo "No local FlashInfer wheels, installing from PyPI..." && \
-        pip install flashinfer; \
-    fi && rm -rf /tmp/wheels
+RUN pip install /tmp/wheels/flashinfer_python-*.whl /tmp/wheels/flashinfer_jit_cache-*.whl 2>/dev/null || \
+    pip install flashinfer && \
+    rm -rf /tmp/wheels
 
 # ── Build vLLM from source for Python 3.13 ────────────────────────────────────
 # We clone upstream vLLM and build. eugr's pre-built wheel is cp312 only.
