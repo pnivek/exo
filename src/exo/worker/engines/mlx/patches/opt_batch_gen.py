@@ -153,6 +153,8 @@ def _fast_next(self: BatchGenerator) -> list[BatchGenerator.Response]:
             _pending_topk_val = None
             _pending_selected_lps = None
 
+    if not hasattr(self, "_next_count"):
+        self._next_count = 0
     self._next_count += 1
     if self._next_count % 512 == 0:
         mx.clear_cache()
