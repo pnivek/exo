@@ -64,10 +64,11 @@ RUN pip install \
     "apache-tvm-ffi<0.2"
 
 # ── Update exo source to disaggregated-inference-leo branch ───────────────────
+# The base exo-spark image has exo installed at /app with dashboard already built.
+# We overlay our updated source files on top.
 WORKDIR /app
 COPY src/ src/
 COPY pyproject.toml .
-COPY dashboard/build/ dashboard/build/
 # Re-install exo (in case deps changed) — skip Rust rebuild (already installed)
 RUN pip install --no-deps -e . 2>/dev/null || true
 
