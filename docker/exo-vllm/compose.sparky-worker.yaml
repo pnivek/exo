@@ -1,13 +1,13 @@
-# exo + vLLM disaggregated inference — Sparky (prefill worker node)
+# exo-vllm disaggregated inference — Sparky (prefill worker)
 #
-# For TP-disagg mode: 2x Spark tensor-parallel prefill + Mac decode.
-# Only needed when the model is too large for a single Spark.
+# Second Spark for tensor-parallel prefill (2x GPU across Sparks).
+# Only needed for models too large for a single Spark.
 #
-# Image: exo-vllm (built from docker/exo-vllm/Dockerfile on top of eugr's vllm-node)
-# Deploy via Komodo on sparky (192.168.0.112)
+# Image: exo-vllm (exo-spark + vLLM + FlashInfer, Python 3.13)
+# Deploy via Komodo on Sparky (192.168.0.112)
 
 services:
-  exo-vllm:
+  exo:
     image: 192.168.0.181:5000/pnivek/exo-vllm:latest
     container_name: exo_vllm_sparky
     restart: "no"
@@ -21,29 +21,33 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    devices:
+      - /dev/infiniband:/dev/infiniband
     volumes:
-      # Model caches (shared with standalone vLLM stacks)
       - /root/.cache/huggingface:/root/.cache/huggingface
       - /root/.cache/vllm:/root/.cache/vllm
       - /root/.cache/flashinfer:/root/.cache/flashinfer
       - /root/.triton:/root/.triton
-      # eugr mods
+      - /root/.local/share/exo/models:/root/.local/share/exo/models
       - /etc/komodo/repos/eugr/spark-vllm-docker:/workspace/spark-vllm-docker:ro
+      - /dev/infiniband:/dev/infiniband
     environment:
       - HF_TOKEN=${HF_TOKEN}
-      # NCCL networking (RDMA between Sparks via enp1s0f0np0)
+      - VLLM_ENABLE_V1_MULTIPROCESSING=0
+      - VLLM_KV_CACHE_LAYOUT=NHD
+      - FASTSAFETENSORS_NOGDS=1
+      - MLX_CUDA_GRAPH_CACHE_SIZE=3000
       - NCCL_IGNORE_CPU_AFFINITY=1
       - NCCL_SOCKET_IFNAME=enp1s0f0np0
       - NCCL_IB_HCA=rocep1s0f0
       - NCCL_IB_DISABLE=0
+      - NCCL_IB_GID_INDEX=3
+      - NCCL_DEBUG=WARN
       - GLOO_SOCKET_IFNAME=enp1s0f0np0
+      - LISTEN_PORT=${LISTEN_PORT}
+      - DIAL_ADDR=${DIAL_ADDR}
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        echo "=== exo-vllm sparky (prefill worker) ==="
         cd /workspace/spark-vllm-docker/mods/fix-qwen3.5-chat-template && bash run.sh || true
-        cd /workspace/exo
-        exec python3 -m exo \
-          --listen-port 55002 \
-          --dial /ip4/192.168.0.172/tcp/55001 \
-          -v
+        exec python3 -m exo --listen-port $LISTEN_PORT --dial $DIAL_ADDR -v
