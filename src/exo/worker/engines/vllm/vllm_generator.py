@@ -590,10 +590,12 @@ def load_vllm_engine(
             model_config = json.load(f)
         text_config = model_config.get("text_config", model_config)
         has_mamba = "mamba_ssm_dtype" in text_config or "linear_attention" in (text_config.get("layer_types") or [])
-    if is_nvfp4 and not has_mamba:
-        backends = ["FLASHINFER", "FLASH_ATTN", "TRITON_ATTN"]
-    else:
+    # Always try FLASHINFER first — it's the most optimized for Spark.
+    # Fall back through FLASH_ATTN and TRITON_ATTN.
+    if has_mamba:
         backends = ["FLASH_ATTN", "TRITON_ATTN"]
+    else:
+        backends = ["FLASHINFER", "FLASH_ATTN", "TRITON_ATTN"]
 
     engine: LLMEngine | None = None
     for backend in backends:
