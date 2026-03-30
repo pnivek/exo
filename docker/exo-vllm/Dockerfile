@@ -33,8 +33,9 @@ COPY src/ src/
 COPY pyproject.toml README.md ./
 COPY dashboard/ dashboard/
 COPY resources/ resources/
-# Override requires-python so pip doesn't reject on 3.12
-RUN sed -i 's/requires-python = ">=3.13"/requires-python = ">=3.12"/' pyproject.toml
+# Override requires-python and ensure README exists (uv_build needs it)
+RUN sed -i 's/requires-python = ">=3.13"/requires-python = ">=3.12"/' pyproject.toml && \
+    touch README.md
 
 # Install exo (must not fail silently)
 RUN pip install uv_build && pip install --no-deps -e .
