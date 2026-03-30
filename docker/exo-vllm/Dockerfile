@@ -16,7 +16,7 @@ ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential pkg-config libssl-dev protobuf-compiler \
     cmake ninja-build python3-dev \
-    libopenblas-dev liblapack-dev \
+    libopenblas-dev liblapack-dev liblapacke-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Rust toolchain ─────────────────────────────────────────────────────────────
@@ -43,7 +43,7 @@ RUN CUDNN_INCLUDE=$(python3 -c "import nvidia.cudnn; print(nvidia.cudnn.__path__
     -DMLX_BUILD_BENCHMARKS=OFF \
     -DMLX_BUILD_EXAMPLES=OFF \
     -DBUILD_SHARED_LIBS=OFF \
-    -DLAPACK_INCLUDE_DIRS=/usr/include/aarch64-linux-gnu \
+    -DLAPACK_INCLUDE_DIRS=/usr/include \
     && cmake --build build --parallel ${BUILD_JOBS}
 
 RUN cp $(find build -name "core.cpython*.so" | head -1) python/mlx/ && \
