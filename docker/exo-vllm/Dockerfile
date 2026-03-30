@@ -1,22 +1,50 @@
 # exo-vllm: exo on top of eugr's vllm-node (NO vLLM compilation needed)
 #
 # eugr's image already has vLLM 0.18 + FlashInfer + PyTorch + CUDA for GB10.
-# We just add exo (Rust bindings + Python package) on top.
-# Python 3.12 (from eugr's image) works fine — exo has no 3.13-only features.
+# We add: exo (Rust bindings + Python), MLX (built from source for CUDA),
+# and the dashboard.
 
 ARG VLLM_BASE=192.168.0.181:5000/pnivek/vllm-node:latest
 FROM ${VLLM_BASE}
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG BUILD_JOBS=16
+ENV MAX_JOBS=${BUILD_JOBS}
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
 
-# ── System deps for Rust build ─────────────────────────────────────────────────
+# ── System deps ────────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential pkg-config libssl-dev protobuf-compiler \
+    cmake ninja-build python3-dev \
+    libopenblas-dev liblapack-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Rust toolchain ─────────────────────────────────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
+
+# ── Build MLX from source (PyPI mlx-cuda packages lack core.so) ───────────────
+WORKDIR /build/mlx
+RUN pip install nanobind scikit-build-core && \
+    git clone --depth=1 https://github.com/ml-explore/mlx.git .
+
+RUN cmake . -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DMLX_BUILD_CUDA=ON \
+    -DMLX_CUDA_ARCHITECTURES=121a \
+    -DNCCL_INCLUDE_DIRS=/usr/include \
+    -DNCCL_LIBRARIES=/usr/lib/aarch64-linux-gnu/libnccl.so \
+    -DMLX_BUILD_PYTHON_BINDINGS=ON \
+    -DMLX_BUILD_TESTS=OFF \
+    -DMLX_BUILD_BENCHMARKS=OFF \
+    -DMLX_BUILD_EXAMPLES=OFF \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DLAPACK_INCLUDE_DIRS=/usr/include/aarch64-linux-gnu \
+    && cmake --build build --parallel ${BUILD_JOBS}
+
+RUN cp $(find build -name "core.cpython*.so" | head -1) python/mlx/ && \
+    pip install --no-build-isolation --no-deps . && \
+    python3 -c "import mlx.core as mx; print('MLX:', mx.__version__)"
 
 # ── Build exo Rust bindings (libp2p networking) ───────────────────────────────
 WORKDIR /workspace/exo
@@ -33,14 +61,12 @@ COPY src/ src/
 COPY pyproject.toml README.md ./
 COPY dashboard/ dashboard/
 COPY resources/ resources/
-# Override requires-python and ensure README exists (uv_build needs it)
 RUN sed -i 's/requires-python = ">=3.13"/requires-python = ">=3.12"/' pyproject.toml && \
     touch README.md
 
-# Install exo (must not fail silently)
 RUN pip install uv_build && pip install --no-deps -e .
 
-# Install remaining deps (some may not be available on 3.12/aarch64, that's OK)
+# Install remaining deps
 RUN pip install \
       "anyio==4.11.0" \
       "aiofiles>=24.1.0" \
@@ -50,7 +76,6 @@ RUN pip install \
       "hypercorn>=0.18.0" \
       "tomlkit>=0.14.0" \
       "zstandard>=0.23.0" \
-      "mlx-cuda-13==0.30.6" \
       "mlx-lm>=0.30" \
       2>/dev/null || true
 
