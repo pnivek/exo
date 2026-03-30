@@ -25,7 +25,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN pip install maturin && \
     cd rust/exo_pyo3_bindings && \
     maturin build --release -i python3 && \
-    pip install target/wheels/*.whl
+    pip install /workspace/exo/target/wheels/*.whl
 
 # ── Install exo Python package ────────────────────────────────────────────────
 COPY src/ src/
