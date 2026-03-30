@@ -603,7 +603,7 @@ def load_vllm_engine(
                 served_model_name=str(model_id),
                 gpu_memory_utilization=0.05,
                 trust_remote_code=trust_remote_code,
-                load_format="fastsafetensors",
+                load_format=os.environ.get("VLLM_LOAD_FORMAT", "safetensors"),
                 enable_prefix_caching=False,
                 attention_backend=backend,
                 compilation_config={"cudagraph_mode": "none"},
