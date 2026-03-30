@@ -34,7 +34,7 @@ services:
       - /dev/infiniband:/dev/infiniband
     environment:
       - HF_TOKEN=${HF_TOKEN}
-      - VLLM_ENABLE_V1_MULTIPROCESSING=0
+      - VLLM_ENABLE_V1_MULTIPROCESSING=1
       - VLLM_KV_CACHE_LAYOUT=NHD
       - FASTSAFETENSORS_NOGDS=1
       - MLX_CUDA_GRAPH_CACHE_SIZE=3000

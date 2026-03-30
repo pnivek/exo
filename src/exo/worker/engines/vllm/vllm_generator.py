@@ -592,28 +592,44 @@ def load_vllm_engine(
         has_mamba = "mamba_ssm_dtype" in text_config or "linear_attention" in (text_config.get("layer_types") or [])
     # Backend selection strategy:
     #
-    # With VLLM_ENABLE_V1_MULTIPROCESSING=1 (the default for VllmInstance), vLLM
-    # forks the EngineCore into a subprocess.  Triton JIT, CUDA graph capture and
-    # FlashInfer autotune all work correctly in the forked subprocess.  We therefore
-    # use FLASH_ATTN on SM10+/SM12+ (Hopper/Blackwell) because it is pre-compiled
-    # and avoids any FlashInfer wheel compatibility questions, while still getting
-    # full CUDA-graph performance via enforce_eager=False.
+    # CRITICAL: Do NOT call torch.cuda.get_device_capability() or any other CUDA
+    # runtime API here.  Any CUDA runtime call (including _lazy_init) creates a
+    # CUDA context in the parent process.  vLLM detects this via
+    # torch.cuda.is_initialized() and overrides VLLM_WORKER_MULTIPROC_METHOD to
+    # 'spawn'.  With spawn, each subprocess re-imports Python modules and creates
+    # independent module-level objects — the cross-process multiprocessing.SimpleQueue
+    # used for KV streaming is NOT inherited and the IPC breaks silently.
     #
-    # IMPORTANT: Do NOT retry backends in the same process. If a backend init fails
-    # it can corrupt CUDA state for subsequent attempts. Use a single backend
-    # determined upfront.
+    # To query GPU compute capability without creating a CUDA context, use nvidia-smi.
+    # vLLM will then default to 'fork', which inherits open file descriptors (the
+    # SimpleQueue's pipe) and makes cross-process KV streaming work correctly.
+    #
+    # Backend choice: FLASHINFER for all standard models (supports attention sinks,
+    # sliding window, full CUDA graphs).  FLASH_ATTN only for Mamba/hybrid models.
+    # Do NOT use FLASH_ATTN for standard attention: it rejects models that use
+    # attention sinks (e.g., gpt-oss-120b), causing a hard ValueError at engine init.
+    import subprocess as _subprocess
     import torch as _torch
 
-    gpu_major = _torch.cuda.get_device_capability(0)[0] if _torch.cuda.is_available() else 0
-    # SM12+ = Blackwell; SM10+ = Hopper+
-    use_flash_attn = gpu_major >= 10
-    if use_flash_attn:
+    gpu_major = 0
+    if _torch.cuda.is_available():
+        try:
+            _r = _subprocess.run(
+                ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5,
+            )
+            _cap = _r.stdout.strip().split("\n")[0].strip() if _r.returncode == 0 else ""
+            gpu_major = int(_cap.split(".")[0]) if _cap else 0
+            logger.info(f"nvidia-smi compute capability: {_cap} (major={gpu_major})")
+        except Exception as _e:
+            logger.warning(f"nvidia-smi query failed: {_e}")
+
+    if has_mamba:
         attention_backend = "FLASH_ATTN"
-        logger.info(f"SM{gpu_major}x GPU: using FLASH_ATTN backend")
-    elif has_mamba:
-        attention_backend = "FLASH_ATTN"
+        logger.info("Mamba model: using FLASH_ATTN backend")
     else:
         attention_backend = "FLASHINFER"
+        logger.info(f"SM{gpu_major}x GPU: using FLASHINFER backend (supports attention sinks)")
 
     engine_args = EngineArgs(
         model=model_path,
