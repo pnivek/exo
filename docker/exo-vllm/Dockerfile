@@ -1,100 +1,64 @@
-# exo-vllm: exo on top of eugr's vllm-node (NO vLLM compilation needed)
+# exo-vllm: Start from exo-spark (Python 3.13, MLX, exo, Rust bindings all working)
+# and add vLLM + FlashInfer on top.
 #
-# eugr's image already has vLLM 0.18 + FlashInfer + PyTorch + CUDA for GB10.
-# We add: exo (Rust bindings + Python), MLX (built from source for CUDA),
-# and the dashboard.
+# exo-spark already has: Python 3.13, custom MLX CUDA (SM121a), exo + Rust bindings,
+# PyTorch 2.11+cu130, NCCL, dashboard — all proven working.
+# We just need to add: vLLM (built from source for 3.13) + FlashInfer wheels.
 
-ARG VLLM_BASE=192.168.0.181:5000/pnivek/vllm-node:latest
-FROM ${VLLM_BASE}
+ARG EXO_BASE=192.168.0.181:5000/pnivek/exo-spark:latest
+FROM ${EXO_BASE}
 
-ARG DEBIAN_FRONTEND=noninteractive
 ARG BUILD_JOBS=16
 ENV MAX_JOBS=${BUILD_JOBS}
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
 
-# ── System deps ────────────────────────────────────────────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl build-essential pkg-config libssl-dev protobuf-compiler \
-    cmake ninja-build python3-dev \
-    libopenblas-dev liblapack-dev liblapacke-dev \
-    && rm -rf /var/lib/apt/lists/*
+ARG TORCH_CUDA_ARCH_LIST="12.1a"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
-# ── Rust toolchain ─────────────────────────────────────────────────────────────
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
+# ── Install FlashInfer from eugr's pre-built wheels ───────────────────────────
+# py3-none and cp39-abi3 wheels work on Python 3.13
+COPY docker/exo-vllm/wheels/ /tmp/wheels/
+RUN pip install /tmp/wheels/flashinfer_python-*.whl /tmp/wheels/flashinfer_jit_cache-*.whl 2>/dev/null || \
+    pip install flashinfer && \
+    rm -rf /tmp/wheels
 
-# ── Build MLX from source (PyPI mlx-cuda packages lack core.so) ───────────────
-WORKDIR /build/mlx
-RUN pip install nanobind scikit-build-core && \
-    git clone --depth=1 https://github.com/ml-explore/mlx.git .
+# ── Build vLLM from source for Python 3.13 ────────────────────────────────────
+WORKDIR /build/vllm
+ARG VLLM_REF=v0.18.1
+RUN echo "Building vLLM at ref: ${VLLM_REF}" && \
+    git clone https://github.com/vllm-project/vllm.git . && \
+    git checkout ${VLLM_REF} && \
+    git submodule update --init --recursive
 
-RUN CUDNN_INCLUDE=$(python3 -c "import nvidia.cudnn; print(nvidia.cudnn.__path__[0] + '/include')") && \
-    CUDNN_LIB_DIR=$(python3 -c "import nvidia.cudnn; print(nvidia.cudnn.__path__[0] + '/lib')") && \
-    cmake . -B build -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DMLX_BUILD_CUDA=ON \
-    -DMLX_CUDA_ARCHITECTURES=121a \
-    -DNCCL_INCLUDE_DIRS=/usr/include \
-    -DNCCL_LIBRARIES=/usr/lib/aarch64-linux-gnu/libnccl.so \
-    -DCUDNN_INCLUDE_PATH=${CUDNN_INCLUDE} \
-    -DCUDNN_LIBRARY_PATH=${CUDNN_LIB_DIR} \
-    -DMLX_BUILD_PYTHON_BINDINGS=ON \
-    -DMLX_BUILD_TESTS=OFF \
-    -DMLX_BUILD_BENCHMARKS=OFF \
-    -DMLX_BUILD_EXAMPLES=OFF \
-    -DBUILD_SHARED_LIBS=OFF \
-    -DLAPACK_INCLUDE_DIRS=/usr/include \
-    && cmake --build build --parallel ${BUILD_JOBS}
+RUN python3 use_existing_torch.py && \
+    sed -i "/flashinfer/d" requirements/cuda.txt && \
+    sed -i '/^triton\b/d' requirements/cuda.txt && \
+    pip install -r requirements/build.txt
 
-RUN cp $(find build -name "core.cpython*.so" | head -1) python/mlx/ && \
-    pip install --no-build-isolation --no-deps . && \
-    python3 -c "import mlx.core as mx; print('MLX:', mx.__version__)"
+RUN pip install --no-build-isolation -e . 2>&1 | tail -5
 
-# ── Build exo Rust bindings (libp2p networking) ───────────────────────────────
-WORKDIR /workspace/exo
-COPY rust/ rust/
-COPY Cargo.toml Cargo.lock ./
-RUN pip install maturin && \
-    sed -i 's/requires-python = ">=3.13"/requires-python = ">=3.12"/' rust/exo_pyo3_bindings/pyproject.toml && \
-    cd rust/exo_pyo3_bindings && \
-    maturin build --release -i python3 && \
-    pip install /workspace/exo/target/wheels/*.whl
+# ── Additional runtime deps ───────────────────────────────────────────────────
+RUN pip install \
+    "ray[default]" \
+    "fastsafetensors>=0.1.10" \
+    "apache-tvm-ffi<0.2" \
+    2>/dev/null || true
 
-# ── Install exo Python package ────────────────────────────────────────────────
+# ── Update exo source to disaggregated-inference-leo branch ───────────────────
+WORKDIR /app
 COPY src/ src/
 COPY pyproject.toml README.md ./
-COPY dashboard/ dashboard/
-COPY resources/ resources/
-RUN sed -i 's/requires-python = ">=3.13"/requires-python = ">=3.12"/' pyproject.toml && \
-    touch README.md
+RUN pip install --no-deps -e . 2>/dev/null || true
 
-RUN pip install uv_build && pip install --no-deps -e .
-
-# Install remaining deps
-RUN pip install \
-      "anyio==4.11.0" \
-      "aiofiles>=24.1.0" \
-      "aiohttp>=3.12" \
-      "types-aiofiles>=24.1.0" \
-      "rustworkx>=0.17.1" \
-      "hypercorn>=0.18.0" \
-      "tomlkit>=0.14.0" \
-      "zstandard>=0.23.0" \
-      "mlx-lm>=0.30" \
-      2>/dev/null || true
-
-# ── Dashboard ──────────────────────────────────────────────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm && \
-    cd /workspace/exo && npm --prefix dashboard install && npm --prefix dashboard run build && \
-    apt-get remove -y nodejs npm && apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/*
-
-# ── Runtime env ────────────────────────────────────────────────────────────────
+# ── vLLM environment ──────────────────────────────────────────────────────────
 ENV VLLM_ENABLE_V1_MULTIPROCESSING=0
 ENV VLLM_KV_CACHE_LAYOUT=NHD
 ENV FASTSAFETENSORS_NOGDS=1
 ENV MLX_CUDA_GRAPH_CACHE_SIZE=3000
 
+# Tiktoken encodings
+RUN python3 -c "import tiktoken; tiktoken.get_encoding('o200k_base'); tiktoken.get_encoding('cl100k_base')" 2>/dev/null || true
+
 EXPOSE 52415 52416 55000 55001 55002
-WORKDIR /workspace/exo
 ENTRYPOINT ["python3", "-m", "exo"]
