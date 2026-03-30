@@ -590,45 +590,59 @@ def load_vllm_engine(
             model_config = json.load(f)
         text_config = model_config.get("text_config", model_config)
         has_mamba = "mamba_ssm_dtype" in text_config or "linear_attention" in (text_config.get("layer_types") or [])
-    # Always try FLASHINFER first — it's the most optimized for Spark.
-    # Fall back through FLASH_ATTN and TRITON_ATTN.
-    if has_mamba:
-        backends = ["FLASH_ATTN", "TRITON_ATTN"]
+    # Backend selection strategy:
+    #
+    # All backends (FLASHINFER, FLASH_ATTN, TRITON_ATTN) fail on SM121a (Blackwell
+    # GB10) when torch.compile warmup is enabled, because Triton JIT raises
+    # "Triton Error [CUDA]: initialization error" inside vLLM's kernel_warmup.
+    #
+    # With enforce_eager=True, torch.compile and CUDA graph warmup are skipped.
+    # FLASH_ATTN (FlashAttention2 pre-compiled kernels) works reliably in eager mode.
+    #
+    # IMPORTANT: Do NOT retry backends in the same process. Trying FLASHINFER first
+    # and catching its failure corrupts CUDA state for subsequent FLASH_ATTN attempts
+    # (because LLMEngine partially initializes CUDA before failing). Use a single
+    # backend determined upfront.
+    #
+    # For SM12.x (Blackwell) and SM10.x (Hopper+) we use FLASH_ATTN with
+    # enforce_eager. For other architectures we try FLASHINFER first (requires a
+    # fresh process for each attempt — the retry loop is intentionally skipped here).
+    import torch as _torch
+
+    gpu_major = _torch.cuda.get_device_capability(0)[0] if _torch.cuda.is_available() else 0
+    # SM12+ = Blackwell; SM10+ = Hopper+ (SM10/11 also have Triton JIT issues in-process)
+    use_eager_flash_attn = gpu_major >= 10
+    if use_eager_flash_attn:
+        # Single backend, no retry needed — FLASH_ATTN + enforce_eager is reliable.
+        attention_backend = "FLASH_ATTN"
+        enforce_eager = True
+        logger.info(f"SM{gpu_major}x GPU: using FLASH_ATTN with enforce_eager (skipping Triton JIT)")
+    elif has_mamba:
+        attention_backend = "FLASH_ATTN"
+        enforce_eager = False
     else:
-        backends = ["FLASHINFER", "FLASH_ATTN", "TRITON_ATTN"]
+        attention_backend = "FLASHINFER"
+        enforce_eager = False
 
-    engine: LLMEngine | None = None
-    for backend in backends:
-        try:
-            engine_args = EngineArgs(
-                model=model_path,
-                served_model_name=str(model_id),
-                gpu_memory_utilization=0.05,
-                trust_remote_code=trust_remote_code,
-                load_format=os.environ.get("VLLM_LOAD_FORMAT", "safetensors"),
-                enable_prefix_caching=False,
-                attention_backend=backend,
-                # enforce_eager disables torch.compile and CUDA graph warmup, which
-                # invoke Triton JIT kernels that fail on SM121a (Blackwell GB10).
-                # FlashAttention2 pre-compiled CUDA kernels work fine in eager mode.
-                enforce_eager=True,
-                compilation_config={"cudagraph_mode": "none"},
-                disable_log_stats=True,
-                max_num_batched_tokens=4096,
-                kv_transfer_config=kv_transfer_config,  # type: ignore
-                disable_hybrid_kv_cache_manager=False,
-            )
+    engine_args = EngineArgs(
+        model=model_path,
+        served_model_name=str(model_id),
+        gpu_memory_utilization=0.05,
+        trust_remote_code=trust_remote_code,
+        load_format=os.environ.get("VLLM_LOAD_FORMAT", "safetensors"),
+        enable_prefix_caching=False,
+        attention_backend=attention_backend,
+        enforce_eager=enforce_eager,
+        compilation_config={"cudagraph_mode": "none"},
+        disable_log_stats=True,
+        max_num_batched_tokens=4096,
+        kv_transfer_config=kv_transfer_config,  # type: ignore
+        disable_hybrid_kv_cache_manager=False,
+    )
 
-            set_weight_loading_callback(on_layer_loaded)
-            engine = LLMEngine.from_engine_args(engine_args)
-            logger.info(f"vLLM engine using attention backend: {backend}")
-            break
-        except (ValueError, RuntimeError) as e:
-            logger.warning(f"Attention backend {backend} failed: {e}, trying next")
-            continue
-
-    if engine is None:
-        raise RuntimeError(f"No attention backend worked for {model_id}")
+    set_weight_loading_callback(on_layer_loaded)
+    engine = LLMEngine.from_engine_args(engine_args)
+    logger.info(f"vLLM engine loaded using attention backend: {attention_backend}")
 
     tool_parser: ToolParser | None = None
     tokenizer = engine.get_tokenizer()
