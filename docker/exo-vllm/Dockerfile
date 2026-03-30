@@ -1,85 +1,62 @@
-# exo-vllm: exo + vLLM disaggregated inference for DGX Spark GB10
+# exo-vllm: exo on top of eugr's vllm-node (NO vLLM compilation needed)
 #
-# Strategy: Start from exo-spark (Python 3.13 + exo + Rust bindings + MLX + PyTorch)
-# and add vLLM + FlashInfer on top. This avoids the Python 3.12 vs 3.13 problem.
-#
-# Pre-built FlashInfer wheels (abi3/py3) are compatible with Python 3.13.
-# vLLM must be built from source since eugr's wheel is cp312 only.
-#
-# Build on Sparkly (aarch64 + GPU required for some vLLM JIT):
-#   docker build -t 192.168.0.181:5000/pnivek/exo-vllm:latest \
-#     -f docker/exo-vllm/Dockerfile .
-#
-# Build context: exo repo root
+# eugr's image already has vLLM 0.18 + FlashInfer + PyTorch + CUDA for GB10.
+# We just add exo (Rust bindings + Python package) on top.
+# Python 3.12 (from eugr's image) works fine — exo has no 3.13-only features.
 
-ARG EXO_BASE=192.168.0.181:5000/pnivek/exo-spark:latest
-FROM ${EXO_BASE}
+ARG VLLM_BASE=192.168.0.181:5000/pnivek/vllm-node:latest
+FROM ${VLLM_BASE}
 
-ARG BUILD_JOBS=16
-ENV MAX_JOBS=${BUILD_JOBS}
-ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
-ENV DEBIAN_FRONTEND=noninteractive
+ARG DEBIAN_FRONTEND=noninteractive
 
-# ── Torch CUDA arch for vLLM compilation ───────────────────────────────────────
-ARG TORCH_CUDA_ARCH_LIST="12.1a"
-ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
-ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+# ── System deps for Rust build ─────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl build-essential pkg-config libssl-dev protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 
-# ── Install FlashInfer ─────────────────────────────────────────────────────────
-# eugr has pre-built wheels but the cubin wheel fails pip 26's strict validation.
-# Install flashinfer_python (pure Python) and flashinfer_jit_cache (abi3) from
-# local wheels. Skip flashinfer_cubin — FlashInfer JIT-compiles kernels on first
-# run and caches them at /root/.cache/flashinfer (volume-mounted from host).
-COPY docker/exo-vllm/wheels/ /tmp/wheels/
-RUN pip install /tmp/wheels/flashinfer_python-*.whl /tmp/wheels/flashinfer_jit_cache-*.whl 2>/dev/null || \
-    pip install flashinfer && \
-    rm -rf /tmp/wheels
+# ── Rust toolchain ─────────────────────────────────────────────────────────────
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
 
-# ── Build vLLM from source for Python 3.13 ────────────────────────────────────
-# We clone upstream vLLM and build. eugr's pre-built wheel is cp312 only.
-WORKDIR /build/vllm
-ARG VLLM_REF=main
-# Echo the ref to bust Docker cache when VLLM_REF changes
-RUN echo "Building vLLM at ref: ${VLLM_REF}" && \
-    git clone https://github.com/vllm-project/vllm.git . && \
-    git checkout ${VLLM_REF} && \
-    git submodule update --init --recursive
+# ── Build exo Rust bindings (libp2p networking) ───────────────────────────────
+WORKDIR /workspace/exo
+COPY rust/ rust/
+COPY Cargo.toml Cargo.lock ./
+RUN pip install maturin && \
+    cd rust/exo_pyo3_bindings && \
+    maturin build --release -i python3 && \
+    pip install target/wheels/*.whl
 
-# vLLM build requirements
-RUN python3 use_existing_torch.py && \
-    sed -i "/flashinfer/d" requirements/cuda.txt && \
-    sed -i '/^triton\b/d' requirements/cuda.txt && \
-    pip install -r requirements/build.txt
-
-# Build and install vLLM
-RUN --mount=type=cache,id=vllm-ccache,target=/root/.ccache \
-    pip install --no-build-isolation -e . 2>&1 | tail -20 || \
-    pip install --no-build-isolation . 2>&1 | tail -20
-
-# ── Additional runtime deps ───────────────────────────────────────────────────
-RUN pip install \
-    "ray[default]" \
-    "fastsafetensors>=0.1.10" \
-    "apache-tvm-ffi<0.2"
-
-# ── Update exo source to disaggregated-inference-leo branch ───────────────────
-# The base exo-spark image has exo installed at /app with dashboard already built.
-# We overlay our updated source files on top.
-WORKDIR /app
+# ── Install exo Python package ────────────────────────────────────────────────
 COPY src/ src/
 COPY pyproject.toml .
-# Re-install exo (in case deps changed) — skip Rust rebuild (already installed)
-RUN pip install --no-deps -e . 2>/dev/null || true
+# Override requires-python so pip doesn't reject on 3.12
+RUN sed -i 's/requires-python = ">=3.13"/requires-python = ">=3.12"/' pyproject.toml && \
+    pip install --no-deps -e . && \
+    pip install \
+      "anyio==4.11.0" \
+      "aiofiles>=24.1.0" \
+      "aiohttp>=3.12" \
+      "types-aiofiles>=24.1.0" \
+      "rustworkx>=0.17.1" \
+      "hypercorn>=0.18.0" \
+      "tomlkit>=0.14.0" \
+      "zstandard>=0.23.0" \
+      "mlx-lm>=0.30" \
+      2>/dev/null || true
 
-# ── vLLM environment ──────────────────────────────────────────────────────────
+# ── Dashboard ──────────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm && \
+    cd /workspace/exo && npm --prefix dashboard install && npm --prefix dashboard run build && \
+    apt-get remove -y nodejs npm && apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── Runtime env ────────────────────────────────────────────────────────────────
 ENV VLLM_ENABLE_V1_MULTIPROCESSING=0
 ENV VLLM_KV_CACHE_LAYOUT=NHD
 ENV FASTSAFETENSORS_NOGDS=1
 ENV MLX_CUDA_GRAPH_CACHE_SIZE=3000
 
-# Download tiktoken encodings (vLLM needs these)
-RUN mkdir -p /workspace/tiktoken_encodings && \
-    python3 -c "import tiktoken; tiktoken.get_encoding('o200k_base'); tiktoken.get_encoding('cl100k_base')" 2>/dev/null || true
-
 EXPOSE 52415 52416 55000 55001 55002
+WORKDIR /workspace/exo
 ENTRYPOINT ["python3", "-m", "exo"]
