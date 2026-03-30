@@ -120,6 +120,9 @@ class StreamingConnector(KVConnectorBase_V1, SupportsHMA):  # pyright: ignore[re
     def request_finished(self, request: Any, block_ids: Any) -> tuple[bool, dict[str, Any] | None]:  # pyright: ignore[reportAny]
         return False, None
 
+    def request_finished_all_groups(self, request: Any, block_ids: Any) -> tuple[bool, dict[str, Any] | None]:  # pyright: ignore[reportAny]
+        return False, None
+
     def get_num_new_matched_tokens(self, request: Any, num_computed_tokens: int) -> tuple[int | None, bool]:  # pyright: ignore[reportAny]
         return 0, False
 
