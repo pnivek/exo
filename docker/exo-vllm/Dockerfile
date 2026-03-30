@@ -30,11 +30,12 @@ RUN pip install maturin && \
 
 # ── Install exo Python package ────────────────────────────────────────────────
 COPY src/ src/
-COPY pyproject.toml .
+COPY pyproject.toml README.md ./
 COPY dashboard/ dashboard/
 COPY resources/ resources/
 # Override requires-python so pip doesn't reject on 3.12
 RUN sed -i 's/requires-python = ">=3.13"/requires-python = ">=3.12"/' pyproject.toml && \
+    pip install uv_build && \
     pip install --no-deps -e . && \
     pip install \
       "anyio==4.11.0" \
