@@ -50,6 +50,7 @@ RUN pip install \
       "hypercorn>=0.18.0" \
       "tomlkit>=0.14.0" \
       "zstandard>=0.23.0" \
+      "mlx-cpu==0.30.6" \
       "mlx-lm>=0.30" \
       2>/dev/null || true
 
