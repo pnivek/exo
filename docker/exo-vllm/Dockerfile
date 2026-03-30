@@ -52,7 +52,7 @@ COPY pyproject.toml README.md ./
 RUN pip install --no-deps -e . 2>/dev/null || true
 
 # ── vLLM environment ──────────────────────────────────────────────────────────
-ENV VLLM_ENABLE_V1_MULTIPROCESSING=1
+ENV VLLM_ENABLE_V1_MULTIPROCESSING=0
 ENV VLLM_KV_CACHE_LAYOUT=NHD
 ENV FASTSAFETENSORS_NOGDS=1
 ENV MLX_CUDA_GRAPH_CACHE_SIZE=3000

@@ -590,46 +590,13 @@ def load_vllm_engine(
             model_config = json.load(f)
         text_config = model_config.get("text_config", model_config)
         has_mamba = "mamba_ssm_dtype" in text_config or "linear_attention" in (text_config.get("layer_types") or [])
-    # Backend selection strategy:
-    #
-    # CRITICAL: Do NOT call torch.cuda.get_device_capability() or any other CUDA
-    # runtime API here.  Any CUDA runtime call (including _lazy_init) creates a
-    # CUDA context in the parent process.  vLLM detects this via
-    # torch.cuda.is_initialized() and overrides VLLM_WORKER_MULTIPROC_METHOD to
-    # 'spawn'.  With spawn, each subprocess re-imports Python modules and creates
-    # independent module-level objects — the cross-process multiprocessing.SimpleQueue
-    # used for KV streaming is NOT inherited and the IPC breaks silently.
-    #
-    # To query GPU compute capability without creating a CUDA context, use nvidia-smi.
-    # vLLM will then default to 'fork', which inherits open file descriptors (the
-    # SimpleQueue's pipe) and makes cross-process KV streaming work correctly.
-    #
-    # Backend choice: FLASHINFER for all standard models (supports attention sinks,
-    # sliding window, full CUDA graphs).  FLASH_ATTN only for Mamba/hybrid models.
-    # Do NOT use FLASH_ATTN for standard attention: it rejects models that use
-    # attention sinks (e.g., gpt-oss-120b), causing a hard ValueError at engine init.
-    import subprocess as _subprocess
-    import torch as _torch
-
-    gpu_major = 0
-    if _torch.cuda.is_available():
-        try:
-            _r = _subprocess.run(
-                ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=5,
-            )
-            _cap = _r.stdout.strip().split("\n")[0].strip() if _r.returncode == 0 else ""
-            gpu_major = int(_cap.split(".")[0]) if _cap else 0
-            logger.info(f"nvidia-smi compute capability: {_cap} (major={gpu_major})")
-        except Exception as _e:
-            logger.warning(f"nvidia-smi query failed: {_e}")
-
-    if has_mamba:
-        attention_backend = "FLASH_ATTN"
-        logger.info("Mamba model: using FLASH_ATTN backend")
-    else:
-        attention_backend = "FLASHINFER"
-        logger.info(f"SM{gpu_major}x GPU: using FLASHINFER backend (supports attention sinks)")
+    # Backend selection: let vLLM auto-select.  With VLLM_ENABLE_V1_MULTIPROCESSING=0
+    # (in-process EngineCore), all backends work correctly on SM121a (GB10) including
+    # TRITON_ATTN, FLASH_ATTN, and FLASHINFER.  vLLM picks the best available backend
+    # for the model architecture (e.g. TRITON_ATTN for models with attention sinks like
+    # gpt-oss-120b, FLASH_ATTN for standard Llama, etc.).  Mamba/hybrid models need
+    # FLASH_ATTN explicitly since auto-selection may not handle them correctly.
+    attention_backend: str | None = "FLASH_ATTN" if has_mamba else None
 
     engine_args = EngineArgs(
         model=model_path,
@@ -638,7 +605,7 @@ def load_vllm_engine(
         trust_remote_code=trust_remote_code,
         load_format=os.environ.get("VLLM_LOAD_FORMAT", "safetensors"),
         enable_prefix_caching=False,
-        attention_backend=attention_backend,
+        **({"attention_backend": attention_backend} if attention_backend else {}),
         disable_log_stats=True,
         max_num_batched_tokens=4096,
         kv_transfer_config=kv_transfer_config,  # type: ignore
@@ -647,12 +614,10 @@ def load_vllm_engine(
 
     set_weight_loading_callback(on_layer_loaded)
     engine = LLMEngine.from_engine_args(engine_args)
-    logger.info(f"vLLM engine loaded using attention backend: {attention_backend}")
+    logger.info("vLLM engine loaded")
 
-    # Receive layer info that the EngineCore subprocess put into the cross-process
-    # queue during initialize_from_config.  With MULTIPROCESSING=1 (fork) this
-    # arrives from the forked subprocess; with MULTIPROCESSING=0 (in-process) it
-    # was put synchronously during the call above.
+    # Receive layer info put into the queue during initialize_from_config.
+    # With MULTIPROCESSING=0 (in-process) this was put synchronously above.
     from exo.worker.engines.vllm.growable_cache import wait_for_layer_info
     wait_for_layer_info()
 
