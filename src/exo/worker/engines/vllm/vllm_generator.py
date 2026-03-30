@@ -608,6 +608,10 @@ def load_vllm_engine(
                 load_format=os.environ.get("VLLM_LOAD_FORMAT", "safetensors"),
                 enable_prefix_caching=False,
                 attention_backend=backend,
+                # enforce_eager disables torch.compile and CUDA graph warmup, which
+                # invoke Triton JIT kernels that fail on SM121a (Blackwell GB10).
+                # FlashAttention2 pre-compiled CUDA kernels work fine in eager mode.
+                enforce_eager=True,
                 compilation_config={"cudagraph_mode": "none"},
                 disable_log_stats=True,
                 max_num_batched_tokens=4096,
