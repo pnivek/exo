@@ -592,37 +592,28 @@ def load_vllm_engine(
         has_mamba = "mamba_ssm_dtype" in text_config or "linear_attention" in (text_config.get("layer_types") or [])
     # Backend selection strategy:
     #
-    # All backends (FLASHINFER, FLASH_ATTN, TRITON_ATTN) fail on SM121a (Blackwell
-    # GB10) when torch.compile warmup is enabled, because Triton JIT raises
-    # "Triton Error [CUDA]: initialization error" inside vLLM's kernel_warmup.
+    # With VLLM_ENABLE_V1_MULTIPROCESSING=1 (the default for VllmInstance), vLLM
+    # forks the EngineCore into a subprocess.  Triton JIT, CUDA graph capture and
+    # FlashInfer autotune all work correctly in the forked subprocess.  We therefore
+    # use FLASH_ATTN on SM10+/SM12+ (Hopper/Blackwell) because it is pre-compiled
+    # and avoids any FlashInfer wheel compatibility questions, while still getting
+    # full CUDA-graph performance via enforce_eager=False.
     #
-    # With enforce_eager=True, torch.compile and CUDA graph warmup are skipped.
-    # FLASH_ATTN (FlashAttention2 pre-compiled kernels) works reliably in eager mode.
-    #
-    # IMPORTANT: Do NOT retry backends in the same process. Trying FLASHINFER first
-    # and catching its failure corrupts CUDA state for subsequent FLASH_ATTN attempts
-    # (because LLMEngine partially initializes CUDA before failing). Use a single
-    # backend determined upfront.
-    #
-    # For SM12.x (Blackwell) and SM10.x (Hopper+) we use FLASH_ATTN with
-    # enforce_eager. For other architectures we try FLASHINFER first (requires a
-    # fresh process for each attempt — the retry loop is intentionally skipped here).
+    # IMPORTANT: Do NOT retry backends in the same process. If a backend init fails
+    # it can corrupt CUDA state for subsequent attempts. Use a single backend
+    # determined upfront.
     import torch as _torch
 
     gpu_major = _torch.cuda.get_device_capability(0)[0] if _torch.cuda.is_available() else 0
-    # SM12+ = Blackwell; SM10+ = Hopper+ (SM10/11 also have Triton JIT issues in-process)
-    use_eager_flash_attn = gpu_major >= 10
-    if use_eager_flash_attn:
-        # Single backend, no retry needed — FLASH_ATTN + enforce_eager is reliable.
+    # SM12+ = Blackwell; SM10+ = Hopper+
+    use_flash_attn = gpu_major >= 10
+    if use_flash_attn:
         attention_backend = "FLASH_ATTN"
-        enforce_eager = True
-        logger.info(f"SM{gpu_major}x GPU: using FLASH_ATTN with enforce_eager (skipping Triton JIT)")
+        logger.info(f"SM{gpu_major}x GPU: using FLASH_ATTN backend")
     elif has_mamba:
         attention_backend = "FLASH_ATTN"
-        enforce_eager = False
     else:
         attention_backend = "FLASHINFER"
-        enforce_eager = False
 
     engine_args = EngineArgs(
         model=model_path,
@@ -632,13 +623,6 @@ def load_vllm_engine(
         load_format=os.environ.get("VLLM_LOAD_FORMAT", "safetensors"),
         enable_prefix_caching=False,
         attention_backend=attention_backend,
-        enforce_eager=enforce_eager,
-        # Disable FlashInfer autotune on SM10+/SM12+: the autotune calls Triton JIT
-        # (driver.active.utils.get_device_properties) which raises
-        # "Triton Error [CUDA]: initialization error" when vLLM runs in-process
-        # (VLLM_ENABLE_V1_MULTIPROCESSING=0) inside the exo runner subprocess.
-        enable_flashinfer_autotune=False if use_eager_flash_attn else None,
-        compilation_config={"cudagraph_mode": "none"},
         disable_log_stats=True,
         max_num_batched_tokens=4096,
         kv_transfer_config=kv_transfer_config,  # type: ignore
@@ -648,6 +632,13 @@ def load_vllm_engine(
     set_weight_loading_callback(on_layer_loaded)
     engine = LLMEngine.from_engine_args(engine_args)
     logger.info(f"vLLM engine loaded using attention backend: {attention_backend}")
+
+    # Receive layer info that the EngineCore subprocess put into the cross-process
+    # queue during initialize_from_config.  With MULTIPROCESSING=1 (fork) this
+    # arrives from the forked subprocess; with MULTIPROCESSING=0 (in-process) it
+    # was put synchronously during the call above.
+    from exo.worker.engines.vllm.growable_cache import wait_for_layer_info
+    wait_for_layer_info()
 
     tool_parser: ToolParser | None = None
     tokenizer = engine.get_tokenizer()

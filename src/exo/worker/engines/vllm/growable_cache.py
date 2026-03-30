@@ -1,3 +1,6 @@
+import multiprocessing
+from typing import Any
+
 import torch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -11,6 +14,13 @@ MIN_GROWTH_BLOCKS = 16
 _patched = False
 _prefix_cache: KVPrefixCache | None = None
 _model_runner: GPUModelRunner | None = None
+
+# Layer-info metadata channel: created before vLLM forks the EngineCore subprocess
+# so both processes share the underlying pipe.  The EngineCore subprocess puts a
+# (num_layers, dtype_str, layers_info) tuple into this queue immediately after
+# initialize_from_config; the runner process reads it once in wait_for_layer_info().
+_layer_info_queue: multiprocessing.SimpleQueue[tuple[int, str, list[dict[str, Any]]] | None] = multiprocessing.SimpleQueue()
+_cached_layer_info: tuple[int, str, list[dict[str, Any]]] | None = None
 
 
 def get_prefix_cache() -> KVPrefixCache | None:
@@ -29,6 +39,31 @@ def get_model_runner() -> GPUModelRunner | None:
 def set_model_runner(runner: GPUModelRunner | None) -> None:
     global _model_runner
     _model_runner = runner
+
+
+def get_cached_layer_info() -> tuple[int, str, list[dict[str, Any]]] | None:
+    """Return layer info captured from the EngineCore subprocess, or None if not yet available."""
+    return _cached_layer_info
+
+
+def wait_for_layer_info() -> None:
+    """Block until layer info arrives from the EngineCore subprocess and cache it.
+
+    Called in the runner (parent) process right after LLMEngine.from_engine_args
+    returns.  By that point the EngineCore subprocess has already finished
+    initialize_from_config and put the info into _layer_info_queue, so this
+    should return immediately in practice.
+    """
+    global _cached_layer_info
+    try:
+        info = _layer_info_queue.get()
+        if info is not None:
+            _cached_layer_info = info
+            logger.info(f"Layer info received from EngineCore: {info[0]} layers, dtype={info[1]}")
+        else:
+            logger.warning("Received None from layer info queue — layer info unavailable")
+    except Exception as e:
+        logger.warning(f"Failed to receive layer info from EngineCore subprocess: {e}")
 
 
 def patch_vllm() -> None:
@@ -129,6 +164,27 @@ def _patch_initialize_from_config() -> None:
     def patched(self: "Worker", kv_cache_config: "object") -> None:
         original(self, kv_cache_config)
         set_model_runner(self.model_runner)
+        # Send layer info to the runner (parent) process via the pre-fork queue.
+        # This works whether we are in-process (MULTIPROCESSING=0) or in the
+        # forked EngineCore subprocess (MULTIPROCESSING=1): the SimpleQueue pipe
+        # fd is inherited across fork, so .put() reaches the parent's .get().
+        try:
+            kv_caches = self.model_runner.kv_caches  # type: ignore
+            num_layers: int = len(kv_caches)  # type: ignore
+            layers_info: list[dict[str, Any]] = []
+            for li in range(num_layers):
+                kv = kv_caches[li]  # type: ignore
+                if isinstance(kv, (list, tuple)) and len(kv) > 1:  # type: ignore
+                    layers_info.append({"type": "arrays", "sizes": [2]})
+                else:
+                    sample = kv[0] if isinstance(kv, (list, tuple)) else kv  # type: ignore
+                    n_heads: int = sample.shape[-2]  # type: ignore
+                    head_dim: int = sample.shape[-1]  # type: ignore
+                    layers_info.append({"type": "kv", "n_heads": n_heads, "head_dim": head_dim})
+            _layer_info_queue.put((num_layers, "bfloat16", layers_info))
+        except Exception as exc:
+            logger.warning(f"Failed to send layer info to runner: {exc}")
+            _layer_info_queue.put(None)
 
     Worker.initialize_from_config = patched  # type: ignore
 

@@ -102,7 +102,7 @@ def entrypoint(
     # Import main after setting global logger - this lets us just import logger from this module
     try:
         if isinstance(bound_instance.instance, VllmInstance):
-            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
             os.environ["VLLM_KV_CACHE_LAYOUT"] = "NHD"
             os.environ["FASTSAFETENSORS_NOGDS"] = "1"
             # os.environ["VLLM_BATCH_INVARIANT"] = "1"

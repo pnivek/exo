@@ -175,10 +175,21 @@ def _init_gdn_layer_order() -> None:
 
 
 def _get_layer_info(engine: LLMEngine) -> tuple[int, str, list[dict[str, Any]]]:
-    from exo.worker.engines.vllm.growable_cache import get_model_runner
+    # Prefer the cross-process cache populated by wait_for_layer_info() after
+    # engine init (works for both MULTIPROCESSING=0 and MULTIPROCESSING=1).
+    from exo.worker.engines.vllm.growable_cache import get_cached_layer_info, get_model_runner
 
+    cached = get_cached_layer_info()
+    if cached is not None:
+        return cached
+
+    # Fallback: in-process mode where model_runner is accessible directly.
     model_runner = get_model_runner()
-    assert model_runner is not None
+    if model_runner is None:
+        raise RuntimeError(
+            "Layer info unavailable: no cached layer info and model_runner is None. "
+            "Ensure wait_for_layer_info() was called after engine init."
+        )
     kv_caches = model_runner.kv_caches
     num_layers: int = len(kv_caches)
 
@@ -198,11 +209,6 @@ def _get_layer_info(engine: LLMEngine) -> tuple[int, str, list[dict[str, Any]]]:
 
 
 def _run_prefill_overlapping(engine: LLMEngine, token_ids: list[int], start_pos: int, wfile: Any) -> None:  # pyright: ignore[reportAny]
-    from exo.worker.engines.vllm.growable_cache import get_model_runner
-
-    model_runner = get_model_runner()
-    assert model_runner is not None
-
     from exo.disaggregated.streaming_connector import (
         get_shared_arrays_queue,
         get_shared_queue,
@@ -313,7 +319,7 @@ def _run_prefill_overlapping(engine: LLMEngine, token_ids: list[int], start_pos:
     logger.info(f"Overlapping prefill: sent {chunks_sent[0]} chunks, {tokens_sent} tokens (server_cached={server_cached}, skip={skip_tokens})")
 
     while not arrays_queue.empty():
-        item = arrays_queue.get_nowait()
+        item = arrays_queue.get()
         if item is not None:
             layer_idx, arrays = item
             write_arrays_state(wfile, layer_idx, arrays)  # pyright: ignore[reportAny]
@@ -338,12 +344,7 @@ def _run_prefill_overlapping(engine: LLMEngine, token_ids: list[int], start_pos:
 
 
 def _run_prefill_batch(engine: LLMEngine, token_ids: list[int], start_pos: int, wfile: Any) -> None:  # pyright: ignore[reportAny]
-    from exo.worker.engines.vllm.growable_cache import get_model_runner
-
     num_layers, dtype_str, layers_info = _get_layer_info(engine)
-
-    model_runner = get_model_runner()
-    assert model_runner is not None
 
     from exo.disaggregated.batch_connector import (
         clear_shared_captured_layers,
