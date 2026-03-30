@@ -34,10 +34,13 @@ COPY pyproject.toml README.md ./
 COPY dashboard/ dashboard/
 COPY resources/ resources/
 # Override requires-python so pip doesn't reject on 3.12
-RUN sed -i 's/requires-python = ">=3.13"/requires-python = ">=3.12"/' pyproject.toml && \
-    pip install uv_build && \
-    pip install --no-deps -e . && \
-    pip install \
+RUN sed -i 's/requires-python = ">=3.13"/requires-python = ">=3.12"/' pyproject.toml
+
+# Install exo (must not fail silently)
+RUN pip install uv_build && pip install --no-deps -e .
+
+# Install remaining deps (some may not be available on 3.12/aarch64, that's OK)
+RUN pip install \
       "anyio==4.11.0" \
       "aiofiles>=24.1.0" \
       "aiohttp>=3.12" \
