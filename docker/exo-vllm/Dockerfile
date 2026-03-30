@@ -23,6 +23,7 @@ WORKDIR /workspace/exo
 COPY rust/ rust/
 COPY Cargo.toml Cargo.lock ./
 RUN pip install maturin && \
+    sed -i 's/requires-python = ">=3.13"/requires-python = ">=3.12"/' rust/exo_pyo3_bindings/pyproject.toml && \
     cd rust/exo_pyo3_bindings && \
     maturin build --release -i python3 && \
     pip install /workspace/exo/target/wheels/*.whl
