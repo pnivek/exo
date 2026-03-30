@@ -83,11 +83,11 @@ class RunnerSupervisor:
 
         from exo.shared.types.worker.instances import VllmInstance
 
-        # vLLM runners use "spawn" to avoid inheriting the parent's CUDA state.
-        # With "fork", the parent's partial CUDA init (from device detection) is
-        # inherited by the child, which conflicts with torch.compile's inductor
-        # backend (cudagraph_mode=none) and causes CUDA illegal instruction errors.
-        ctx = mp.get_context("spawn") if isinstance(bound_instance.instance, VllmInstance) else mp
+        # Use default (fork) for vLLM runners on CUDA.  Triton JIT fails with
+        # both "spawn" and "forkserver" on SM121a (GB10 Blackwell) due to CUDA
+        # driver initialization issues in non-fork subprocesses.  Fork inherits the
+        # parent's CUDA context, which vLLM's in-process EngineCore handles correctly.
+        ctx = mp
         runner_process = ctx.Process(
             target=entrypoint,
             args=(

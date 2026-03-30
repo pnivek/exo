@@ -18,7 +18,11 @@ logger: "loguru.Logger" = loguru.logger
 _TIKTOKEN_BASE_URL = "https://openaipublic.blob.core.windows.net/encodings"
 _TIKTOKEN_FILES = ["o200k_base.tiktoken", "cl100k_base.tiktoken"]
 
-_CUDA_HOST_LIBS = ["libcuda.so.1", "libnvidia-ml.so.1", "libnvidia-ptxjitcompiler.so.1"]
+_CUDA_HOST_LIBS = ["libcuda.so.1", "libnvidia-ml.so.1"]
+# NOTE: libnvidia-ptxjitcompiler.so.1 is intentionally NOT loaded here.
+# Loading it with RTLD_GLOBAL conflicts with Triton 3.6's own ptxjit
+# compilation pipeline, causing "Triton Error [CUDA]: initialization error"
+# in the runner subprocess on SM121a (GB10 Blackwell).
 _CUDA_HOST_SEARCH_DIRS = [
     Path("/usr/lib/aarch64-linux-gnu"),
     Path("/usr/lib/x86_64-linux-gnu"),
@@ -70,6 +74,79 @@ def _ensure_cuda_libs() -> None:
         return
 
 
+def _patch_flashinfer_triton_kernels() -> None:
+    """Replace FlashInfer's Triton JIT kernels with pure-PyTorch equivalents.
+
+    On SM121a (GB10 Blackwell), Triton's CUDA initialization fails in exo's
+    runner subprocess with 'Triton Error [CUDA]: initialization error'.  This
+    only affects processes spawned from exo's main process — standalone Triton
+    works fine.  The root cause is unknown but is likely related to inherited
+    process state from the parent (Rust/libp2p networking, async event loop).
+
+    FlashInfer's ``_copy_page_indices_kernel`` is the only Triton kernel in the
+    critical path.  It's a simple data-copy kernel that can be replaced with a
+    PyTorch equivalent without any performance impact (it operates on index
+    tensors, not large data arrays).
+    """
+    try:
+        import torch
+
+        def _copy_page_indices_pytorch(
+            page_indices: torch.Tensor,
+            block_table: torch.Tensor,
+            block_table_stride: int,
+            cu_num_blocks: torch.Tensor,
+            BLOCK_SIZE: int,  # noqa: N803 — matches Triton signature
+        ) -> None:
+            """PyTorch replacement for FlashInfer's _copy_page_indices_kernel.
+
+            For each request i, copies block_table[i, :num_blocks[i]] into
+            page_indices[cu_num_blocks[i]:cu_num_blocks[i+1]].
+            """
+            num_reqs = cu_num_blocks.shape[0] - 1
+            starts = cu_num_blocks[:num_reqs]
+            ends = cu_num_blocks[1 : num_reqs + 1]
+            counts = ends - starts
+
+            for i in range(num_reqs):
+                n = counts[i].item()
+                if n > 0:
+                    src = block_table[i, :n]
+                    dst_start = starts[i].item()
+                    page_indices[dst_start : dst_start + n] = src
+
+        # Wrap to match the Triton kernel's launch API:
+        #   _copy_page_indices_kernel[(num_reqs,)](page_indices, block_table, stride, cu_num_blocks, BLOCK_SIZE=...)
+        class _TritonKernelShim:
+            """Mimics Triton's grid-launch syntax: kernel[(grid,)](args, BLOCK_SIZE=N)."""
+
+            def __getitem__(self, grid: tuple[int, ...]) -> "_TritonKernelShim._Launcher":
+                return self._Launcher(grid)
+
+            class _Launcher:
+                def __init__(self, grid: tuple[int, ...]) -> None:
+                    self.grid = grid
+
+                def __call__(
+                    self,
+                    page_indices: torch.Tensor,
+                    block_table: torch.Tensor,
+                    block_table_stride: int,
+                    cu_num_blocks: torch.Tensor,
+                    BLOCK_SIZE: int = 128,  # noqa: N803
+                ) -> None:
+                    _copy_page_indices_pytorch(
+                        page_indices, block_table, block_table_stride, cu_num_blocks, BLOCK_SIZE
+                    )
+
+        from vllm.v1.attention.backends import flashinfer as fi_mod
+
+        fi_mod._copy_page_indices_kernel = _TritonKernelShim()  # type: ignore[attr-defined]
+        logger.info("Patched FlashInfer _copy_page_indices_kernel with PyTorch equivalent (Triton bypass)")
+    except Exception as e:
+        logger.warning(f"Failed to patch FlashInfer Triton kernels: {e}")
+
+
 def entrypoint(
     bound_instance: BoundInstance,
     event_sender: MpSender[Event],
@@ -106,7 +183,12 @@ def entrypoint(
             os.environ["VLLM_KV_CACHE_LAYOUT"] = "NHD"
             os.environ["FASTSAFETENSORS_NOGDS"] = "1"
             # os.environ["VLLM_BATCH_INVARIANT"] = "1"
-            _ensure_cuda_libs()
+            # NOTE: _ensure_cuda_libs() intentionally NOT called.
+            # Pre-loading libcuda.so.1/libnvidia-ml.so.1 with RTLD_GLOBAL
+            # causes Triton's cuInit(0) to fail in this subprocess with
+            # "Triton Error [CUDA]: initialization error". vLLM and PyTorch
+            # load CUDA libs correctly on their own.
+            _patch_flashinfer_triton_kernels()
             _ensure_tiktoken_encodings()
             from exo.shared.constants import EXO_MODELS_DIR
             from exo.worker.runner.llm_inference.runner import Runner, VllmBuilder

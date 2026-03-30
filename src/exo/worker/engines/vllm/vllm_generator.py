@@ -590,13 +590,20 @@ def load_vllm_engine(
             model_config = json.load(f)
         text_config = model_config.get("text_config", model_config)
         has_mamba = "mamba_ssm_dtype" in text_config or "linear_attention" in (text_config.get("layer_types") or [])
-    # Backend selection: let vLLM auto-select.  With VLLM_ENABLE_V1_MULTIPROCESSING=0
-    # (in-process EngineCore), all backends work correctly on SM121a (GB10) including
-    # TRITON_ATTN, FLASH_ATTN, and FLASHINFER.  vLLM picks the best available backend
-    # for the model architecture (e.g. TRITON_ATTN for models with attention sinks like
-    # gpt-oss-120b, FLASH_ATTN for standard Llama, etc.).  Mamba/hybrid models need
-    # FLASH_ATTN explicitly since auto-selection may not handle them correctly.
-    attention_backend: str | None = "FLASH_ATTN" if has_mamba else None
+    # Backend selection: FLASHINFER for all models on CUDA GPUs.
+    #
+    # On SM121a (GB10 Blackwell), the other backends are broken:
+    #   - FLASH_ATTN: segfaults in cudaFuncSetAttribute (compiled kernels not built for SM121a)
+    #   - TRITON_ATTN: "Triton Error [CUDA]: initialization error" (Triton JIT doesn't support SM121a)
+    #   - FLEX_ATTENTION: untested on SM121a
+    #
+    # FLASHINFER works because its wheels are built specifically for the target GPU
+    # (installed in the Docker image). It also supports attention sinks (gpt-oss-120b),
+    # sliding window, and full CUDA graphs (enforce_eager=False).
+    #
+    # Mamba/hybrid models still need FLASH_ATTN for the linear-attention layers.
+    attention_backend = "FLASH_ATTN" if has_mamba else "FLASHINFER"
+    logger.info(f"Using attention backend: {attention_backend}")
 
     engine_args = EngineArgs(
         model=model_path,
@@ -605,7 +612,7 @@ def load_vllm_engine(
         trust_remote_code=trust_remote_code,
         load_format=os.environ.get("VLLM_LOAD_FORMAT", "safetensors"),
         enable_prefix_caching=False,
-        **({"attention_backend": attention_backend} if attention_backend else {}),
+        attention_backend=attention_backend,
         disable_log_stats=True,
         max_num_batched_tokens=4096,
         kv_transfer_config=kv_transfer_config,  # type: ignore
