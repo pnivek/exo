@@ -28,12 +28,16 @@ WORKDIR /build/mlx
 RUN pip install nanobind scikit-build-core && \
     git clone --depth=1 https://github.com/ml-explore/mlx.git .
 
-RUN cmake . -B build -G Ninja \
+RUN CUDNN_INCLUDE=$(python3 -c "import nvidia.cudnn; import os; print(os.path.join(os.path.dirname(nvidia.cudnn.__file__), 'include'))") && \
+    CUDNN_LIB_DIR=$(python3 -c "import nvidia.cudnn; import os; print(os.path.join(os.path.dirname(nvidia.cudnn.__file__), 'lib'))") && \
+    cmake . -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DMLX_BUILD_CUDA=ON \
     -DMLX_CUDA_ARCHITECTURES=121a \
     -DNCCL_INCLUDE_DIRS=/usr/include \
     -DNCCL_LIBRARIES=/usr/lib/aarch64-linux-gnu/libnccl.so \
+    -DCUDNN_INCLUDE_PATH=${CUDNN_INCLUDE} \
+    -DCUDNN_LIBRARY_PATH=${CUDNN_LIB_DIR} \
     -DMLX_BUILD_PYTHON_BINDINGS=ON \
     -DMLX_BUILD_TESTS=OFF \
     -DMLX_BUILD_BENCHMARKS=OFF \
