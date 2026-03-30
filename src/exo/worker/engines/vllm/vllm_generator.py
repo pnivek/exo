@@ -633,6 +633,11 @@ def load_vllm_engine(
         enable_prefix_caching=False,
         attention_backend=attention_backend,
         enforce_eager=enforce_eager,
+        # Disable FlashInfer autotune on SM10+/SM12+: the autotune calls Triton JIT
+        # (driver.active.utils.get_device_properties) which raises
+        # "Triton Error [CUDA]: initialization error" when vLLM runs in-process
+        # (VLLM_ENABLE_V1_MULTIPROCESSING=0) inside the exo runner subprocess.
+        enable_flashinfer_autotune=False if use_eager_flash_attn else None,
         compilation_config={"cudagraph_mode": "none"},
         disable_log_stats=True,
         max_num_batched_tokens=4096,
