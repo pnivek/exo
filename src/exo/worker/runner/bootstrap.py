@@ -104,6 +104,7 @@ def entrypoint(
         if isinstance(bound_instance.instance, VllmInstance):
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
             os.environ["VLLM_KV_CACHE_LAYOUT"] = "NHD"
+            os.environ["FASTSAFETENSORS_NOGDS"] = "1"
             # os.environ["VLLM_BATCH_INVARIANT"] = "1"
             _ensure_cuda_libs()
             _ensure_tiktoken_encodings()
