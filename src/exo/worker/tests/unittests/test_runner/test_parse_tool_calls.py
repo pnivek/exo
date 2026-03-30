@@ -1,5 +1,7 @@
 """Tests for parse_tool_calls generator, especially unclosed tool call handling."""
 
+from __future__ import annotations
+
 import json
 from collections.abc import Generator
 from typing import Any

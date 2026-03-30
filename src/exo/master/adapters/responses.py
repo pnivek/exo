@@ -1,5 +1,7 @@
 """OpenAI Responses API adapter for converting requests/responses."""
 
+from __future__ import annotations
+
 from collections.abc import AsyncGenerator
 from itertools import count
 from typing import Any
