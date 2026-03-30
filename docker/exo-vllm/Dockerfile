@@ -39,7 +39,9 @@ RUN pip install /tmp/wheels/flashinfer_python-*.whl /tmp/wheels/flashinfer_jit_c
 # We clone upstream vLLM and build. eugr's pre-built wheel is cp312 only.
 WORKDIR /build/vllm
 ARG VLLM_REF=main
-RUN git clone https://github.com/vllm-project/vllm.git . && \
+# Echo the ref to bust Docker cache when VLLM_REF changes
+RUN echo "Building vLLM at ref: ${VLLM_REF}" && \
+    git clone https://github.com/vllm-project/vllm.git . && \
     git checkout ${VLLM_REF} && \
     git submodule update --init --recursive
 
