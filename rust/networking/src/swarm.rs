@@ -4,7 +4,7 @@ use crate::swarm::transport::tcp_transport;
 use crate::{alias, discovery};
 pub use behaviour::{Behaviour, BehaviourEvent};
 use futures_lite::{Stream, StreamExt};
-use libp2p::{PeerId, SwarmBuilder, gossipsub, identity, swarm::SwarmEvent};
+use libp2p::{Multiaddr, PeerId, SwarmBuilder, gossipsub, identity, swarm::SwarmEvent};
 use tokio::sync::{mpsc, oneshot};
 
 /// The current version of the network: this prevents devices running different versions of the
@@ -32,6 +32,10 @@ pub enum ToSwarm {
         topic: String,
         data: Vec<u8>,
         result_sender: oneshot::Sender<Result<gossipsub::MessageId, gossipsub::PublishError>>,
+    },
+    Dial {
+        addr: Multiaddr,
+        result_sender: oneshot::Sender<Result<(), String>>,
     },
 }
 pub enum FromSwarm {
@@ -112,6 +116,13 @@ fn on_message(swarm: &mut libp2p::Swarm<Behaviour>, message: ToSwarm) {
                 .publish(gossipsub::IdentTopic::new(topic), data);
             _ = result_sender.send(result);
         }
+        ToSwarm::Dial {
+            addr,
+            result_sender,
+        } => {
+            let result = swarm.dial(addr).map_err(|e| e.to_string());
+            _ = result_sender.send(result);
+        }
     }
 }
 
@@ -142,10 +153,12 @@ fn filter_swarm_event(event: SwarmEvent<BehaviourEvent>) -> Option<FromSwarm> {
     }
 }
 
-/// Create and configure a swarm which listens to all ports on OS
+/// Create and configure a swarm which listens on all interfaces.
+/// If `port` is 0, the OS assigns a random available port.
 pub fn create_swarm(
     keypair: identity::Keypair,
     from_client: mpsc::Receiver<ToSwarm>,
+    port: u16,
 ) -> alias::AnyResult<Swarm> {
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -153,8 +166,8 @@ pub fn create_swarm(
         .with_behaviour(Behaviour::new)?
         .build();
 
-    // Listen on all interfaces and whatever port the OS assigns
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    let addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{port}").parse()?;
+    swarm.listen_on(addr)?;
     Ok(Swarm { swarm, from_client })
 }
 

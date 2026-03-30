@@ -40,6 +40,7 @@ class Node:
 
     node_id: NodeId
     offline: bool
+    dial_addrs: list[str] = field(default_factory=list)
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
 
     @classmethod
@@ -47,7 +48,7 @@ class Node:
         keypair = get_node_id_keypair()
         node_id = NodeId(keypair.to_node_id())
         session_id = SessionId(master_node_id=node_id, election_clock=0)
-        router = Router.create(keypair)
+        router = Router.create(keypair, listen_port=args.listen_port)
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
         await router.register_topic(topics.COMMANDS)
@@ -134,6 +135,7 @@ class Node:
             api,
             node_id,
             args.offline,
+            args.dial,
         )
 
     async def run(self):
@@ -152,6 +154,34 @@ class Node:
             if self.api:
                 tg.start_soon(self.api.run)
             tg.start_soon(self._elect_loop)
+            if self.dial_addrs:
+                tg.start_soon(self._dial_peers)
+
+    async def _dial_peers(self):
+        # Wait briefly for the router/swarm to start listening
+        await anyio.sleep(2)
+        for addr in self.dial_addrs:
+            max_retries = 5
+            base_delay = 2.0
+            for attempt in range(max_retries):
+                try:
+                    logger.info(
+                        f"Dialing peer at {addr} (attempt {attempt + 1}/{max_retries})"
+                    )
+                    await self.router._net.dial_peer(addr)  # pyright: ignore[reportPrivateUsage]
+                    logger.info(f"Dial initiated for {addr}")
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (1 << attempt)
+                        logger.warning(
+                            f"Failed to dial {addr}: {e} — retrying in {delay:.0f}s"
+                        )
+                        await anyio.sleep(delay)
+                    else:
+                        logger.error(
+                            f"Failed to dial {addr} after {max_retries} attempts: {e}"
+                        )
 
     def shutdown(self):
         # if this is our second call to shutdown, just sys.exit
@@ -311,6 +341,8 @@ class Args(CamelCaseModel):
     no_batch: bool = False
     no_overlapping_prefill_sends: bool = False
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
+    listen_port: int = 0  # 0 = OS-assigned random port
+    dial: list[str] = []
 
     @classmethod
     def parse(cls) -> Self:
@@ -386,6 +418,19 @@ class Args(CamelCaseModel):
             action="store_false",
             dest="fast_synch",
             help="Force MLX FAST_SYNCH off",
+        )
+        parser.add_argument(
+            "--listen-port",
+            type=int,
+            default=0,
+            dest="listen_port",
+            help="Fixed libp2p listen port (default: 0 = OS-assigned random port). Use a fixed port to avoid the port-discovery dance when dialing peers.",
+        )
+        parser.add_argument(
+            "--dial",
+            action="append",
+            default=[],
+            help="Dial a peer at a specific multiaddr (e.g. /ip4/192.168.0.114/tcp/49382). Can be specified multiple times.",
         )
 
         args = parser.parse_args()

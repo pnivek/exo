@@ -180,7 +180,8 @@ impl PyNetworkingHandle {
     // ---- Lifecycle management methods ----
 
     #[new]
-    fn py_new(identity: Bound<'_, PyKeypair>) -> PyResult<Self> {
+    #[pyo3(signature = (identity, listen_port=0))]
+    fn py_new(identity: Bound<'_, PyKeypair>, listen_port: u16) -> PyResult<Self> {
         // create communication channels
         let (to_swarm, from_client) = mpsc::channel(MPSC_CHANNEL_SIZE);
 
@@ -189,7 +190,9 @@ impl PyNetworkingHandle {
 
         // create networking swarm (within tokio context!! or it crashes)
         let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
-        let swarm = create_swarm(identity, from_client).pyerr()?.into_stream();
+        let swarm = create_swarm(identity, from_client, listen_port)
+            .pyerr()?
+            .into_stream();
 
         Ok(Self {
             swarm: Arc::new(Mutex::new(swarm)),
@@ -254,6 +257,27 @@ impl PyNetworkingHandle {
         rx.allow_threads_py() // allow-threads-aware async call
             .await
             .map_err(|_| PyErr::receiver_channel_closed())
+    }
+
+    /// Dial a peer at a specific multiaddr (e.g. "/ip4/192.168.0.114/tcp/49382").
+    async fn dial_peer(&self, addr: String) -> PyResult<()> {
+        let (tx, rx) = oneshot::channel();
+        let multiaddr: libp2p::Multiaddr = addr
+            .parse()
+            .map_err(|e| PyRuntimeError::new_err(format!("Invalid multiaddr: {e}")))?;
+
+        self.to_swarm
+            .send_py(ToSwarm::Dial {
+                addr: multiaddr,
+                result_sender: tx,
+            })
+            .allow_threads_py()
+            .await?;
+
+        rx.allow_threads_py()
+            .await
+            .map_err(|_| PyErr::receiver_channel_closed())?
+            .map_err(|e| PyRuntimeError::new_err(format!("Dial failed: {e}")))
     }
 
     /// Publishes a message with multiple topics to the `GossipSub` network.

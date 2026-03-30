@@ -102,7 +102,12 @@ class TopicRouter[T: CamelCaseModel]:
 
 class Router:
     @classmethod
-    def create(cls, identity: Keypair) -> "Router":
+    def create(cls, identity: Keypair, listen_port: int = 0) -> "Router":
+        if listen_port:
+            try:
+                return cls(handle=NetworkingHandle(identity, listen_port=listen_port))
+            except TypeError:
+                pass
         return cls(handle=NetworkingHandle(identity))
 
     def __init__(self, handle: NetworkingHandle):
