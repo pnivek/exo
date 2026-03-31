@@ -25,6 +25,7 @@ services:
     devices:
       - /dev/infiniband:/dev/infiniband
     volumes:
+      - /root/.config/exo:/root/.config/exo
       - /root/.cache/huggingface:/root/.cache/huggingface
       - /root/.cache/vllm:/root/.cache/vllm
       - /root/.cache/flashinfer:/root/.cache/flashinfer
@@ -34,6 +35,7 @@ services:
       - /dev/infiniband:/dev/infiniband
     environment:
       - HF_TOKEN=${HF_TOKEN}
+      - EXO_MODELS_PATH=/root/.local/share/exo/models
       - VLLM_ENABLE_V1_MULTIPROCESSING=0
       - VLLM_KV_CACHE_LAYOUT=NHD
       - FASTSAFETENSORS_NOGDS=1

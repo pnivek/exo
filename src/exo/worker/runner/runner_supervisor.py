@@ -68,6 +68,7 @@ class RunnerSupervisor:
     _cancel_watch_runner: anyio.CancelScope = field(
         default_factory=anyio.CancelScope, init=False
     )
+    _tcp_proxy: object | None = field(default=None, init=False)
 
     @classmethod
     def create(
@@ -81,12 +82,21 @@ class RunnerSupervisor:
         task_sender, task_recv = mp_channel[Task]()
         cancel_sender, cancel_recv = mp_channel[TaskId]()
 
-        from exo.shared.types.worker.instances import VllmInstance
+        # On macOS, spawned subprocesses cannot reach LAN IPs (EHOSTUNREACH)
+        # due to posix_spawn restrictions. Start a thread-based TCP proxy in
+        # the main process (which CAN access LAN) and relay connections from
+        # the subprocess via Unix domain socket.
+        import sys as _sys
 
-        # Use default (fork) for vLLM runners on CUDA.  Triton JIT fails with
-        # both "spawn" and "forkserver" on SM121a (GB10 Blackwell) due to CUDA
-        # driver initialization issues in non-fork subprocesses.  Fork inherits the
-        # parent's CUDA context, which vLLM's in-process EngineCore handles correctly.
+        proxy_socket_path: str | None = None
+        proxy = None
+        if _sys.platform == "darwin":
+            from exo.worker.runner.tcp_proxy import TcpProxyServer
+
+            proxy = TcpProxyServer()
+            proxy.start()
+            proxy_socket_path = proxy.socket_path
+
         ctx = mp
         runner_process = ctx.Process(
             target=entrypoint,
@@ -96,6 +106,7 @@ class RunnerSupervisor:
                 task_recv,
                 cancel_recv,
                 logger,
+                proxy_socket_path,
             ),
             daemon=True,
         )
@@ -112,6 +123,7 @@ class RunnerSupervisor:
             _cancel_sender=cancel_sender,
             _event_sender=event_sender,
         )
+        self._tcp_proxy = proxy
 
         return self
 
@@ -136,6 +148,8 @@ class RunnerSupervisor:
             self._cancel_sender.send(CANCEL_ALL_TASKS)
         with contextlib.suppress(ClosedResourceError):
             self._cancel_sender.close()
+        if self._tcp_proxy is not None:
+            self._tcp_proxy.stop()
         self.runner_process.join(5)
         if not self.runner_process.is_alive():
             logger.info("Runner process succesfully terminated")

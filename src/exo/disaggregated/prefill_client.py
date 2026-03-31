@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import time
 from collections import defaultdict
 from collections.abc import Callable
 from typing import TYPE_CHECKING, BinaryIO, cast
+
+# Proxy socket path for macOS LAN access workaround
+_proxy_socket_path: str | None = os.environ.get("EXO_PREFILL_PROXY_SOCKET")
 
 import mlx.core as mx
 import torch
@@ -77,9 +81,17 @@ def remote_prefill(
     logger.info(f"Connecting to prefill server at {host}:{port} ({len(token_ids)} tokens, start_pos={start_pos})")
     t0 = time.perf_counter()
 
-    sock = socket.create_connection((host, port), timeout=60)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    if _proxy_socket_path:
+        # macOS: connect via Unix socket proxy (main process relays to TCP)
+        logger.info(f"Using TCP proxy at {_proxy_socket_path} for {host}:{port}")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(60)
+        sock.connect(_proxy_socket_path)
+        sock.sendall(f"{host}:{port}\n".encode())
+    else:
+        sock = socket.create_connection((host, port), timeout=60)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
     try:
         request = json.dumps({"model": model_id, "token_ids": token_ids, "start_pos": start_pos}).encode("utf-8") + b"\n"
         sock.sendall(request)

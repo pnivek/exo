@@ -97,13 +97,28 @@ def _classify_unknown_darwin_interface(name: str) -> InterfaceType:
     return "unknown"
 
 
+def _classify_linux_interface(name: str) -> InterfaceType:
+    """Classify a Linux network interface by name."""
+    if name.startswith(("wl", "wlan")):
+        return "wifi"
+    elif name.startswith(("docker", "br-", "veth")):
+        return "unknown"
+    elif name.startswith(("thunderbolt", "tb", "enx")):
+        return "thunderbolt"
+    elif name.startswith(("en", "eth")):
+        return "ethernet"
+    else:
+        return "unknown"
+
+
 async def _get_linux_network_interfaces() -> list[NetworkInterfaceInfo]:
     import json as _json
 
     try:
         result = await run_process(["ip", "-j", "addr", "show"])
     except (CalledProcessError, FileNotFoundError):
-        return []
+        # Fallback: use psutil when ip command is unavailable (e.g. Docker containers)
+        return _get_linux_network_interfaces_psutil()
 
     data: list[dict[str, object]] = _json.loads(result.stdout)  # pyright: ignore[reportAny]
     interfaces: list[NetworkInterfaceInfo] = []
@@ -115,14 +130,7 @@ async def _get_linux_network_interfaces() -> list[NetworkInterfaceInfo]:
         if link_type == "loopback":
             continue
         elif link_type == "ether":
-            if name.startswith(("wl", "wlan")):
-                iface_type = "wifi"
-            elif name.startswith(("docker", "br-", "veth")):
-                iface_type = "unknown"
-            elif name.startswith(("thunderbolt", "tb", "enx")):
-                iface_type = "thunderbolt"
-            else:
-                iface_type = "ethernet"
+            iface_type = _classify_linux_interface(name)
         elif link_type in ("none", "tun"):
             iface_type = "unknown"
         else:
@@ -134,6 +142,25 @@ async def _get_linux_network_interfaces() -> list[NetworkInterfaceInfo]:
             if family in ("inet", "inet6") and ip:
                 interfaces.append(NetworkInterfaceInfo(name=name, ip_address=ip, interface_type=iface_type))
 
+    return interfaces
+
+
+def _get_linux_network_interfaces_psutil() -> list[NetworkInterfaceInfo]:
+    """Fallback network interface detection using psutil (no ip command needed)."""
+    interfaces: list[NetworkInterfaceInfo] = []
+    for iface, addrs in psutil.net_if_addrs().items():
+        if iface == "lo":
+            continue
+        iface_type = _classify_linux_interface(iface)
+        for addr in addrs:
+            if addr.family in (socket.AF_INET, socket.AF_INET6) and addr.address:
+                interfaces.append(
+                    NetworkInterfaceInfo(
+                        name=iface,
+                        ip_address=addr.address,
+                        interface_type=iface_type,
+                    )
+                )
     return interfaces
 
 
