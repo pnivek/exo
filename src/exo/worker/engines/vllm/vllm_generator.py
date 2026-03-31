@@ -354,6 +354,9 @@ class VllmBatchEngine:
 
     def step(self) -> list[tuple[TaskId, GenerationResponse]]:
         if not self.has_work:
+            import time
+
+            time.sleep(0.01)  # avoid busy-spin when idle
             return []
 
         outputs = self.engine.step()

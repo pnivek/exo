@@ -153,15 +153,9 @@ def entrypoint(
     task_receiver: MpReceiver[Task],
     cancel_receiver: MpReceiver[TaskId],
     _logger: "loguru.Logger",
-    proxy_socket_path: str | None = None,
 ) -> None:
     global logger
     logger = _logger
-
-    # Configure TCP proxy for LAN connections (macOS spawned subprocess restriction)
-    if proxy_socket_path is not None:
-        os.environ["EXO_PREFILL_PROXY_SOCKET"] = proxy_socket_path
-        logger.info(f"TCP proxy configured at {proxy_socket_path}")
 
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(max(soft, 2048), hard), hard))
