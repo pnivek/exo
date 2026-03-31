@@ -17,6 +17,10 @@ from exo.utils.task_group import TaskGroup
 
 DEFAULT_ELECTION_TIMEOUT = 3.0
 
+# Longer debounce for connection events to avoid election storms during
+# long prefills where KV transfer saturates WiFi and causes libp2p flaps.
+CONNECTION_DEBOUNCE = 5.0
+
 
 class ElectionMessage(CamelCaseModel):
     clock: int
@@ -159,8 +163,11 @@ class Election:
     async def _connection_receiver(self) -> None:
         with self._cm_receiver as connection_messages:
             async for first in connection_messages:
-                # Delay after connection message for time to symmetrically setup
-                await anyio.sleep(0.2)
+                # Debounce connection events to prevent election storms.
+                # During long prefills, KV cache transfer saturates WiFi,
+                # causing libp2p connection flaps. A short debounce triggers
+                # rapid re-elections that destroy running instances.
+                await anyio.sleep(CONNECTION_DEBOUNCE)
                 rest = connection_messages.collect()
 
                 logger.debug(
