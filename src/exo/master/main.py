@@ -136,6 +136,31 @@ class Master:
                     continue
 
                 ip = find_ip_prioritised(decode_node, node_id, self.state.topology, self.state.node_network, ring=True)
+
+                # Fallback: when topology edges are empty (election cycling
+                # prevents edge persistence), pick the best IP directly from
+                # the node's reported network interfaces.
+                if ip is None:
+                    node_net = self.state.node_network.get(node_id)
+                    if node_net:
+                        iface_priority = {
+                            "thunderbolt": 0, "maybe_ethernet": 1,
+                            "ethernet": 2, "wifi": 3, "unknown": 4,
+                        }
+                        best = sorted(
+                            (i for i in node_net.interfaces
+                             if i.ip_address
+                             and not i.ip_address.startswith("127.")
+                             and not i.ip_address.startswith("169.254.")
+                             and not i.ip_address.startswith("172.17.")
+                             and not i.ip_address.startswith("fe80")
+                             and not i.ip_address.startswith("::1")),
+                            key=lambda i: iface_priority.get(i.interface_type, 4),
+                        )
+                        if best:
+                            ip = best[0].ip_address
+                            logger.info(f"Prefill routing: using nodeNetwork fallback {ip} [{best[0].interface_type}] for {node_id}")
+
                 if ip is None:
                     logger.info(f"Prefill routing: no IP route from {decode_node} to {node_id}")
                     continue
