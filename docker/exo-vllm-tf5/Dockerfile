@@ -28,7 +28,7 @@ RUN mkdir -p /app/dashboard/build
 ARG BUILD_JOBS=16
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
 RUN cd rust/exo_pyo3_bindings && \
-    maturin build --release --interpreter python3 2>&1 | tail -5 && \
+    maturin build --release --interpreter python3 && \
     pip install /app/target/wheels/exo_pyo3_bindings*.whl
 
 # ── Install exo (no-deps since most deps are already in the base image) ──
