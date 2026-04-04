@@ -160,10 +160,22 @@ pub fn create_swarm(
     from_client: mpsc::Receiver<ToSwarm>,
     port: u16,
 ) -> alias::AnyResult<Swarm> {
+    create_swarm_with_mdns(keypair, from_client, port, true)
+}
+
+/// Create a swarm with optional mDNS discovery.
+/// When `enable_mdns` is false, peer discovery relies solely on explicit dial addresses.
+/// This prevents WiFi-induced connection flaps from triggering election storms.
+pub fn create_swarm_with_mdns(
+    keypair: identity::Keypair,
+    from_client: mpsc::Receiver<ToSwarm>,
+    port: u16,
+    enable_mdns: bool,
+) -> alias::AnyResult<Swarm> {
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_other_transport(tcp_transport)?
-        .with_behaviour(Behaviour::new)?
+        .with_behaviour(|kp| Behaviour::with_mdns(kp, enable_mdns))?
         .build();
 
     let addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{port}").parse()?;

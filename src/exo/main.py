@@ -48,7 +48,11 @@ class Node:
         keypair = get_node_id_keypair()
         node_id = NodeId(keypair.to_node_id())
         session_id = SessionId(master_node_id=node_id, election_clock=0)
-        router = Router.create(keypair, listen_port=args.listen_port)
+        # Disable mDNS when explicit --dial addresses are provided.
+        # mDNS multicast over WiFi causes connection flaps → election storms.
+        # With --dial, peers are discovered explicitly — mDNS is unnecessary.
+        enable_mdns = len(args.dial) == 0
+        router = Router.create(keypair, listen_port=args.listen_port, enable_mdns=enable_mdns)
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
         await router.register_topic(topics.COMMANDS)

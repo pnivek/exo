@@ -25,6 +25,7 @@ const RETRY_CONNECT_INTERVAL: Duration = Duration::from_secs(5);
 
 mod managed {
     use libp2p::swarm::NetworkBehaviour;
+    use libp2p::swarm::behaviour::toggle::Toggle;
     use libp2p::{identity, mdns, ping};
     use std::io;
     use std::time::Duration;
@@ -36,14 +37,23 @@ mod managed {
 
     #[derive(NetworkBehaviour)]
     pub struct Behaviour {
-        mdns: mdns::tokio::Behaviour,
+        mdns: Toggle<mdns::tokio::Behaviour>,
         ping: ping::Behaviour,
     }
 
     impl Behaviour {
         pub fn new(keypair: &identity::Keypair) -> io::Result<Self> {
+            Self::with_mdns(keypair, true)
+        }
+
+        pub fn with_mdns(keypair: &identity::Keypair, enable_mdns: bool) -> io::Result<Self> {
+            let mdns = if enable_mdns {
+                Toggle::from(Some(mdns_behaviour(keypair)?))
+            } else {
+                Toggle::from(None)
+            };
             Ok(Self {
-                mdns: mdns_behaviour(keypair)?,
+                mdns,
                 ping: ping_behaviour(),
             })
         }
@@ -52,12 +62,9 @@ mod managed {
     fn mdns_behaviour(keypair: &identity::Keypair) -> io::Result<mdns::tokio::Behaviour> {
         use mdns::{Config, tokio};
 
-        // mDNS config => enable IPv6
         let mdns_config = Config {
             ttl: MDNS_RECORD_TTL,
             query_interval: MDNS_QUERY_INTERVAL,
-
-            // enable_ipv6: true, // TODO: for some reason, TCP+mDNS don't work well with ipv6?? figure out how to make work
             ..Default::default()
         };
 
@@ -113,8 +120,12 @@ pub struct Behaviour {
 
 impl Behaviour {
     pub fn new(keypair: &identity::Keypair) -> io::Result<Self> {
+        Self::with_mdns(keypair, true)
+    }
+
+    pub fn with_mdns(keypair: &identity::Keypair, enable_mdns: bool) -> io::Result<Self> {
         Ok(Self {
-            managed: managed::Behaviour::new(keypair)?,
+            managed: managed::Behaviour::with_mdns(keypair, enable_mdns)?,
             mdns_discovered: HashMap::new(),
             retry_delay: Delay::new(RETRY_CONNECT_INTERVAL),
             pending_events: WakerDeque::new(),

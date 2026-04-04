@@ -11,7 +11,7 @@ use crate::networking::exception::{
 use crate::pyclass;
 use futures_lite::{Stream, StreamExt as _};
 use libp2p::gossipsub::PublishError;
-use networking::swarm::{FromSwarm, ToSwarm, create_swarm};
+use networking::swarm::{FromSwarm, ToSwarm, create_swarm_with_mdns};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::{PyModule, PyModuleMethods as _};
 use pyo3::types::PyBytes;
@@ -180,8 +180,8 @@ impl PyNetworkingHandle {
     // ---- Lifecycle management methods ----
 
     #[new]
-    #[pyo3(signature = (identity, listen_port=0))]
-    fn py_new(identity: Bound<'_, PyKeypair>, listen_port: u16) -> PyResult<Self> {
+    #[pyo3(signature = (identity, listen_port=0, enable_mdns=true))]
+    fn py_new(identity: Bound<'_, PyKeypair>, listen_port: u16, enable_mdns: bool) -> PyResult<Self> {
         // create communication channels
         let (to_swarm, from_client) = mpsc::channel(MPSC_CHANNEL_SIZE);
 
@@ -190,7 +190,7 @@ impl PyNetworkingHandle {
 
         // create networking swarm (within tokio context!! or it crashes)
         let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
-        let swarm = create_swarm(identity, from_client, listen_port)
+        let swarm = create_swarm_with_mdns(identity, from_client, listen_port, enable_mdns)
             .pyerr()?
             .into_stream();
 
