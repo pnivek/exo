@@ -20,7 +20,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY pyproject.toml README.md ./
 COPY resources/ resources/
-COPY dashboard/build/ dashboard/build/
+# Dashboard build artifact is optional — this node is a vLLM prefill worker.
+# Create empty placeholder so exo's dashboard path finder doesn't crash.
+RUN mkdir -p /app/dashboard/build
 
 # ── Build Rust bindings for Python 3.12 ──────────────────────────────────
 ARG BUILD_JOBS=16
