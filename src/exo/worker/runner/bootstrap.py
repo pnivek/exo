@@ -183,12 +183,10 @@ def entrypoint(
             os.environ["VLLM_KV_CACHE_LAYOUT"] = "NHD"
             os.environ["FASTSAFETENSORS_NOGDS"] = "1"
             # os.environ["VLLM_BATCH_INVARIANT"] = "1"
-            # NOTE: _ensure_cuda_libs() intentionally NOT called.
-            # Pre-loading libcuda.so.1/libnvidia-ml.so.1 with RTLD_GLOBAL
-            # causes Triton's cuInit(0) to fail in this subprocess with
-            # "Triton Error [CUDA]: initialization error". vLLM and PyTorch
-            # load CUDA libs correctly on their own.
-            _patch_flashinfer_triton_kernels()
+            # NOTE: _ensure_cuda_libs() and _patch_flashinfer_triton_kernels()
+            # intentionally NOT called. These were workarounds for vLLM 0.18.1
+            # on SM121a. With vLLM 0.19.1+ and FlashInfer 0.6.7+, the native
+            # Triton/FlashInfer kernels work correctly on SM121a.
             _ensure_tiktoken_encodings()
             from exo.shared.constants import EXO_MODELS_DIR
             from exo.worker.runner.llm_inference.runner import Runner, VllmBuilder

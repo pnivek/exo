@@ -253,31 +253,40 @@ class Node:
                         f"Node {result.session_id.master_node_id} elected master"
                     )
                 if result.is_new_master:
-                    if self.download_coordinator:
-                        self.download_coordinator.shutdown()
-                        self.download_coordinator = DownloadCoordinator(
-                            self.node_id,
-                            exo_shard_downloader(offline=self.offline),
-                            event_sender=self.event_router.sender(),
-                            download_command_receiver=self.router.receiver(
-                                topics.DOWNLOAD_COMMANDS
-                            ),
-                            offline=self.offline,
-                        )
-                        self._tg.start_soon(self.download_coordinator.run)
-                    if self.worker:
-                        self.worker.shutdown()
-                        # TODO: add profiling etc to resource monitor
-                        self.worker = Worker(
-                            self.node_id,
-                            event_receiver=self.event_router.receiver(),
-                            event_sender=self.event_router.sender(),
-                            command_sender=self.router.sender(topics.COMMANDS),
-                            download_command_sender=self.router.sender(
-                                topics.DOWNLOAD_COMMANDS
-                            ),
-                        )
-                        self._tg.start_soon(self.worker.run)
+                    # Only restart Worker/DownloadCoordinator when the master
+                    # node actually CHANGES (different node ID). When the same
+                    # node re-wins with a new election clock, skip the restart
+                    # to avoid killing runners during long model loads (70B+).
+                    master_changed = not hasattr(self, '_last_master_node_id') or \
+                        self._last_master_node_id != result.session_id.master_node_id
+                    self._last_master_node_id = result.session_id.master_node_id
+
+                    if master_changed:
+                        if self.download_coordinator:
+                            self.download_coordinator.shutdown()
+                            self.download_coordinator = DownloadCoordinator(
+                                self.node_id,
+                                exo_shard_downloader(offline=self.offline),
+                                event_sender=self.event_router.sender(),
+                                download_command_receiver=self.router.receiver(
+                                    topics.DOWNLOAD_COMMANDS
+                                ),
+                                offline=self.offline,
+                            )
+                            self._tg.start_soon(self.download_coordinator.run)
+                        if self.worker:
+                            self.worker.shutdown()
+                            # TODO: add profiling etc to resource monitor
+                            self.worker = Worker(
+                                self.node_id,
+                                event_receiver=self.event_router.receiver(),
+                                event_sender=self.event_router.sender(),
+                                command_sender=self.router.sender(topics.COMMANDS),
+                                download_command_sender=self.router.sender(
+                                    topics.DOWNLOAD_COMMANDS
+                                ),
+                            )
+                            self._tg.start_soon(self.worker.run)
                     if self.api:
                         self.api.reset(result.won_clock, self.event_router.receiver())
                 else:

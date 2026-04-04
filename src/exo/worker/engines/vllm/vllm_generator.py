@@ -611,13 +611,14 @@ def load_vllm_engine(
     engine_args = EngineArgs(
         model=model_path,
         served_model_name=str(model_id),
-        gpu_memory_utilization=0.05,
+        gpu_memory_utilization=float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.7")),
         trust_remote_code=trust_remote_code,
-        load_format=os.environ.get("VLLM_LOAD_FORMAT", "safetensors"),
-        enable_prefix_caching=False,
+        load_format=os.environ.get("VLLM_LOAD_FORMAT", "fastsafetensors"),
+        enable_prefix_caching=True,
         attention_backend=attention_backend,
         disable_log_stats=True,
         max_num_batched_tokens=4096,
+        kv_cache_dtype=os.environ.get("VLLM_KV_CACHE_DTYPE", "auto"),
         kv_transfer_config=kv_transfer_config,  # type: ignore
         disable_hybrid_kv_cache_manager=False,
     )

@@ -23,11 +23,17 @@ from mlx_lm.models.deepseek_v32 import DeepseekV32MLP
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.glm4_moe import Model as Glm4MoeModel
 from mlx_lm.models.glm4_moe import MoE
-from mlx_lm.models.glm4_moe_lite import Glm4MoeLiteDecoderLayer, Glm4MoeLiteMLP
-from mlx_lm.models.glm4_moe_lite import Model as GLM4MoeLiteModel
+try:
+    from mlx_lm.models.glm4_moe_lite import Glm4MoeLiteDecoderLayer, Glm4MoeLiteMLP
+    from mlx_lm.models.glm4_moe_lite import Model as GLM4MoeLiteModel
+except ModuleNotFoundError:
+    Glm4MoeLiteDecoderLayer = Glm4MoeLiteMLP = GLM4MoeLiteModel = None  # type: ignore[assignment, misc]
 from mlx_lm.models.gpt_oss import GptOssMoeModel
 from mlx_lm.models.gpt_oss import Model as GptOssModel
-from mlx_lm.models.kimi_k25 import Model as KimiK25Model
+try:
+    from mlx_lm.models.kimi_k25 import Model as KimiK25Model
+except ModuleNotFoundError:
+    KimiK25Model = None  # type: ignore[assignment, misc]
 from mlx_lm.models.llama import Model as LlamaModel
 from mlx_lm.models.minimax import MiniMaxAttention
 from mlx_lm.models.minimax import Model as MiniMaxModel
@@ -39,11 +45,17 @@ from mlx_lm.models.nemotron_h import (
     NemotronHMoE,
 )
 from mlx_lm.models.nemotron_h import NemotronHModel as NemotronHInnerModel
-from mlx_lm.models.qwen3_5 import DecoderLayer as Qwen3_5DecoderLayer
-from mlx_lm.models.qwen3_5 import Model as Qwen3_5TextModel
-from mlx_lm.models.qwen3_5 import Qwen3_5TextModel as Qwen3_5TextModelInner
-from mlx_lm.models.qwen3_5 import SparseMoeBlock as Qwen3_5SparseMoeBlock
-from mlx_lm.models.qwen3_5_moe import Model as Qwen3_5MoeModel
+try:
+    from mlx_lm.models.qwen3_5 import DecoderLayer as Qwen3_5DecoderLayer
+    from mlx_lm.models.qwen3_5 import Model as Qwen3_5TextModel
+    from mlx_lm.models.qwen3_5 import Qwen3_5TextModel as Qwen3_5TextModelInner
+    from mlx_lm.models.qwen3_5 import SparseMoeBlock as Qwen3_5SparseMoeBlock
+except ModuleNotFoundError:
+    Qwen3_5DecoderLayer = Qwen3_5TextModel = Qwen3_5TextModelInner = Qwen3_5SparseMoeBlock = None  # type: ignore[assignment, misc]
+try:
+    from mlx_lm.models.qwen3_5_moe import Model as Qwen3_5MoeModel
+except ModuleNotFoundError:
+    Qwen3_5MoeModel = None  # type: ignore[assignment, misc]
 from mlx_lm.models.qwen3_moe import Model as Qwen3MoeModel
 from mlx_lm.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeSparseMoeBlock
 from mlx_lm.models.qwen3_next import Model as Qwen3NextModel
@@ -53,9 +65,12 @@ from mlx_lm.models.qwen3_next import (
     Qwen3NextSparseMoeBlock,
 )
 from mlx_lm.models.qwen3_next import Qwen3NextModel as Qwen3NextInnerModel
-from mlx_lm.models.step3p5 import Model as Step35Model
-from mlx_lm.models.step3p5 import Step3p5MLP as Step35MLP
-from mlx_lm.models.step3p5 import Step3p5Model as Step35InnerModel
+try:
+    from mlx_lm.models.step3p5 import Model as Step35Model
+    from mlx_lm.models.step3p5 import Step3p5MLP as Step35MLP
+    from mlx_lm.models.step3p5 import Step3p5Model as Step35InnerModel
+except ModuleNotFoundError:
+    Step35Model = Step35MLP = Step35InnerModel = None  # type: ignore[assignment, misc]
 
 from exo.shared.logging import logger
 from exo.shared.types.worker.shards import PipelineShardMetadata

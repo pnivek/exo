@@ -19,7 +19,7 @@ DEFAULT_ELECTION_TIMEOUT = 3.0
 
 # Longer debounce for connection events to avoid election storms during
 # long prefills where KV transfer saturates WiFi and causes libp2p flaps.
-CONNECTION_DEBOUNCE = 5.0
+CONNECTION_DEBOUNCE = 10.0
 
 
 class ElectionMessage(CamelCaseModel):

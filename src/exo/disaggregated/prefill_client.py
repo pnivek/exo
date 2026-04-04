@@ -77,7 +77,7 @@ def remote_prefill(
     logger.info(f"Connecting to prefill server at {host}:{port} ({len(token_ids)} tokens, start_pos={start_pos})")
     t0 = time.perf_counter()
 
-    sock = socket.create_connection((host, port), timeout=60)
+    sock = socket.create_connection((host, port), timeout=300)  # 5 min for large model first-prefill CUDA graph compilation
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
     try:
