@@ -25,19 +25,22 @@ const RETRY_CONNECT_INTERVAL: Duration = Duration::from_secs(5);
 
 mod managed {
     use libp2p::swarm::NetworkBehaviour;
-    use libp2p::swarm::behaviour::toggle::Toggle;
     use libp2p::{identity, mdns, ping};
     use std::io;
     use std::time::Duration;
 
     const MDNS_RECORD_TTL: Duration = Duration::from_secs(2_500);
     const MDNS_QUERY_INTERVAL: Duration = Duration::from_secs(1_500);
+    // When mDNS is "disabled", use an extremely long query interval so it
+    // never fires.  This avoids the complexity of Toggle<> with the
+    // #[derive(NetworkBehaviour)] macro.
+    const MDNS_DISABLED_INTERVAL: Duration = Duration::from_secs(999_999);
     const PING_TIMEOUT: Duration = Duration::from_millis(2_500);
     const PING_INTERVAL: Duration = Duration::from_millis(2_500);
 
     #[derive(NetworkBehaviour)]
     pub struct Behaviour {
-        mdns: Toggle<mdns::tokio::Behaviour>,
+        mdns: mdns::tokio::Behaviour,
         ping: ping::Behaviour,
     }
 
@@ -47,24 +50,19 @@ mod managed {
         }
 
         pub fn with_mdns(keypair: &identity::Keypair, enable_mdns: bool) -> io::Result<Self> {
-            let mdns = if enable_mdns {
-                Toggle::from(Some(mdns_behaviour(keypair)?))
-            } else {
-                Toggle::from(None)
-            };
             Ok(Self {
-                mdns,
+                mdns: mdns_behaviour(keypair, enable_mdns)?,
                 ping: ping_behaviour(),
             })
         }
     }
 
-    fn mdns_behaviour(keypair: &identity::Keypair) -> io::Result<mdns::tokio::Behaviour> {
+    fn mdns_behaviour(keypair: &identity::Keypair, enabled: bool) -> io::Result<mdns::tokio::Behaviour> {
         use mdns::{Config, tokio};
 
         let mdns_config = Config {
             ttl: MDNS_RECORD_TTL,
-            query_interval: MDNS_QUERY_INTERVAL,
+            query_interval: if enabled { MDNS_QUERY_INTERVAL } else { MDNS_DISABLED_INTERVAL },
             ..Default::default()
         };
 
