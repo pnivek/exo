@@ -272,8 +272,12 @@ mod behaviour {
 
     impl Behaviour {
         pub fn new(keypair: &identity::Keypair) -> alias::AnyResult<Self> {
+            Self::with_mdns(keypair, true)
+        }
+
+        pub fn with_mdns(keypair: &identity::Keypair, enable_mdns: bool) -> alias::AnyResult<Self> {
             Ok(Self {
-                discovery: discovery::Behaviour::new(keypair)?,
+                discovery: discovery::Behaviour::with_mdns(keypair, enable_mdns)?,
                 gossipsub: gossipsub_behaviour(keypair),
             })
         }
