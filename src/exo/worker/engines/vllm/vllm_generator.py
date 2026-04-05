@@ -614,7 +614,10 @@ def load_vllm_engine(
     # the autotuner forces FlashInfer to use default tactics without subprocess.
     # Also enforce eager to avoid CUDA graph capture issues.
     is_fp8 = "fp8" in model_path.lower() or "fp8" in str(model_id).lower()
-    enforce_eager = is_fp8 or bool(os.environ.get("VLLM_ENFORCE_EAGER", ""))
+    # Enforce eager for all models on GB10 — CUDA graph capture + large BF16
+    # models leaves almost no room for KV cache. Eager mode trades some decode
+    # throughput for much more KV headroom (46+ GiB vs 2 GiB).
+    enforce_eager = True
 
     engine_args = EngineArgs(
         model=model_path,
