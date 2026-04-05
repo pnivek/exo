@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 from typing import Any
 
 import torch
@@ -108,13 +109,20 @@ def _patch_determine_available_memory() -> None:
             pass
         finally:
             torch.cuda.empty_cache = real_empty_cache  # type: ignore
-        free_bytes, _ = torch.cuda.mem_get_info()
-        initial = max(int(free_bytes * INITIAL_FRACTION), 1)
-        self._growable_max_kv_bytes = free_bytes
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        # On unified memory (GB10), torch.cuda.mem_get_info underreports free
+        # memory because PyTorch's CUDA allocator holds reserved-but-unused pools.
+        # Ensure at least MIN_KV_CACHE_GIB so we can handle 32K+ token prefills.
+        MIN_KV_CACHE_GIB = int(os.environ.get("EXO_MIN_KV_CACHE_GIB", "10"))
+        min_kv_bytes = MIN_KV_CACHE_GIB * 1024**3
+        effective_free = max(free_bytes, min_kv_bytes)
+        initial = max(int(effective_free * INITIAL_FRACTION), 1)
+        self._growable_max_kv_bytes = effective_free
         self.available_kv_cache_memory_bytes = initial
         logger.info(
             f"Growable KV cache: initial {initial / (1024**3):.2f} GiB "
-            f"(max {free_bytes / (1024**3):.2f} GiB)"
+            f"(max {effective_free / (1024**3):.2f} GiB, "
+            f"torch reported free {free_bytes / (1024**3):.2f} GiB)"
         )
         return initial
 
