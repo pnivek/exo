@@ -110,11 +110,32 @@ def _patch_determine_available_memory() -> None:
         finally:
             torch.cuda.empty_cache = real_empty_cache  # type: ignore
         free_bytes, total_bytes = torch.cuda.mem_get_info()
+
+        # Compute how much KV cache the model's max context actually needs.
+        # This makes the allocation dynamic based on model architecture.
+        min_kv_bytes = 0
+        try:
+            kv_spec = self.get_kv_cache_spec()
+            block_size_bytes = sum(
+                spec.page_size_bytes for spec in kv_spec.values()
+            )
+            tokens_per_block = next(iter(kv_spec.values())).block_len
+            max_seq_len = self.model_config.max_model_len
+            blocks_needed = (max_seq_len + tokens_per_block - 1) // tokens_per_block
+            min_kv_bytes = blocks_needed * block_size_bytes
+            logger.info(
+                f"KV cache for {max_seq_len} tokens: "
+                f"{min_kv_bytes / (1024**3):.2f} GiB "
+                f"({blocks_needed} blocks × {block_size_bytes} bytes)"
+            )
+        except Exception as e:
+            logger.warning(f"Could not compute KV cache size from model spec: {e}")
+            # Fallback to env var or 10 GiB default
+            min_kv_bytes = int(os.environ.get("EXO_MIN_KV_CACHE_GIB", "10")) * 1024**3
+
         # On unified memory (GB10), torch.cuda.mem_get_info underreports free
-        # memory because PyTorch's CUDA allocator holds reserved-but-unused pools.
-        # Ensure at least MIN_KV_CACHE_GIB so we can handle 32K+ token prefills.
-        MIN_KV_CACHE_GIB = int(os.environ.get("EXO_MIN_KV_CACHE_GIB", "10"))
-        min_kv_bytes = MIN_KV_CACHE_GIB * 1024**3
+        # memory because PyTorch's CUDA allocator holds reserved-but-unused
+        # pools. Use the model-derived minimum as a floor.
         effective_free = max(free_bytes, min_kv_bytes)
         initial = max(int(effective_free * INITIAL_FRACTION), 1)
         self._growable_max_kv_bytes = effective_free
