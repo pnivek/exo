@@ -268,17 +268,23 @@ def _run_prefill_overlapping(engine: LLMEngine, token_ids: list[int], start_pos:
     prefill_token_ids = token_ids[:-2] if len(token_ids) > 2 else token_ids
     request_id = f"prefill-{time.monotonic_ns()}"
     params = SamplingParams(max_tokens=2, detokenize=False)  # pyright: ignore[reportCallIssue]
+    logger.info(f"DEBUG: adding request {request_id} with {len(prefill_token_ids)} tokens")
     engine.add_request(request_id, {"prompt_token_ids": prefill_token_ids}, params)  # pyright: ignore[reportArgumentType]
+    logger.info(f"DEBUG: request added, has_unfinished={engine.has_unfinished_requests()}")
 
     chunks_sent = [0]
     layer_token_counts: dict[int, int] = {}
     all_kv_chunks: list[tuple[int, torch.Tensor, torch.Tensor]] = []
 
     def writer_loop() -> None:
+        logger.info("DEBUG: writer_loop started")
+        items_received = 0
         while True:
             item = layer_queue.get()
             if item is None:
+                logger.info(f"DEBUG: writer_loop got None sentinel, total items={items_received}")
                 break
+            items_received += 1
             layer_idx, keys, values = item
             all_kv_chunks.append((layer_idx, keys, values))
 
@@ -286,6 +292,9 @@ def _run_prefill_overlapping(engine: LLMEngine, token_ids: list[int], start_pos:
             n = keys.shape[0]
             new_total = prev + n
             layer_token_counts[layer_idx] = new_total
+
+            if items_received <= 2 or items_received % 20 == 0:
+                logger.info(f"DEBUG: writer got item #{items_received} layer={layer_idx} keys={keys.shape}")
 
             if new_total <= skip_tokens:
                 continue
@@ -301,10 +310,15 @@ def _run_prefill_overlapping(engine: LLMEngine, token_ids: list[int], start_pos:
     writer_thread = threading.Thread(target=writer_loop, daemon=True)
     writer_thread.start()
 
+    step_count = 0
     while engine.has_unfinished_requests():
+        step_count += 1
         outputs = engine.step()
+        if step_count <= 3 or step_count % 10 == 0:
+            logger.info(f"DEBUG: engine.step() #{step_count}, outputs={len(outputs)}, queue_size={layer_queue.qsize()}")
         for output in outputs:
             if output.request_id == request_id and output.outputs[0].token_ids:
+                logger.info(f"DEBUG: got output token after {step_count} steps, aborting request")
                 engine.abort_request([request_id])  # type: ignore
                 break
         else:
