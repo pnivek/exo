@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import multiprocessing
+import queue
 import re
 from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.multiprocessing  # noqa: F401 — registers tensor ForkingPickler reducers for zero-copy sharing
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # pyright: ignore[reportMissingImports]
     KVConnectorBase_V1,  # pyright: ignore[reportUnknownVariableType]
@@ -17,20 +16,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # pyright: igno
 
 _LAYER_RE = re.compile(r"layers\.(\d+)\.")
 
-# Use multiprocessing.SimpleQueue so that KV data written in the vLLM EngineCore
-# subprocess (forked by VLLM_ENABLE_V1_MULTIPROCESSING=1) is readable in the
-# runner (parent) process. torch.multiprocessing is imported above to register
-# tensor ForkingPickler reducers, enabling zero-copy CPU-tensor sharing via
-# /dev/shm instead of serialisation through the pipe.
-_shared_queue: multiprocessing.SimpleQueue[tuple[int, torch.Tensor, torch.Tensor] | None] = multiprocessing.SimpleQueue()
-_shared_arrays_queue: multiprocessing.SimpleQueue[tuple[int, list[torch.Tensor]] | None] = multiprocessing.SimpleQueue()
+# Use queue.Queue (in-process, zero-copy) since VLLM_ENABLE_V1_MULTIPROCESSING=0.
+# multiprocessing.SimpleQueue serializes tensors through a pipe which deadlocks
+# on large models (70B = ~192MB KV data fills the pipe buffer).
+_shared_queue: queue.Queue[tuple[int, torch.Tensor, torch.Tensor] | None] = queue.Queue()
+_shared_arrays_queue: queue.Queue[tuple[int, list[torch.Tensor]] | None] = queue.Queue()
 
 
-def get_shared_queue() -> multiprocessing.SimpleQueue[tuple[int, torch.Tensor, torch.Tensor] | None]:
+def get_shared_queue() -> queue.Queue[tuple[int, torch.Tensor, torch.Tensor] | None]:
     return _shared_queue
 
 
-def get_shared_arrays_queue() -> multiprocessing.SimpleQueue[tuple[int, list[torch.Tensor]] | None]:
+def get_shared_arrays_queue() -> queue.Queue[tuple[int, list[torch.Tensor]] | None]:
     return _shared_arrays_queue
 
 
@@ -57,7 +54,7 @@ class StreamingConnectorMetadata(KVConnectorMetadata):  # pyright: ignore[report
 
 
 class StreamingConnector(KVConnectorBase_V1, SupportsHMA):  # pyright: ignore[reportUntypedBaseClass]
-    _queue: multiprocessing.SimpleQueue[tuple[int, torch.Tensor, torch.Tensor] | None]
+    _queue: queue.Queue[tuple[int, torch.Tensor, torch.Tensor] | None]
 
     _save_count: int = 0
 
@@ -66,7 +63,7 @@ class StreamingConnector(KVConnectorBase_V1, SupportsHMA):  # pyright: ignore[re
         self._queue = _shared_queue
 
     @property
-    def layer_queue(self) -> multiprocessing.SimpleQueue[tuple[int, torch.Tensor, torch.Tensor] | None]:
+    def layer_queue(self) -> queue.Queue[tuple[int, torch.Tensor, torch.Tensor] | None]:
         return self._queue
 
     def start_load_kv(self, forward_context: Any, **kwargs: Any) -> None:  # pyright: ignore[reportAny]
