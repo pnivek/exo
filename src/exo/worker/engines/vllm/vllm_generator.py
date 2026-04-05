@@ -608,6 +608,14 @@ def load_vllm_engine(
     attention_backend = "FLASH_ATTN" if has_mamba else "FLASHINFER"
     logger.info(f"Using attention backend: {attention_backend}")
 
+    # FP8 models crash on SM121a (GB10) because FlashInfer's autotuner runs FP8
+    # GEMM in a subprocess that initializes cuBLASLt, but the main process then
+    # tries to use FP8 GEMM without its own cuBLASLt initialization. Disabling
+    # the autotuner forces FlashInfer to use default tactics without subprocess.
+    # Also enforce eager to avoid CUDA graph capture issues.
+    is_fp8 = "fp8" in model_path.lower() or "fp8" in str(model_id).lower()
+    enforce_eager = is_fp8 or bool(os.environ.get("VLLM_ENFORCE_EAGER", ""))
+
     engine_args = EngineArgs(
         model=model_path,
         served_model_name=str(model_id),
@@ -621,6 +629,8 @@ def load_vllm_engine(
         kv_cache_dtype=os.environ.get("VLLM_KV_CACHE_DTYPE", "auto"),
         kv_transfer_config=kv_transfer_config,  # type: ignore
         disable_hybrid_kv_cache_manager=False,
+        enforce_eager=enforce_eager,
+        enable_flashinfer_autotune=not is_fp8,  # Autotuner subprocess breaks cuBLASLt FP8 on SM121a
     )
 
     set_weight_loading_callback(on_layer_loaded)
