@@ -265,7 +265,11 @@ def _run_prefill_overlapping(engine: LLMEngine, token_ids: list[int], start_pos:
         SamplingParams,
     )
 
-    prefill_token_ids = token_ids[:-2] if len(token_ids) > 2 else token_ids
+    # Strip last 64 tokens — client re-prefills these locally to bridge KV divergence
+    # from heterogeneous hardware (e.g. NVFP4 on Spark vs 4-bit on Mac).
+    _REPREFILL = 64
+    _strip = min(_REPREFILL, len(token_ids) - 1)
+    prefill_token_ids = token_ids[:-_strip] if _strip > 0 else token_ids
     request_id = f"prefill-{time.monotonic_ns()}"
     params = SamplingParams(max_tokens=2, detokenize=False)  # pyright: ignore[reportCallIssue]
     engine.add_request(request_id, {"prompt_token_ids": prefill_token_ids}, params)  # pyright: ignore[reportArgumentType]
@@ -367,7 +371,11 @@ def _run_prefill_batch(engine: LLMEngine, token_ids: list[int], start_pos: int, 
         SamplingParams,
     )
 
-    prefill_token_ids = token_ids[:-2] if len(token_ids) > 2 else token_ids
+    # Strip last 64 tokens — client re-prefills these locally to bridge KV divergence
+    # from heterogeneous hardware (e.g. NVFP4 on Spark vs 4-bit on Mac).
+    _REPREFILL = 64
+    _strip = min(_REPREFILL, len(token_ids) - 1)
+    prefill_token_ids = token_ids[:-_strip] if _strip > 0 else token_ids
     request_id = f"prefill-{time.monotonic_ns()}"
     params = SamplingParams(max_tokens=2, detokenize=False)  # pyright: ignore[reportCallIssue]
     engine.add_request(request_id, {"prompt_token_ids": prefill_token_ids}, params)  # pyright: ignore[reportArgumentType]

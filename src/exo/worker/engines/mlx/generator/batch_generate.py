@@ -216,7 +216,15 @@ class ExoBatchGenerator:
                 matched_index,
             )
 
-        last_tokens = mx.array(all_prompt_tokens[-2:]) if used_remote_prefill else prompt_tokens[-2:]
+        # Re-prefill more tokens locally after remote prefill to bridge KV divergence
+        # from heterogeneous hardware (e.g. NVFP4 on Spark vs 4-bit on Mac).
+        _DISAGG_REPREFILL_TOKENS = 64
+        if used_remote_prefill:
+            reprefill = min(_DISAGG_REPREFILL_TOKENS, len(all_prompt_tokens))
+            reprefill = max(reprefill, 2)
+            last_tokens = mx.array(all_prompt_tokens[-reprefill:])
+        else:
+            last_tokens = prompt_tokens[-2:]
 
         logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
             make_logits_processors(
