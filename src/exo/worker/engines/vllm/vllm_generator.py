@@ -619,7 +619,7 @@ def load_vllm_engine(
     engine_args = EngineArgs(
         model=model_path,
         served_model_name=str(model_id),
-        gpu_memory_utilization=float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.7")),
+        gpu_memory_utilization=float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.9")),
         trust_remote_code=trust_remote_code,
         load_format=os.environ.get("VLLM_LOAD_FORMAT", "fastsafetensors"),
         enable_prefix_caching=True,
