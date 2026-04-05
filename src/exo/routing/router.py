@@ -107,7 +107,11 @@ class Router:
             try:
                 return cls(handle=NetworkingHandle(identity, listen_port=listen_port, enable_mdns=enable_mdns))
             except TypeError:
-                pass
+                # Fallback for older Rust bindings that don't have enable_mdns
+                try:
+                    return cls(handle=NetworkingHandle(identity, listen_port=listen_port))
+                except TypeError:
+                    pass
         return cls(handle=NetworkingHandle(identity))
 
     def __init__(self, handle: NetworkingHandle):
