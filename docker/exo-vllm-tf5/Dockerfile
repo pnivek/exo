@@ -22,7 +22,9 @@ COPY pyproject.toml README.md ./
 COPY resources/ resources/
 # Dashboard build artifact is optional — this node is a vLLM prefill worker.
 # Create empty placeholder so exo's dashboard path finder doesn't crash.
-RUN mkdir -p /app/dashboard/build
+# Create minimal dashboard placeholder (vLLM prefill node doesn't serve UI)
+RUN mkdir -p /app/dashboard/build/_app && \
+    echo '<!DOCTYPE html><html><body>exo vllm prefill node</body></html>' > /app/dashboard/build/index.html
 
 # ── Build Rust bindings for Python 3.12 ──────────────────────────────────
 ARG BUILD_JOBS=16
