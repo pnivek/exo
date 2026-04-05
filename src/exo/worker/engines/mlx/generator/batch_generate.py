@@ -153,6 +153,7 @@ class ExoBatchGenerator:
         _prefill_tps: float = 0.0
         cache_snapshots: list[CacheSnapshot] | None = None
         used_remote_prefill = False
+        remote_kv_offset = 0
         uncached_count = len(prompt_tokens)
         if (
             uncached_count > 1000
@@ -178,6 +179,7 @@ class ExoBatchGenerator:
                 cache_snapshots = [snapshot_ssm_states(cache)]
                 _prefill_tps = total_tokens / max(time.perf_counter() - t0, 0.001)
                 used_remote_prefill = True
+                remote_kv_offset = total_tokens  # actual # of positions with remote KV
                 logger.info(f"Remote prefill: {total_tokens} tokens at {_prefill_tps:.0f} tok/s")
             except Exception:
                 logger.opt(exception=True).warning("Remote prefill failed, falling back to local")
@@ -216,13 +218,22 @@ class ExoBatchGenerator:
                 matched_index,
             )
 
-        # Re-prefill more tokens locally after remote prefill to bridge KV divergence
-        # from heterogeneous hardware (e.g. NVFP4 on Spark vs 4-bit on Mac).
-        _DISAGG_REPREFILL_TOKENS = 64
+        # Re-prefill locally from where the remote KV actually ends to bridge both:
+        # (a) any gap between remote KV coverage and the prompt end, and
+        # (b) KV divergence from heterogeneous hardware (NVFP4 vs 4-bit).
+        # Use at least _MIN_REPREFILL tokens to smooth cross-quant drift.
+        _MIN_REPREFILL = 64
         if used_remote_prefill:
-            reprefill = min(_DISAGG_REPREFILL_TOKENS, len(all_prompt_tokens))
-            reprefill = max(reprefill, 2)
+            # remote_kv_offset = actual positions covered by remote KV
+            tokens_after_remote = len(all_prompt_tokens) - remote_kv_offset
+            reprefill = max(tokens_after_remote, _MIN_REPREFILL, 2)
+            reprefill = min(reprefill, len(all_prompt_tokens))
             last_tokens = mx.array(all_prompt_tokens[-reprefill:])
+            logger.info(
+                f"Disagg re-prefill: {reprefill} tokens locally "
+                f"(remote_kv_offset={remote_kv_offset}, prompt_len={len(all_prompt_tokens)}, "
+                f"gap={tokens_after_remote})"
+            )
         else:
             last_tokens = prompt_tokens[-2:]
 
