@@ -176,10 +176,11 @@ def remote_prefill(
             _inject_arrays_cache(cache, arrays_buffers[i])
             del arrays_buffers[i]
 
-        # Periodic memory cleanup to prevent accumulation on large models
+        # Periodic GC to free intermediate torch/numpy tensors.
+        # NOTE: do NOT call mx.clear_cache() here — it evicts the
+        # just-injected KV arrays from the MLX cache, causing garbage output.
         if i % 10 == 0:
             gc.collect()
-            mx.clear_cache()
 
     t_injected = time.perf_counter()
     logger.info(
