@@ -112,10 +112,20 @@ class Master:
             if first_shard is None:
                 logger.info(f"Prefill routing: VllmInstance {instance.instance_id} has no shards")
                 continue
-            if derive_base_model(first_shard.model_card.base_model).lower() != decode_model_base.lower():
+            # Fuzzy match: strip common prefixes/suffixes like "Meta", "Instruct", "Chat"
+            # so "Llama 3.1 70B" matches "Llama 3.1 70B Instruct" and "Meta Llama 3.1 70B Instruct"
+            def _normalize_for_match(s: str) -> str:
+                s = derive_base_model(s).lower()
+                for word in ("meta", "instruct", "chat", "hf"):
+                    s = s.replace(word, "")
+                return " ".join(s.split())  # collapse whitespace
+
+            vllm_base = _normalize_for_match(first_shard.model_card.base_model)
+            decode_base = _normalize_for_match(decode_model_base)
+            if vllm_base != decode_base:
                 logger.info(
                     f"Prefill routing: VllmInstance {instance.instance_id} base_model "
-                    f"{first_shard.model_card.base_model!r} != decode {decode_model_base!r}"
+                    f"{first_shard.model_card.base_model!r} ({vllm_base!r}) != decode {decode_model_base!r} ({decode_base!r})"
                 )
                 continue
 
