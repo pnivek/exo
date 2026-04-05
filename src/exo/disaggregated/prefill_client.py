@@ -144,6 +144,8 @@ def remote_prefill(
     max_received = max((sum(k.shape[0] for k, _v in chunks) for chunks in kv_buffers.values()), default=0)
     final_offset = start_pos + max_received
 
+    import gc
+
     for i, cache in enumerate(caches):
         if i in kv_buffers:
             chunks = kv_buffers[i]
@@ -166,8 +168,18 @@ def remote_prefill(
                 else:
                     _inject_kv_cache(cache, all_keys, all_values, final_offset)  # pyright: ignore[reportUnknownArgumentType]
 
+            # Free torch tensors immediately after MLX conversion
+            del all_keys, all_values
+            del kv_buffers[i]
+
         if i in arrays_buffers and isinstance(cache, ArraysCache):
             _inject_arrays_cache(cache, arrays_buffers[i])
+            del arrays_buffers[i]
+
+        # Periodic memory cleanup to prevent accumulation on large models
+        if i % 10 == 0:
+            gc.collect()
+            mx.clear_cache()
 
     t_injected = time.perf_counter()
     logger.info(
