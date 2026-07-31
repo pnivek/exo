@@ -1,3 +1,8 @@
+# Deferred annotations keep this module importable on Python 3.12, where
+# types.CoroutineType is not yet subscriptable (3.13 feature). The eugr
+# spark-vllm images run exo on the image's Python 3.12.
+from __future__ import annotations
+
 import contextlib
 import multiprocessing as mp
 from dataclasses import dataclass, field
@@ -66,7 +71,7 @@ class ErrorOverride:
         """
 
         if iscoroutinefunction(fn):
-            async_fn = cast(Callable[P, CoroutineType[Any, Any, R]], fn)
+            async_fn = cast("Callable[P, CoroutineType[Any, Any, R]]", fn)
 
             @wraps(async_fn)
             async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
