@@ -73,7 +73,7 @@ def _patch_determine_available_memory() -> None:
     # original = Worker.determine_available_memory
 
     @torch.inference_mode()
-    def patched(self: Worker) -> int:
+    def patched(self: Worker, *args: Any, **kwargs: Any) -> int:
         import pathlib
         import shutil
 
@@ -155,16 +155,22 @@ def _patch_initialize_from_config() -> None:
     def clear_and_reinit_attn(
         self: GPUModelRunner,
         kv_cache_config: KVCacheConfig,
+        *args: Any,
+        **kwargs: Any,
     ) -> None:
+        # Signature-transparent: vLLM 0.21 added is_profiling (and may add
+        # more); we only care about clearing attn_groups before re-init.
         self.attn_groups.clear()
-        original_init_attn(self, kv_cache_config)
+        original_init_attn(self, kv_cache_config, *args, **kwargs)
 
     GPUModelRunner.initialize_attn_backend = clear_and_reinit_attn
 
     original = Worker.initialize_from_config
 
-    def patched(self: Worker, kv_cache_config: KVCacheConfig) -> None:
-        original(self, kv_cache_config)
+    def patched(
+        self: Worker, kv_cache_config: KVCacheConfig, *args: Any, **kwargs: Any
+    ) -> None:
+        original(self, kv_cache_config, *args, **kwargs)
         set_model_runner(self.model_runner)
 
     Worker.initialize_from_config = patched
