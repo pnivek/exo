@@ -51,10 +51,13 @@ RUN pip install --no-cache-dir --ignore-requires-python \
     python-multipart msgspec zstandard "transformers>=5.6.2" python-daemon \
     types-aiofiles nvidia-ml-py
 
-# mlx (CPU wheels) + mlx-lm: the vLLM engine uses mlx_lm's TokenizerWrapper
-# for chat templating, and the shared runner import graph reaches mlx. GPU
-# MLX compute on this node is NOT expected — decode belongs on the Mac.
-RUN pip install --no-cache-dir --ignore-requires-python "mlx==0.32.0" mlx-lm
+# mlx (CPU backend) + Leo's mlx-lm fork: the vLLM engine uses mlx_lm's
+# TokenizerWrapper for chat templating, and the shared runner import graph
+# reaches mlx + mlx_lm.models.deepseek_v4 (fork-only). GPU MLX compute on
+# this node is NOT expected — decode belongs on the Mac.
+RUN pip install --no-cache-dir --ignore-requires-python \
+    "mlx==0.32.0" "mlx-cpu==0.32.0" \
+    "git+https://github.com/rltakashige/mlx-lm@leo/deepseek-v4"
 
 RUN python3 -c "from exo.main import main; print('exo imports OK')" && \
     python3 -c "from exo.worker.engines.vllm.builder import VllmBuilder; print('vllm builder imports OK')"
