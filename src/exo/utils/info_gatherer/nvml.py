@@ -2,7 +2,7 @@ from exo.shared.types.profiling import SystemPerformanceProfile
 from exo.utils.pydantic_ext import TaggedModel
 
 try:
-    import pynvml as nvml
+    import pynvml as nvml  # pyright: ignore[reportMissingModuleSource]
 except ImportError:
     nvml = None
 

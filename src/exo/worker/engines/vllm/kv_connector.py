@@ -56,7 +56,9 @@ _gdn_shipped: set[int] = set()
 _captured_layers: dict[int, dict[str, torch.Tensor]] = {}
 _captured_arrays: dict[int, list[torch.Tensor]] = {}
 # Hybrid-model SSM/conv state captured via causal_conv1d + delta-rule patches.
-_gdn_states: dict[int, dict[str, torch.Tensor]] = {}
+# Values are tensors under "conv"/"ssm"; the conv patch also stores the plain
+# int cache index under "ci", so the value type stays loose.
+_gdn_states: dict[int, dict[str, Any]] = {}
 _gdn_layer_order: list[int] = []
 _gdn_call_idx: list[int] = [0]
 _ssm_call_idx: list[int] = [0]
@@ -94,7 +96,7 @@ def get_arrays_queue() -> queue.Queue[
     return _arrays_queue
 
 
-def get_gdn_states() -> dict[int, dict[str, torch.Tensor]]:
+def get_gdn_states() -> dict[int, dict[str, Any]]:
     return _gdn_states
 
 
@@ -120,7 +122,7 @@ def _try_ship_gdn(layer_idx: int) -> None:
     conv_gpu = state["conv"]
     ssm_gpu = state["ssm"]
     side_stream = _get_save_stream()
-    side_stream.wait_stream(torch.cuda.current_stream())  # pyright: ignore[reportUnknownMemberType]
+    side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
         conv_host = torch.empty(conv_gpu.shape, dtype=conv_gpu.dtype, pin_memory=True)
         ssm_host = torch.empty(ssm_gpu.shape, dtype=ssm_gpu.dtype, pin_memory=True)
@@ -252,7 +254,7 @@ class StreamingConnector(KVConnectorBase_V1, SupportsHMA):
         if slot_mapping is not None:
             try:
                 save_stream = _get_save_stream()
-                save_stream.wait_stream(torch.cuda.current_stream())  # pyright: ignore[reportUnknownMemberType] # TODO: stub
+                save_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(save_stream):
                     keys_gpu, values_gpu = extract_kv_via_slot_mapping(
                         kv_layer, slot_mapping
@@ -398,7 +400,9 @@ ExoKVProducerConnector = StreamingConnector
 _connector_patched = False
 
 
-def _patch_vllm_for_connector(connector_class: type[Any]) -> None:
+def _patch_vllm_for_connector(  # pyright: ignore[reportUnusedFunction]
+    connector_class: type[Any],
+) -> None:
     """Three patches that make a custom save-only connector cooperate with vLLM.
 
     1. Suppress `unify_hybrid_kv_cache_specs` ValueError on hybrid (Mamba +
@@ -432,11 +436,11 @@ def _patch_vllm_for_connector(connector_class: type[Any]) -> None:
     ) -> tuple[bool, dict[str, Any] | None]:
         return False, None
 
-    sched_mod.Scheduler._connector_finished = patched_connector_finished  # pyright: ignore[reportPrivateUsage]
+    sched_mod.Scheduler._connector_finished = patched_connector_finished
 
     from vllm.distributed.kv_transfer.kv_connector import factory
 
-    original_get = factory.KVConnectorFactory._get_connector_class_with_compat  # pyright: ignore[reportPrivateUsage]
+    original_get = factory.KVConnectorFactory._get_connector_class_with_compat
 
     def patched_get(kv_transfer_config: KVTransferConfig) -> tuple[Any, Any]:
         kv_conn = kv_transfer_config.kv_connector or ""
@@ -458,7 +462,7 @@ def _patch_vllm_for_connector(connector_class: type[Any]) -> None:
             return BatchConnector, None
         return original_get(kv_transfer_config)
 
-    factory.KVConnectorFactory._get_connector_class_with_compat = patched_get  # pyright: ignore[reportPrivateUsage]
+    factory.KVConnectorFactory._get_connector_class_with_compat = patched_get
 
     # Patch KVCacheManager.get_computed_blocks so we capture the actual APC-hit
     # token count for each request at the moment vLLM looks it up — *before*
@@ -467,9 +471,7 @@ def _patch_vllm_for_connector(connector_class: type[Any]) -> None:
     # `apc_hit + first_chunk` and would cause us to extract bytes from blocks
     # that haven't been written yet for the first-chunk tail.
     try:
-        from vllm.v1.core.kv_cache_manager import (  # pyright: ignore[reportMissingImports]
-            KVCacheManager,
-        )
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
     except ImportError:
         KVCacheManager = None  # noqa: N806
 
@@ -477,12 +479,12 @@ def _patch_vllm_for_connector(connector_class: type[Any]) -> None:
         original_get_computed_blocks = KVCacheManager.get_computed_blocks
 
         def patched_get_computed_blocks(self: Any, request: Any) -> Any:
-            result = original_get_computed_blocks(self, request)
+            result: Any = original_get_computed_blocks(self, request)
             try:
                 req_id = getattr(request, "request_id", None)
                 if req_id is not None:
-                    if isinstance(result, tuple) and len(result) >= 2:  # pyright: ignore[reportUnknownArgumentType]
-                        num = int(result[1])  # pyright: ignore[reportUnknownArgumentType]
+                    if isinstance(result, tuple) and len(result) >= 2:
+                        num = int(result[1])
                     else:
                         num = 0
                     total = int(getattr(request, "num_tokens", 0) or 0)
@@ -497,7 +499,7 @@ def _patch_vllm_for_connector(connector_class: type[Any]) -> None:
                 )
             return result
 
-        KVCacheManager.get_computed_blocks = patched_get_computed_blocks  # pyright: ignore[reportAttributeAccessIssue]
+        KVCacheManager.get_computed_blocks = patched_get_computed_blocks
 
     # Patch Scheduler.schedule so APC-cached prefix blocks are extracted out
     # of the paged pool and pushed to _kv_queue at scheduling time — BEFORE
@@ -568,7 +570,7 @@ def _patch_vllm_for_connector(connector_class: type[Any]) -> None:
                     _scheduled_apc_extracted.add(req_id)
                     continue
                 save_stream = _get_save_stream()
-                save_stream.wait_stream(torch.cuda.current_stream())  # pyright: ignore[reportUnknownMemberType]
+                save_stream.wait_stream(torch.cuda.current_stream())
                 first_log_done = False
                 # Run the entire gather + cast + pinned alloc + D2H on the
                 # side stream — scheduler thread only issues kernel launches
@@ -650,7 +652,7 @@ def _patch_vllm_for_connector(connector_class: type[Any]) -> None:
 _gdn_patched = False
 
 
-def _patch_gdn_capture() -> None:
+def _patch_gdn_capture() -> None:  # pyright: ignore[reportUnusedFunction]
     global _gdn_patched
     if _gdn_patched:
         return
@@ -708,7 +710,7 @@ def _patch_gdn_capture() -> None:
             if hasattr(mod, "__dict__")
             else False
         ):
-            mod.causal_conv1d_fn = patched_fn
+            cast(Any, mod).causal_conv1d_fn = patched_fn
     logger.info("Patched causal_conv1d_fn for GDN conv-state capture")
 
     # The GDN delta-rule functions live in `mamba/gdn_linear_attn` (defined or
@@ -739,16 +741,16 @@ def _patch_gdn_capture() -> None:
                     if (
                         output_final_state
                         and isinstance(result, tuple)
-                        and len(result) == 2  # pyright: ignore[reportUnknownArgumentType]
+                        and len(result) == 2
                     ):
-                        _, ssm_state = result  # pyright: ignore[reportUnknownVariableType]
+                        _, ssm_state = result
                         idx = _ssm_call_idx[0]
                         if _gdn_layer_order and idx < len(_gdn_layer_order) * 100:
                             layer_idx = _gdn_layer_order[idx % len(_gdn_layer_order)]
                             _gdn_states.setdefault(layer_idx, {})["ssm"] = ssm_state
                             _try_ship_gdn(layer_idx)
                         _ssm_call_idx[0] += 1
-                    return result  # pyright: ignore[reportUnknownVariableType]
+                    return result
 
                 return patched_chunk
 
@@ -781,7 +783,7 @@ def init_gdn_layer_order(kv_caches: Any) -> None:
     _gdn_layer_order.clear()
     for li in range(len(kv_caches)):
         kv = kv_caches[li]
-        if isinstance(kv, (list, tuple)) and len(kv) > 1:  # pyright: ignore[reportUnknownArgumentType]
+        if isinstance(kv, (list, tuple)) and len(kv) > 1:
             _gdn_layer_order.append(li)
     if _gdn_layer_order:
         logger.info(f"GDN layer order: {len(_gdn_layer_order)} hybrid layers detected")

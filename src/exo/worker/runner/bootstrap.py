@@ -83,7 +83,7 @@ def entrypoint(
             patch_vllm()
             builder = VllmBuilder(
                 bound_instance.bound_shard.model_card.model_id,
-                event_sender,
+                event_sender_downcast,
                 cancel_receiver,
             )
         else:

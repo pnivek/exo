@@ -15,3 +15,9 @@ class RequestOutput:
     prompt_token_ids: list[int] | None
     outputs: list[CompletionOutput]
     finished: bool
+
+class PoolingRequestOutput:
+    request_id: str
+    prompt_token_ids: list[int] | None
+    outputs: object
+    finished: bool

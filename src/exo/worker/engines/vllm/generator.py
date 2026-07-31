@@ -59,7 +59,7 @@ def _stop_token_ids(tokenizer: TokenizerLike, model_id: ModelId) -> set[int]:
     ids: set[int] = set()
     eos_id = getattr(tokenizer, "eos_token_id", None)
     if eos_id is not None:
-        ids.add(eos_id)  # pyright: ignore[reportAny]
+        ids.add(eos_id)
     extra = get_eos_token_ids_for_model(model_id)
     if extra:
         ids.update(extra)
@@ -127,7 +127,7 @@ def warmup_vllm_engine(engine: LLMEngine) -> int:
             ),
         )
     ]
-    prompt_text: str | list[int] = tokenizer.apply_chat_template(  # pyright: ignore[reportUnknownMemberType]
+    prompt_text: str | list[int] = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
     if isinstance(prompt_text, list):
@@ -343,7 +343,7 @@ def _monkey_patch_iterator(weight_utils: object, attr_name: str) -> None:
     original = getattr(weight_utils, attr_name, None)
     if original is None:
         return
-    patched = _wrap_weights_iterator(original)  # pyright: ignore[reportAny]
+    patched = _wrap_weights_iterator(original)
     setattr(weight_utils, attr_name, patched)
     for mod in list(sys.modules.values()):
         if mod is weight_utils:
@@ -422,10 +422,10 @@ def load_vllm_engine(
     has_mamba = False
     try:
         with open(model_path / "config.json") as f:
-            model_config = json.load(f)  # pyright: ignore[reportAny]
-        text_config = model_config.get("text_config", model_config)  # pyright: ignore[reportAny]
+            model_config = json.load(f)
+        text_config = model_config.get("text_config", model_config)
         has_mamba = "mamba_ssm_dtype" in text_config or "linear_attention" in (
-            text_config.get("layer_types") or []  # pyright: ignore[reportAny]
+            text_config.get("layer_types") or []
         )
     except Exception:
         pass
@@ -455,7 +455,7 @@ def load_vllm_engine(
                 ),
                 disable_log_stats=True,
                 max_num_batched_tokens=4096,
-                kv_transfer_config=kv_transfer_config, # pyright: ignore[reportArgumentType]
+                kv_transfer_config=kv_transfer_config,
                 disable_hybrid_kv_cache_manager=False,
                 kv_cache_dtype="auto",
             )
