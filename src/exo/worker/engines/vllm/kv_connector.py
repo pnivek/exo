@@ -440,29 +440,43 @@ def _patch_vllm_for_connector(  # pyright: ignore[reportUnusedFunction]
 
     from vllm.distributed.kv_transfer.kv_connector import factory
 
-    original_get = factory.KVConnectorFactory._get_connector_class_with_compat
-
-    def patched_get(kv_transfer_config: KVTransferConfig) -> tuple[Any, Any]:
-        kv_conn = kv_transfer_config.kv_connector or ""
-        kv_conn_lower = kv_conn.lower()
-        if (
-            kv_conn
-            in {
-                connector_class.__name__,
-                f"{connector_class.__module__}:{connector_class.__name__}",
+    if hasattr(factory.KVConnectorFactory, "register_connector"):
+        # vLLM 0.21+ has a sanctioned registration API — no override needed.
+        for cls in (connector_class, BatchConnector):
+            factory.KVConnectorFactory.register_connector(
+                cls.__name__, cls.__module__, cls.__name__
+            )
+        if connector_class.__name__ != "ExoKVProducerConnector":
+            factory.KVConnectorFactory.register_connector(
                 "ExoKVProducerConnector",
-                f"{__name__}:ExoKVProducerConnector",
-                "StreamingConnector",
-                f"{__name__}:StreamingConnector",
-            }
-            or "streaming_connector" in kv_conn_lower
-        ):
-            return connector_class, None
-        if "batch_connector" in kv_conn_lower:
-            return BatchConnector, None
-        return original_get(kv_transfer_config)
+                connector_class.__module__,
+                connector_class.__name__,
+            )
+    else:
+        # vLLM 0.19-era: intercept the private resolver.
+        original_get = factory.KVConnectorFactory._get_connector_class_with_compat
 
-    factory.KVConnectorFactory._get_connector_class_with_compat = patched_get
+        def patched_get(kv_transfer_config: KVTransferConfig) -> tuple[Any, Any]:
+            kv_conn = kv_transfer_config.kv_connector or ""
+            kv_conn_lower = kv_conn.lower()
+            if (
+                kv_conn
+                in {
+                    connector_class.__name__,
+                    f"{connector_class.__module__}:{connector_class.__name__}",
+                    "ExoKVProducerConnector",
+                    f"{__name__}:ExoKVProducerConnector",
+                    "StreamingConnector",
+                    f"{__name__}:StreamingConnector",
+                }
+                or "streaming_connector" in kv_conn_lower
+            ):
+                return connector_class, None
+            if "batch_connector" in kv_conn_lower:
+                return BatchConnector, None
+            return original_get(kv_transfer_config)
+
+        factory.KVConnectorFactory._get_connector_class_with_compat = patched_get
 
     # Patch KVCacheManager.get_computed_blocks so we capture the actual APC-hit
     # token count for each request at the moment vLLM looks it up — *before*

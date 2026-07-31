@@ -413,9 +413,9 @@ def load_vllm_engine(
     kv_transfer_config: dict[str, str] | None = None
     if kv_connector_cls is not None:
         kv_transfer_config = {
-            "kv_connector": (
-                f"{kv_connector_cls.__module__}:{kv_connector_cls.__name__}"
-            ),
+            # Bare class name: resolved by KVConnectorFactory registration on
+            # vLLM 0.21+, and recognized by our 0.19-era resolver override.
+            "kv_connector": kv_connector_cls.__name__,
             "kv_role": "kv_both",
         }
 
