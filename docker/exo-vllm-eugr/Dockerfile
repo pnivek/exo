@@ -37,7 +37,7 @@ ARG BUILD_JOBS=16
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
 RUN cd rust/exo_rs && \
     maturin build --release --interpreter python3 && \
-    pip install /app/target/wheels/exo_rs*.whl
+    pip install --ignore-requires-python /app/target/wheels/exo_rs*.whl
 
 # ── Install exo itself (deps come next; base image owns vllm/torch) ─────
 RUN pip install --no-deps --ignore-requires-python -e . 2>&1 | tail -3
