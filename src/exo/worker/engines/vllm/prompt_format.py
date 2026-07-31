@@ -57,7 +57,10 @@ def make_vllm_sampling_params(
     if params.bench:
         kwargs.ignore_eos = True
         kwargs.min_tokens = kwargs.max_tokens
-        if not params.use_prefix_cache:
+        # skip_reading_prefix_cache exists only in the evanev7/vllm exo2 fork;
+        # on stock vLLM (e.g. eugr spark-vllm images) benches keep prefix
+        # cache reads on rather than crashing.
+        if not params.use_prefix_cache and hasattr(kwargs, "skip_reading_prefix_cache"):
             kwargs.skip_reading_prefix_cache = True
 
     return kwargs
