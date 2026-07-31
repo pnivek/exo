@@ -65,6 +65,7 @@
     nodeThunderboltBridge,
     nodeIdentities,
     isConnected,
+    featureFlags,
     type DownloadProgress,
     type PlacementPreview,
   } from "$lib/stores/app.svelte";
@@ -702,7 +703,10 @@
       ? Object.keys(topologyData()!.nodes).length
       : 1;
     const sharding = nodeCount <= 1 ? "Pipeline" : selectedSharding;
-    const instanceType = nodeCount <= 1 ? "MlxRing" : selectedInstanceType;
+    const instanceType =
+      nodeCount <= 1 && selectedInstanceType === "MlxJaccl"
+        ? "MlxRing"
+        : selectedInstanceType;
     try {
       const placementResponse = await fetch(
         `/instance/placement?model_id=${encodeURIComponent(modelId)}&sharding=${sharding}&instance_meta=${instanceType}&min_nodes=1`,
@@ -783,6 +787,7 @@
       quantization?: string;
       base_model?: string;
       capabilities?: string[];
+      requires_vllm?: boolean;
     }>
   >([]);
   type ModelMemoryFitStatus =
@@ -886,7 +891,7 @@
   }
 
   let selectedSharding = $state<"Pipeline" | "Tensor">("Pipeline");
-  type InstanceMeta = "MlxRing" | "MlxJaccl";
+  type InstanceMeta = "MlxRing" | "MlxJaccl" | "Vllm";
 
   // Launch defaults persistence
   const LAUNCH_DEFAULTS_KEY = "exo-launch-defaults-v2";
@@ -932,7 +937,12 @@
     // Apply sharding and instance type unconditionally
     selectedSharding = defaults.sharding;
     selectedInstanceType =
-      defaults.instanceType === "MlxRing" ? "MlxRing" : "MlxJaccl";
+      defaults.instanceType === "MlxRing"
+        ? "MlxRing"
+        : defaults.instanceType === "Vllm"
+          ? "Vllm"
+          : "MlxJaccl";
+    userPickedInstanceType = true;
 
     // Apply minNodes if valid (between 1 and maxNodes)
     if (
@@ -954,6 +964,23 @@
   }
 
   let selectedInstanceType = $state<InstanceMeta>("MlxRing");
+  let userPickedInstanceType = $state(false);
+  $effect(() => {
+    if (!userPickedInstanceType && featureFlags()["vllm_available"]) {
+      selectedInstanceType = "Vllm";
+    }
+  });
+  const selectedModelRequiresVllm = $derived.by((): boolean => {
+    const id = selectedPreviewModelId();
+    if (!id) return false;
+    const model = models.find((m) => m.id === id);
+    return model?.requires_vllm === true;
+  });
+  $effect(() => {
+    if (selectedModelRequiresVllm) {
+      selectedInstanceType = "Vllm";
+    }
+  });
   let selectedMinNodes = $state<number>(1);
   let minNodesInitialized = $state(false);
   let launchingModelId = $state<string | null>(null);
@@ -1146,9 +1173,7 @@
   }
 
   const matchesSelectedRuntime = (runtime: InstanceMeta): boolean =>
-    selectedInstanceType === "MlxRing"
-      ? runtime === "MlxRing"
-      : runtime === "MlxJaccl";
+    runtime === selectedInstanceType;
 
   // Helper to check if a model can be launched (has valid placement with >= minNodes)
   function canModelFit(modelId: string): boolean {
@@ -2066,6 +2091,7 @@
     let instanceType = "Unknown";
     if (instanceTag === "MlxRingInstance") instanceType = "MLX Ring";
     else if (instanceTag === "MlxJacclInstance") instanceType = "MLX RDMA";
+    else if (instanceTag === "VllmInstance") instanceType = "vLLM";
 
     const inst = instance as {
       shardAssignments?: {
@@ -5782,14 +5808,18 @@
                     </div>
                     <div class="flex gap-2">
                       <button
+                        disabled={selectedModelRequiresVllm}
                         onclick={() => {
+                          if (selectedModelRequiresVllm) return;
                           selectedInstanceType = "MlxRing";
+                          userPickedInstanceType = true;
                           saveLaunchDefaults();
                         }}
-                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
-                        'MlxRing'
-                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
-                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 {selectedModelRequiresVllm
+                          ? 'opacity-40 cursor-not-allowed bg-transparent text-white/40 border-exo-medium-gray/30'
+                          : selectedInstanceType === 'MlxRing'
+                            ? 'cursor-pointer bg-transparent text-exo-yellow border-exo-yellow'
+                            : 'cursor-pointer bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
                       >
                         <span
                           class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedInstanceType ===
@@ -5805,14 +5835,18 @@
                         TCP/IP
                       </button>
                       <button
+                        disabled={selectedModelRequiresVllm}
                         onclick={() => {
+                          if (selectedModelRequiresVllm) return;
                           selectedInstanceType = "MlxJaccl";
+                          userPickedInstanceType = true;
                           saveLaunchDefaults();
                         }}
-                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
-                        'MlxJaccl'
-                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
-                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 {selectedModelRequiresVllm
+                          ? 'opacity-40 cursor-not-allowed bg-transparent text-white/40 border-exo-medium-gray/30'
+                          : selectedInstanceType === 'MlxJaccl'
+                            ? 'cursor-pointer bg-transparent text-exo-yellow border-exo-yellow'
+                            : 'cursor-pointer bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
                       >
                         <span
                           class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedInstanceType ===
@@ -5827,7 +5861,41 @@
                         </span>
                         RDMA (Fast)
                       </button>
+                      {#if featureFlags()["vllm_available"] || selectedModelRequiresVllm}
+                        <button
+                          onclick={() => {
+                            selectedInstanceType = "Vllm";
+                            userPickedInstanceType = true;
+                            saveLaunchDefaults();
+                          }}
+                          class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
+                          'Vllm'
+                            ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                            : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                        >
+                          <span
+                            class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedInstanceType ===
+                            'Vllm'
+                              ? 'border-exo-yellow'
+                              : 'border-exo-medium-gray'}"
+                          >
+                            {#if selectedInstanceType === "Vllm"}
+                              <span
+                                class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                              ></span>
+                            {/if}
+                          </span>
+                          vLLM (CUDA)
+                        </button>
+                      {/if}
                     </div>
+                    {#if selectedModelRequiresVllm}
+                      <div
+                        class="mt-2 text-[11px] font-mono text-orange-300/80"
+                      >
+                        This model requires vLLM.
+                      </div>
+                    {/if}
                   </div>
 
                   <!-- Minimum Devices -->

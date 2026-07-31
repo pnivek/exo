@@ -32,6 +32,7 @@ from exo.utils.pydantic_ext import TaggedModel
 from exo.utils.task_group import TaskGroup
 
 from .macmon import MacmonMetrics
+from .nvml import NvmlMetrics, gather_nvidia_metrics, has_nvml
 from .system_info import (
     get_friendly_name,
     get_model_and_chip,
@@ -369,6 +370,15 @@ def _has_nvml_cuda() -> bool:
         return False
 
 
+def _has_vllm() -> bool:
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("vllm") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 class NodeBackends(TaggedModel):
     backends: list[Backend]
 
@@ -379,7 +389,11 @@ class NodeBackends(TaggedModel):
             backends.append(Backend.MlxMetal)
         if await to_thread.run_sync(_has_nvml_cuda):
             backends.append(Backend.MlxCuda)
-            backends.append(Backend.Vllm)
+            # Vllm requires the package to actually be importable, not just an
+            # NVIDIA GPU — a CUDA node without the vllm extra installed must not
+            # advertise itself as a vLLM-capable placement target.
+            if await to_thread.run_sync(_has_vllm):
+                backends.append(Backend.Vllm)
         return cls(backends=backends)
 
 
@@ -391,6 +405,7 @@ GatheredInfo = (
     | MacThunderboltConnections
     | RdmaCtlStatus
     | ThunderboltBridgeInfo
+    | NvmlMetrics
     | NodeConfig
     | MiscData
     | StaticNodeInformation
@@ -450,6 +465,8 @@ class InfoGatherer:
                 tg.start_soon(self._monitor_rdma_ctl_status, 10)
             if not IS_DARWIN:
                 tg.start_soon(self._monitor_memory_usage, 1)
+                if has_nvml():
+                    tg.start_soon(self._monitor_nvml_metrics, 1)
             tg.start_soon(self._watch_system_info, 10)
             tg.start_soon(self._monitor_misc, 60)
             tg.start_soon(self._monitor_static_info, 60)
@@ -458,7 +475,6 @@ class InfoGatherer:
             nc = await NodeConfig.gather()
             if nc is not None:
                 await self.info_sender.send(nc)
-
             await self.info_sender.send(await NodeBackends.gather())
 
     def shutdown(self):
@@ -507,6 +523,16 @@ class InfoGatherer:
             except Exception as e:
                 logger.opt(exception=e).warning("Error gathering Thunderbolt data")
             await anyio.sleep(system_profiler_interval)
+
+    async def _monitor_nvml_metrics(self, nvml_poll_rate: float):
+        while True:
+            try:
+                metrics = gather_nvidia_metrics()
+                if metrics is not None:
+                    await self.info_sender.send(metrics)
+            except Exception as e:
+                logger.opt(exception=e).warning("Error gathering NVML metrics")
+            await anyio.sleep(nvml_poll_rate)
 
     async def _monitor_memory_usage(self, memory_poll_rate: float):
         if self._psutil_enabled:

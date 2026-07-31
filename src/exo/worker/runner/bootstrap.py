@@ -8,7 +8,7 @@ import loguru
 
 from exo.shared.types.events import Event
 from exo.shared.types.tasks import Task, TaskId
-from exo.shared.types.worker.instances import BoundInstance
+from exo.shared.types.worker.instances import BoundInstance, VllmInstance
 from exo.utils.channels import ClosedResourceError, MpReceiver, MpSender
 from exo.worker.engines.base import Builder
 
@@ -70,6 +70,21 @@ def entrypoint(
 
             builder = MfluxBuilder(
                 event_sender_downcast, cancel_receiver, bound_instance.bound_shard
+            )
+        elif isinstance(bound_instance.instance, VllmInstance):
+            from exo.worker.engines.vllm.builder import VllmBuilder
+            from exo.worker.engines.vllm.growable_cache import patch_vllm
+
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+            os.environ["VLLM_KV_CACHE_LAYOUT"] = "NHD"
+            os.environ["VLLM_BATCH_INVARIANT"] = "1"
+            os.environ.setdefault("FASTSAFETENSORS_NOGDS", "1")
+
+            patch_vllm()
+            builder = VllmBuilder(
+                bound_instance.bound_shard.model_card.model_id,
+                event_sender,
+                cancel_receiver,
             )
         else:
             from exo.worker.engines.mlx.patches import apply_mlx_patches

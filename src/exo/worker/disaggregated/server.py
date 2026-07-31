@@ -21,6 +21,7 @@ class PrefillRequest(msgspec.Struct):
     model_id: str = ""
     token_ids: list[int] = msgspec.field(default_factory=list)
     start_pos: int = 0
+    use_prefix_cache: bool = True
 
 
 _request_encoder = msgspec.msgpack.Encoder()
@@ -56,7 +57,10 @@ class _PrefillHandler(socketserver.StreamRequestHandler):
         super().setup()
         sock = cast(socket.socket, self.request)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        # 64MB send buffer: K/V chunks are ~33MB each; a small SNDBUF
+        # back-pressures the writer thread between chunks and serializes
+        # network with compute.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024 * 1024)
 
     def handle(self) -> None:
         server = cast(PrefillServer, self.server)

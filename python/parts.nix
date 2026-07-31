@@ -175,6 +175,159 @@ let
             autoPatchelfIgnoreMissingDeps = [ "libcuda.so.1" ];
             preFixup = "addAutoPatchelfSearchPath '${final.torch}'";
           });
+          # Currently treating vllm as a cuda dep. it obviously exists as a non cuda dep
+          vllm = prev.vllm.overrideAttrs (old:
+            let
+              cuda_cccl_compat = pkgs.runCommand "cuda-cccl-compat" { } ''
+                mkdir -p $out/include
+                ln -s ${cudaPackages.cuda_cccl}/include $out/include/cccl
+              '';
+
+              cudaRoot = pkgs.symlinkJoin {
+                name = "cuda-merged-exo";
+                paths = builtins.concatMap (p: [ (lib.getBin p) (lib.getLib p) (lib.getDev p) ]) (cudaLibs ++ [ cudaPackages.cuda_nvcc cuda_cccl_compat ]);
+              };
+
+              cutlass = pkgs.fetchFromGitHub {
+                name = "cutlass-source";
+                owner = "NVIDIA";
+                repo = "cutlass";
+                tag = "v4.2.1";
+                hash = "sha256-iP560D5Vwuj6wX1otJhwbvqe/X4mYVeKTpK533Wr5gY=";
+              };
+              triton-kernels = pkgs.fetchFromGitHub {
+                owner = "triton-lang";
+                repo = "triton";
+                tag = "v3.6.0";
+                hash = "sha256-JFSpQn+WsNnh7CAPlcpOcUp0nyKXNbJEANdXqmkt4Tc=";
+              };
+
+              cutlass-flashmla = pkgs.fetchFromGitHub {
+                owner = "NVIDIA";
+                repo = "cutlass";
+                rev = "147f5673d0c1c3dcf66f78d677fd647e4a020219";
+                hash = "sha256-dHQto08IwTDOIuFUp9jwm1MWkFi8v2YJ/UESrLuG71g=";
+              };
+
+              flashmla = pkgs.stdenv.mkDerivation {
+                pname = "flashmla";
+                version = "1.0.0";
+
+                src = pkgs.fetchFromGitHub {
+                  name = "FlashMLA-source";
+                  owner = "vllm-project";
+                  repo = "FlashMLA";
+                  rev = "c2afa9cb93e674d5a9120a170a6da57b89267208";
+                  hash = "sha256-pKlwxV6G9iHag/jbu3bAyvYvnu5TbrQwUMFV0AlGC3s=";
+                };
+
+                dontConfigure = true;
+
+                buildPhase = ''
+                  rm -rf csrc/cutlass
+                  ln -sf ${cutlass-flashmla} csrc/cutlass
+                '';
+
+                installPhase = ''
+                  cp -rva . $out
+                '';
+              };
+              qutlass = pkgs.fetchFromGitHub {
+                name = "qutlass-source";
+                owner = "IST-DASLab";
+                repo = "qutlass";
+                rev = "830d2c4537c7396e14a02a46fbddd18b5d107c65";
+                hash = "sha256-aG4qd0vlwP+8gudfvHwhtXCFmBOJKQQTvcwahpEqC84=";
+              };
+              vllm-flash-attn = pkgs.stdenv.mkDerivation {
+                pname = "vllm-flash-attn";
+                version = "2.7.2.post1";
+
+                src = pkgs.fetchFromGitHub {
+                  name = "flash-attention-source";
+                  owner = "vllm-project";
+                  repo = "flash-attention";
+                  rev = "188be16520ceefdc625fdf71365585d2ee348fe2";
+                  hash = "sha256-Osec+/IF3+UDtbIhDMBXzUeWJ7hDJNb5FpaVaziPSgM=";
+                };
+
+                patches = [
+                  (pkgs.fetchpatch {
+                    url = "https://github.com/Dao-AILab/flash-attention/commit/dad67c88d4b6122c69d0bed1cebded0cded71cea.patch";
+                    hash = "sha256-JSgXWItOp5KRpFbTQj/cZk+Tqez+4mEz5kmH5EUeQN4=";
+                  })
+                  (pkgs.fetchpatch {
+                    url = "https://github.com/Dao-AILab/flash-attention/commit/e26dd28e487117ee3e6bc4908682f41f31e6f83a.patch";
+                    hash = "sha256-NkCEowXSi+tiWu74Qt+VPKKavx0H9JeteovSJKToK9A=";
+                  })
+                ];
+
+                dontConfigure = true;
+
+                buildPhase = ''
+                  rm -rf csrc/cutlass
+                  ln -sf ${cutlass} csrc/cutlass
+                '';
+
+                installPhase = ''
+                  cp -rva . $out
+                '';
+              };
+            in
+            {
+              patches = (old.patches or [ ]) ++ [ ../nix/vllm-setuppy-cmake.patch ];
+              nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+                pkgs.cmake
+                pkgs.ninja
+                pkgs.autoAddDriverRunpath
+              ] ++ lib.optionals cudaSupport [
+                cudaPackages.cuda_nvcc
+              ];
+              # TODO: vllm rocm/cpu
+              VLLM_TARGET_DEVICE = "empty";
+              preConfigure = ''
+                export MAX_JOBS="$NIX_BUILD_CORES"
+              '';
+
+              # TODO: vllm non cuda13 support, more arch's, etc.
+            } // lib.optionalAttrs cudaSupport {
+              buildInputs = cudaLibs ++ [ cudaRoot ];
+
+              VLLM_CUDA_VERSION = cudaPackages.cudaMajorMinorVersion;
+              CUDA_HOME = "${cudaRoot}";
+              CUDAToolkit_ROOT = "${cudaRoot}";
+              CUDACXX = "${cudaRoot}/bin/nvcc";
+              VLLM_CUTLASS_SRC_DIR = "${lib.getDev cutlass}";
+              VLLM_TARGET_DEVICE = "cuda";
+              TORCH_CUDA_ARCH_LIST = "12.0;12.1";
+              TRITON_KERNELS_SRC_DIR = "${lib.getDev triton-kernels}/python/triton_kernels/triton_kernels";
+              FLASH_MLA_SRC_DIR = "${lib.getDev flashmla}";
+              QUTLASS_SRC_DIR = "${lib.getDev qutlass}";
+              VLLM_FLASH_ATTN_SRC_DIR = "${lib.getDev vllm-flash-attn}";
+              CAFFE2_USE_CUDNN = "ON";
+              CAFFE2_USE_CUFILE = "ON";
+              CUTLASS_ENABLE_CUBLAS = "ON";
+              CUTLASS_NVCC_ARCHS_ENABLED = "12.0;12.1";
+
+              cmakeFlags = [
+                (lib.cmakeBool "CMAKE_SKIP_INSTALL_RPATH" true)
+                (lib.cmakeBool "CMAKE_BUILD_WITH_INSTALL_RPATH" true)
+                (lib.cmakeFeature "CUDA_HOME" "${cudaRoot}")
+                (lib.cmakeFeature "CUDAToolkit_ROOT" "${cudaRoot}")
+                (lib.cmakeFeature "CMAKE_CUDA_COMPILER" "${cudaRoot}/bin/nvcc")
+                (lib.cmakeFeature "CMAKE_PREFIX_PATH" "${cudaRoot}")
+                (lib.cmakeFeature "FETCHCONTENT_SOURCE_DIR_CUTLASS" "${lib.getDev cutlass}")
+                (lib.cmakeFeature "FLASH_MLA_SRC_DIR" "${lib.getDev flashmla}")
+                (lib.cmakeFeature "VLLM_FLASH_ATTN_SRC_DIR" "${lib.getDev vllm-flash-attn}")
+                (lib.cmakeFeature "QUTLASS_SRC_DIR" "${lib.getDev qutlass}")
+                (lib.cmakeFeature "TORCH_CUDA_ARCH_LIST" "12.0;12.1")
+                (lib.cmakeFeature "CUTLASS_NVCC_ARCHS_ENABLED" "${cudaPackages.flags.cmakeCudaArchitecturesString}")
+                (lib.cmakeFeature "CUDA_TOOLKIT_ROOT_DIR" "${cudaRoot}")
+                (lib.cmakeFeature "CAFFE2_USE_CUDNN" "ON")
+                (lib.cmakeFeature "CAFFE2_USE_CUFILE" "ON")
+                (lib.cmakeFeature "CUTLASS_ENABLE_CUBLAS" "ON")
+              ];
+            });
 
         } // lib.optionalAttrs (cudaSupport && isx86_64) {
           numba = prev.numba.overrideAttrs (old: {
@@ -244,18 +397,18 @@ in
     { self', pkgs, unfreePkgs, lib, ... }:
     let
       inherit (pkgs.stdenv.hostPlatform) isLinux;
-      inherit (mkPythonSet { inherit self' pkgs lib; members = { exo = [ "mlx-cpu" ]; }; }) exo;
+      inherit (mkPythonSet { inherit self' pkgs lib; members = { exo = [ "mlx-cpu" "vllm-none" ]; }; }) exo;
 
       # Virtual environment with dev dependencies for testing
       testVenv = (mkPythonSet {
         inherit self' pkgs lib; members = {
-        exo = [ "dev" "mlx-cpu" ]; # Include pytest, pytest-asyncio, pytest-env
+        exo = [ "dev" "mlx-cpu" "vllm-none" ]; # Include pytest, pytest-asyncio, pytest-env
       };
       }).venv "exo-test";
 
       mkBenchScript = (mkPythonSet {
         inherit self' pkgs lib; members = {
-        exo = [ "mlx-cpu" ];
+        exo = [ "mlx-cpu" "vllm-none" ];
         exo-bench = [ ]; # Include pytest, pytest-asyncio, pytest-env
       };
       }).mkPythonScript;
@@ -268,7 +421,9 @@ in
       # if someone is particularly interested in cuda12 support in nix, please open an issue.
       # until then, it's more hassle than its worth
       #cuda12Set = mkPythonSet { inherit self' lib; inherit (unfreePkgs.pkgsCuda.cudaPackages_12) pkgs; members = { exo = [ "mlx-cuda12" ]; }; };
-      cuda13Set = mkPythonSet { inherit self' lib; inherit (unfreePkgs.pkgsCuda.cudaPackages_13) pkgs; members = { exo = [ "mlx-cuda13" ]; }; };
+      # vllm-cuda13 composes with mlx-cuda13 (they only conflict with mlx-cuda12 /
+      # vllm-none), so the CUDA build carries both the MLX CUDA backend and vLLM.
+      cuda13Set = mkPythonSet { inherit self' lib; inherit (unfreePkgs.pkgsCuda.cudaPackages_13) pkgs; members = { exo = [ "mlx-cuda13" "vllm-cuda13" ]; }; };
     in
     {
       packages = {

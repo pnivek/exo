@@ -61,6 +61,7 @@ from exo.utils.info_gatherer.info_gatherer import (
     NodeConfig,
     NodeDiskUsage,
     NodeNetworkInterfaces,
+    NvmlMetrics,
     RdmaCtlStatus,
     StaticNodeInformation,
     ThunderboltBridgeInfo,
@@ -320,6 +321,9 @@ def apply_node_timed_out(event: NodeTimedOut, state: State) -> State:
     node_rdma_ctl = {
         key: value for key, value in state.node_rdma_ctl.items() if key != event.node_id
     }
+    node_backends = {
+        key: value for key, value in state.node_backends.items() if key != event.node_id
+    }
     # Only recompute cycles if the leaving node had TB bridge enabled
     leaving_node_status = state.node_thunderbolt_bridge.get(event.node_id)
     leaving_node_had_tb_enabled = (
@@ -342,6 +346,7 @@ def apply_node_timed_out(event: NodeTimedOut, state: State) -> State:
             "node_thunderbolt": node_thunderbolt,
             "node_thunderbolt_bridge": node_thunderbolt_bridge,
             "node_rdma_ctl": node_rdma_ctl,
+            "node_backends": node_backends,
             "thunderbolt_bridge_cycles": thunderbolt_bridge_cycles,
         }
     )
@@ -368,6 +373,11 @@ def apply_node_gathered_info(event: NodeGatheredInfo, state: State) -> State:
                 event.node_id: info.system_profile,
             }
             update["node_memory"] = {**state.node_memory, event.node_id: info.memory}
+        case NvmlMetrics():
+            update["node_system"] = {
+                **state.node_system,
+                event.node_id: info.system_profile,
+            }
         case MemoryUsage():
             update["node_memory"] = {**state.node_memory, event.node_id: info}
         case NodeDiskUsage():

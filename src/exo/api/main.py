@@ -144,6 +144,7 @@ from exo.shared.models.model_cards import (
     ModelTask,
 )
 from exo.shared.tracing import TraceEvent, compute_stats, export_trace, load_trace_file
+from exo.shared.types.backends import Backend
 from exo.shared.types.chunks import (
     ErrorChunk,
     ImageChunk,
@@ -535,8 +536,10 @@ class API:
                         )
                     ]
                 )
-        # TODO: PDD
-        # instance_combinations.append((Sharding.PrefillDecodeDisaggregation, InstanceMeta.MlxRing, 1))
+        if any(
+            Backend.Vllm in backends for backends in self.state.node_backends.values()
+        ):
+            instance_combinations.append((Sharding.Pipeline, InstanceMeta.Vllm, 1))
 
         for sharding, instance_meta, min_nodes in instance_combinations:
             try:
@@ -693,7 +696,13 @@ class API:
         )
 
     async def get_feature_flags(self) -> dict[str, bool]:
-        return {"disaggregation": ENABLE_DISAGGREGATION}
+        return {
+            "disaggregation": ENABLE_DISAGGREGATION,
+            "vllm_available": any(
+                Backend.Vllm in backends
+                for backends in self.state.node_backends.values()
+            ),
+        }
 
     async def list_instance_links(self) -> list[InstanceLink]:
         if not ENABLE_DISAGGREGATION:
@@ -1813,6 +1822,8 @@ class API:
                     capabilities=card.capabilities,
                     reasoning_dialect=card.reasoning_dialect,
                     context_length=card.context_length,
+                    # Derived: a card that can ONLY run on the vLLM backend.
+                    requires_vllm=set(card.backends) == {Backend.Vllm},
                 )
                 for card in cards
             ]

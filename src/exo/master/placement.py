@@ -44,6 +44,7 @@ from exo.shared.types.worker.instances import (
     InstanceMeta,
     MlxJacclInstance,
     MlxRingInstance,
+    VllmInstance,
 )
 from exo.shared.types.worker.shards import Sharding
 from exo.utils.ports import random_ephemeral_port
@@ -51,6 +52,7 @@ from exo.utils.ports import random_ephemeral_port
 INSTANCE_META_BACKENDS: dict[InstanceMeta, list[Backend]] = {
     InstanceMeta.MlxRing: [Backend.MlxMetal, Backend.MlxCuda, Backend.MlxCpu],
     InstanceMeta.MlxJaccl: [Backend.MlxMetal],
+    InstanceMeta.Vllm: [Backend.Vllm],
 }
 
 
@@ -243,7 +245,7 @@ def place_instance(
     )
 
     # Single-node: force Pipeline/Ring (Tensor and Jaccl require multi-node)
-    if len(selected_cycle) == 1:
+    if len(selected_cycle) == 1 and command.instance_meta != InstanceMeta.Vllm:
         command = command.model_copy(
             update={
                 "instance_meta": InstanceMeta.MlxRing,
@@ -306,6 +308,11 @@ def place_instance(
                 shard_assignments=shard_assignments,
                 hosts_by_node=hosts_by_node,
                 ephemeral_port=ephemeral_port,
+            )
+        case InstanceMeta.Vllm:
+            target_instances[instance_id] = VllmInstance(
+                instance_id=instance_id,
+                shard_assignments=shard_assignments,
             )
 
     return target_instances
