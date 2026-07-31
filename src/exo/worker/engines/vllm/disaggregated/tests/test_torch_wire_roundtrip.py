@@ -473,7 +473,9 @@ class TestTorchFramedStream:
                 start_pos=0,
             ),
         )
-        for layer_idx, token_counts in sorted({**chunked_layers, **whole_layers}.items()):
+        for layer_idx, token_counts in sorted(
+            {**chunked_layers, **whole_layers}.items()
+        ):
             keys_by_layer[layer_idx] = []
             values_by_layer[layer_idx] = []
             for chunk_index, num_tokens in enumerate(token_counts):
@@ -595,9 +597,9 @@ class TestTorchFloat8:
 
         converted = to_bfloat16(as_float8.view(torch_module.uint8))
         assert converted.dtype == torch_module.bfloat16
-        assert bool(
-            torch_module.isfinite(converted.to(torch_module.float32)).all()
-        ), "float8 reinterpreted as uint8 produced non-finite values"
+        assert bool(torch_module.isfinite(converted.to(torch_module.float32)).all()), (
+            "float8 reinterpreted as uint8 produced non-finite values"
+        )
         assert bool(torch_module.equal(converted, expected))
 
         decoded = mlx_adapter.bytes_to_array(
@@ -611,7 +613,11 @@ class TestTorchFloat8:
     def test_float_dtypes_pass_through_unchanged(
         self, torch_module: ModuleType
     ) -> None:
-        for dtype in (torch_module.bfloat16, torch_module.float16, torch_module.float32):
+        for dtype in (
+            torch_module.bfloat16,
+            torch_module.float16,
+            torch_module.float32,
+        ):
             source = make_torch_nhd(torch_module, 2, 2, 2, dtype=dtype)
             assert to_bfloat16(source).dtype == dtype
 
@@ -651,7 +657,10 @@ class TestVllmAdapterParity:
         )
 
     def test_write_kv_layer_chunk_decodes_on_mlx_side(
-        self, torch_module: ModuleType, mlx_core: ModuleType, mlx_adapter: ModuleType,
+        self,
+        torch_module: ModuleType,
+        mlx_core: ModuleType,
+        mlx_adapter: ModuleType,
         vllm_adapter: ModuleType,
     ) -> None:
         """The real producer helper, straight into the real consumer helper."""
