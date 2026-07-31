@@ -25,7 +25,12 @@ from exo.worker.engines.mlx.disaggregated.adapter import (
     inject_rotating_kv_chunk,
 )
 
-_SOCKET_TIMEOUT_SECS = 60
+# Aligned with the runner's PREFILL_FINISH_TIMEOUT_SECONDS (300): the server
+# is allowed 300s to finish a prefill, so the client must not give up sooner.
+# At 60s, any transfer slower than ~35MB/s for an 8K-token bf16-32B cache
+# timed out and silently fell back to local prefill — while the server kept
+# streaming into a dead socket.
+_SOCKET_TIMEOUT_SECS = 300
 _RECV_BUFFER_BYTES = 4 * 1024 * 1024
 
 
