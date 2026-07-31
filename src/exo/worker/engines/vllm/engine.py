@@ -49,6 +49,7 @@ from exo.worker.engines.vllm.kv_connector import (
     get_save_kv_layer_diag,
     init_gdn_layer_order,
     reset_capture_state,
+    set_capture_active,
 )
 from exo.worker.runner.bootstrap import logger
 from exo.worker.runner.llm_inference.model_output_parsers import (
@@ -202,6 +203,7 @@ class VllmEngine(Engine):
         n_layers = len(model_runner.kv_caches)
 
         reset_capture_state()
+        set_capture_active(True)
         arrays_queue = get_arrays_queue()
         kv_queue = get_kv_queue()
 
@@ -410,6 +412,7 @@ class VllmEngine(Engine):
             with contextlib.suppress(Exception):
                 engine.abort_request([request.request_id])
         finally:
+            set_capture_active(False)
             logger.info(
                 f"serve_prefill {request.request_id}: "
                 f"kv_queue={kv_queue.qsize()} arrays_queue={arrays_queue.qsize()}"

@@ -61,6 +61,15 @@ _arrays_queue: queue.Queue[
 # Per-layer tracking of which layers' GDN states have been shipped via the
 # async pipeline. Entries here are excluded from the post-writer fallback drain.
 _gdn_shipped: set[int] = set()
+# Capture gate: True only while a serve_prefill is actively draining the
+# queues. Without it, ordinary generation requests (no writer thread running)
+# capture their prompt KV into the staging queues where it accumulates as
+# pinned memory — the leak the bounded queues turned into a loud queue.Full.
+_capture_active: list[bool] = [False]
+
+
+def set_capture_active(active: bool) -> None:
+    _capture_active[0] = active
 _captured_layers: dict[int, dict[str, torch.Tensor]] = {}
 _captured_arrays: dict[int, list[torch.Tensor]] = {}
 # Hybrid-model SSM/conv state captured via causal_conv1d + delta-rule patches.
@@ -124,6 +133,8 @@ def _try_ship_gdn(layer_idx: int) -> None:
     `arrays[layer_idx] = ...` last-write-wins keeps the final-chunk state
     (Mamba state is cumulative, only the final state matters).
     """
+    if not _capture_active[0]:
+        return
     state = _gdn_states.get(layer_idx)
     if state is None or "conv" not in state or "ssm" not in state:
         return
@@ -220,6 +231,8 @@ class StreamingConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: Any,
         **kwargs: Any,
     ) -> None:
+        if not _capture_active[0]:
+            return
         slot_mapping = getattr(attn_metadata, "slot_mapping", None)
         m = _LAYER_RE.search(layer_name)
         layer_idx_for_diag = int(m.group(1)) if m else -1
@@ -350,6 +363,8 @@ class BatchConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: Any,
         **kwargs: Any,
     ) -> None:
+        if not _capture_active[0]:
+            return
         slot_mapping = getattr(attn_metadata, "slot_mapping", None)
         if slot_mapping is not None and slot_mapping.shape[0] <= 100:
             return
@@ -541,6 +556,8 @@ def _patch_vllm_for_connector(  # pyright: ignore[reportUnusedFunction]
     _scheduled_apc_extracted: set[str] = set()
 
     def patched_schedule(self: sched_mod.Scheduler) -> Any:
+        if not _capture_active[0]:
+            return original_schedule(self)
         scheduler_output = original_schedule(self)
         try:
             new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None) or []
