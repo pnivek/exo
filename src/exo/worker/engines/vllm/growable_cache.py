@@ -1,4 +1,5 @@
 # pyright: reportPrivateUsage=false, reportAttributeAccessIssue=false
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -9,8 +10,19 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from exo.shared.logging import logger
 
-INITIAL_FRACTION = 0.05
-GROWTH_HEADROOM_BYTES = 512 * 1024 * 1024
+# Unified-memory (GB10) safety: page cache, pinned host staging buffers, and
+# NVRM driver allocations all share the same 121 GiB physical pool as the KV
+# cache. Two observed host crashes (NVRM NV_ERR_NO_MEMORY, machine wedged)
+# came from treating "free at load time" as a KV growth ceiling. The budget is
+# now explicit and hard-capped, and growth never eats into the reserve.
+#   EXO_KV_CACHE_GIB   — hard cap on total KV pool (default 16 GiB
+#                        ≈ 64K tokens for a 64-layer 8-KV-head bf16 model)
+#   EXO_MEM_RESERVE_GIB — memory that must stay available to the rest of the
+#                        system; growth stops before touching it (default 24)
+KV_CACHE_CAP_BYTES = int(float(os.environ.get("EXO_KV_CACHE_GIB", "16")) * 1024**3)
+MEM_RESERVE_BYTES = int(float(os.environ.get("EXO_MEM_RESERVE_GIB", "24")) * 1024**3)
+INITIAL_FRACTION = 1.0  # allocate the full budget upfront; growth is a fallback
+GROWTH_HEADROOM_BYTES = MEM_RESERVE_BYTES
 MIN_GROWTH_BLOCKS = 16
 
 if TYPE_CHECKING:
@@ -95,14 +107,19 @@ def _patch_determine_available_memory() -> None:
                 f"{min_initial / (1024**3):.2f} GiB. Stop other GPU "
                 f"processes (check `nvidia-smi`)."
             )
-        initial = max(int(free_bytes * INITIAL_FRACTION), min_initial)
-        self._growable_max_kv_bytes = free_bytes
-        self.available_kv_cache_memory_bytes = initial
-        logger.info(
-            f"Growable KV cache: initial {initial / (1024**3):.2f} GiB "
-            f"(max {free_bytes / (1024**3):.2f} GiB)"
+        budget = min(
+            max(int((free_bytes - MEM_RESERVE_BYTES) * INITIAL_FRACTION), min_initial),
+            KV_CACHE_CAP_BYTES,
         )
-        return initial
+        self._growable_max_kv_bytes = budget
+        self.available_kv_cache_memory_bytes = budget
+        logger.info(
+            f"KV cache budget: {budget / (1024**3):.2f} GiB (hard cap "
+            f"{KV_CACHE_CAP_BYTES / (1024**3):.0f} GiB, reserve "
+            f"{MEM_RESERVE_BYTES / (1024**3):.0f} GiB, free at load "
+            f"{free_bytes / (1024**3):.2f} GiB)"
+        )
+        return budget
 
     Worker.determine_available_memory = patched
 
@@ -247,7 +264,11 @@ def _try_grow_cache(kv_cache_manager: "KVCacheManager") -> bool:
     total_tensor_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
     per_block_bytes = total_tensor_bytes // old_num_blocks
 
-    usable_bytes = int(free_bytes * 0.8)
+    # Never grow the pool beyond the hard cap, and never into the reserve.
+    cap_remaining = KV_CACHE_CAP_BYTES - total_tensor_bytes
+    usable_bytes = min(free_bytes - MEM_RESERVE_BYTES, cap_remaining)
+    if usable_bytes <= 0:
+        return False
     growth_blocks = min(usable_bytes // per_block_bytes, old_num_blocks)
 
     if growth_blocks < MIN_GROWTH_BLOCKS:

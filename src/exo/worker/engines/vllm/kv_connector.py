@@ -40,16 +40,24 @@ _LAYER_RE = re.compile(r"layers\.(\d+)\.")
 # it for skip_tokens accounting *and* to slice the keys/values tensors before
 # writing to wire — never trusts `keys.shape[0]`, since shape can disagree with
 # token count when the source path packs/reshapes (e.g. NVFP4 layouts).
+# Bounded: entries hold PINNED host tensors, which on unified-memory systems
+# (GB10) come from the same physical pool as GPU memory. An unbounded queue
+# with a slow receiver accumulates pinned memory without limit — observed to
+# starve NVRM and wedge the host. Bounded puts apply backpressure to the
+# forward pass instead; a stuck writer trips the put timeout and aborts the
+# request rather than deadlocking or OOMing the machine.
+KV_QUEUE_MAX_CHUNKS = 64
+KV_QUEUE_PUT_TIMEOUT_SECONDS = 60.0
 _kv_queue: queue.Queue[
     tuple[int, int, torch.Tensor, torch.Tensor, torch.cuda.Event] | None
-] = queue.Queue()
+] = queue.Queue(maxsize=KV_QUEUE_MAX_CHUNKS)
 # 3-tuple: (layer_idx, arrays_host_or_gpu, copy_done_event_or_none)
 # - From save_kv_layer hybrid path: tensors are GPU, event=None (writer .cpu()s)
 # - From GDN capture (after both conv+ssm ready): tensors are pinned host,
 #   event is a CUDA event the writer must synchronize on before reading
 _arrays_queue: queue.Queue[
     tuple[int, list[torch.Tensor], torch.cuda.Event | None] | None
-] = queue.Queue()
+] = queue.Queue(maxsize=KV_QUEUE_MAX_CHUNKS)
 # Per-layer tracking of which layers' GDN states have been shipped via the
 # async pipeline. Entries here are excluded from the post-writer fallback drain.
 _gdn_shipped: set[int] = set()
@@ -130,7 +138,10 @@ def _try_ship_gdn(layer_idx: int) -> None:
         ssm_host.copy_(ssm_gpu, non_blocking=True)
     event = torch.cuda.Event()
     event.record(side_stream)
-    _arrays_queue.put((layer_idx, [conv_host, ssm_host], event))
+    _arrays_queue.put(
+        (layer_idx, [conv_host, ssm_host], event),
+        timeout=KV_QUEUE_PUT_TIMEOUT_SECONDS,
+    )
     _gdn_shipped.add(layer_idx)
 
 
@@ -236,7 +247,9 @@ class StreamingConnector(KVConnectorBase_V1, SupportsHMA):
                 to_bf16(t)
                 for t in cast(list[torch.Tensor] | tuple[torch.Tensor, ...], kv_layer)
             ]
-            _arrays_queue.put((layer_idx, arrays, None))
+            _arrays_queue.put(
+                (layer_idx, arrays, None), timeout=KV_QUEUE_PUT_TIMEOUT_SECONDS
+            )
             return
 
         # Standard attention layers (full or sliding-window): extract K/V
@@ -277,7 +290,10 @@ class StreamingConnector(KVConnectorBase_V1, SupportsHMA):
                     f"slot_mapping.shape={slot_mapping.shape}: {exc!r}"
                 )
                 return
-            _kv_queue.put((layer_idx, num_tokens, keys_host, values_host, event))
+            _kv_queue.put(
+                (layer_idx, num_tokens, keys_host, values_host, event),
+                timeout=KV_QUEUE_PUT_TIMEOUT_SECONDS,
+            )
 
     def wait_for_save(self) -> None:
         return
@@ -634,7 +650,8 @@ def _patch_vllm_for_connector(  # pyright: ignore[reportUnusedFunction]
                         event = torch.cuda.Event()
                         event.record(save_stream)
                         _kv_queue.put(
-                            (layer_idx, num_apc, keys_host, values_host, event)
+                            (layer_idx, num_apc, keys_host, values_host, event),
+                            timeout=KV_QUEUE_PUT_TIMEOUT_SECONDS,
                         )
                         pre_layers_shipped += 1
                         pre_bytes_shipped += (
