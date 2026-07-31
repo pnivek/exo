@@ -77,6 +77,25 @@ def _patch_nogds() -> None:
     weight_utils._init_fastsafetensors_loader = patched
 
 
+def _available_memory_bytes() -> int:
+    """Memory actually available for KV allocation on this node.
+
+    On unified-memory systems (GB10) torch.cuda.mem_get_info reports only
+    MemFree-ish numbers and misses tens of GiB of reclaimable page cache
+    (which IS usable — and IS GPU memory — on these machines). /proc/meminfo
+    MemAvailable is the honest signal; fall back to mem_get_info elsewhere.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    free_bytes, _ = torch.cuda.mem_get_info()
+    return free_bytes
+
+
 def _patch_determine_available_memory() -> None:
     from vllm.v1.worker.gpu_worker import Worker
 
@@ -91,7 +110,7 @@ def _patch_determine_available_memory() -> None:
         if compile_cache.exists():
             shutil.rmtree(compile_cache, ignore_errors=True)
 
-        free_bytes, _ = torch.cuda.mem_get_info()
+        free_bytes = _available_memory_bytes()
         # vLLM's get_kv_cache_configs computes per-group block counts via
         # `tensor.size // num_blocks_old` and asserts the result divides
         # evenly. With a small `available_kv_cache_memory_bytes` and
@@ -254,7 +273,7 @@ def _try_grow_cache(kv_cache_manager: "KVCacheManager") -> bool:
     if model_runner is None:
         return False
 
-    free_bytes, _ = torch.cuda.mem_get_info()
+    free_bytes = _available_memory_bytes()
     if free_bytes < GROWTH_HEADROOM_BYTES:
         return False
 
