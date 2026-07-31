@@ -51,7 +51,13 @@ RUN pip install --no-cache-dir --ignore-requires-python \
     python-multipart msgspec zstandard "transformers>=5.6.2" python-daemon \
     types-aiofiles nvidia-ml-py
 
-RUN python3 -c "from exo.main import main; print('exo imports OK')"
+# mlx (CPU wheels) + mlx-lm: the vLLM engine uses mlx_lm's TokenizerWrapper
+# for chat templating, and the shared runner import graph reaches mlx. GPU
+# MLX compute on this node is NOT expected — decode belongs on the Mac.
+RUN pip install --no-cache-dir --ignore-requires-python "mlx==0.32.0" mlx-lm
+
+RUN python3 -c "from exo.main import main; print('exo imports OK')" && \
+    python3 -c "from exo.worker.engines.vllm.builder import VllmBuilder; print('vllm builder imports OK')"
 
 # Pre-cache tiktoken encodings (offline nodes)
 RUN python3 -c "import tiktoken; tiktoken.get_encoding('o200k_base'); tiktoken.get_encoding('cl100k_base')" 2>/dev/null || true
