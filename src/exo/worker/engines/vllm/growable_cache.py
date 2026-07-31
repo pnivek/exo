@@ -4,9 +4,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.request import Request
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from exo.shared.logging import logger
@@ -124,9 +122,12 @@ def _patch_initialize_kv_cache_tensors() -> None:
     original_alloc = GPUModelRunner._allocate_kv_cache_tensors
 
     def patched_alloc(
-        self: GPUModelRunner, kv_cache_config: KVCacheConfig
+        self: GPUModelRunner,
+        kv_cache_config: KVCacheConfig,
+        *args: Any,
+        **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
-        raw_tensors = original_alloc(self, kv_cache_config)
+        raw_tensors = original_alloc(self, kv_cache_config, *args, **kwargs)
         self._growable_raw_tensors = {name: t for name, t in raw_tensors.items()}
         return raw_tensors
 
@@ -138,10 +139,14 @@ def _patch_initialize_kv_cache_tensors() -> None:
         self: GPUModelRunner,
         kv_cache_config: KVCacheConfig,
         kernel_block_sizes: list[int],
+        *args: Any,
+        **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         self._growable_kv_cache_config = kv_cache_config
         self._growable_kernel_block_sizes = kernel_block_sizes
-        return original_init_tensors(self, kv_cache_config, kernel_block_sizes)
+        return original_init_tensors(
+            self, kv_cache_config, kernel_block_sizes, *args, **kwargs
+        )
 
     GPUModelRunner.initialize_kv_cache_tensors = patched_init_tensors
 
@@ -182,31 +187,11 @@ def _patch_kv_cache_manager_init() -> None:
     original_init = KVCacheManager.__init__
 
     def patched_init(
-        self: KVCacheManager,
-        kv_cache_config: KVCacheConfig,
-        max_model_len: int,
-        hash_block_size: int,
-        enable_caching: bool = True,
-        use_eagle: bool = False,
-        log_stats: bool = False,
-        enable_kv_cache_events: bool = False,
-        dcp_world_size: int = 1,
-        pcp_world_size: int = 1,
-        metrics_collector: KVCacheMetricsCollector | None = None,
+        self: KVCacheManager, *args: Any, **kwargs: Any
     ) -> None:
-        original_init(
-            self,
-            kv_cache_config,
-            max_model_len,
-            hash_block_size,
-            enable_caching,
-            use_eagle,
-            log_stats,
-            enable_kv_cache_events,
-            dcp_world_size,
-            pcp_world_size,
-            metrics_collector,
-        )
+        # Signature-transparent: KVCacheManager.__init__ keeps growing new
+        # parameters across vLLM releases (0.21 added max_num_batched_tokens).
+        original_init(self, *args, **kwargs)
         self._growable_model_runner = get_model_runner()
 
     KVCacheManager.__init__ = patched_init
@@ -218,39 +203,11 @@ def _patch_allocate_slots() -> None:
     original = KVCacheManager.allocate_slots
 
     def patched(
-        self: KVCacheManager,
-        request: Request,
-        num_new_tokens: int,
-        num_new_computed_tokens: int = 0,
-        new_computed_blocks: KVCacheBlocks | None = None,
-        num_lookahead_tokens: int = 0,
-        num_external_computed_tokens: int = 0,
-        delay_cache_blocks: bool = False,
-        num_encoder_tokens: int = 0,
+        self: KVCacheManager, *args: Any, **kwargs: Any
     ) -> KVCacheBlocks | None:
-        result = original(
-            self,
-            request,
-            num_new_tokens,
-            num_new_computed_tokens,
-            new_computed_blocks,
-            num_lookahead_tokens,
-            num_external_computed_tokens,
-            delay_cache_blocks,
-            num_encoder_tokens,
-        )
+        result = original(self, *args, **kwargs)
         while result is None and _try_grow_cache(self):
-            result = original(
-                self,
-                request,
-                num_new_tokens,
-                num_new_computed_tokens,
-                new_computed_blocks,
-                num_lookahead_tokens,
-                num_external_computed_tokens,
-                delay_cache_blocks,
-                num_encoder_tokens,
-            )
+            result = original(self, *args, **kwargs)
 
         return result
 
@@ -263,30 +220,11 @@ def _patch_allocate_slots() -> None:
         )
 
         def patched_can_fit(
-            self: KVCacheManager,
-            request: Request,
-            num_new_computed_tokens: int = 0,
-            new_computed_blocks: KVCacheBlocks | None = None,
-            num_external_computed_tokens: int = 0,
-            num_encoder_tokens: int = 0,
+            self: KVCacheManager, *args: Any, **kwargs: Any
         ) -> bool:
-            result: bool = original_can_fit(
-                self,
-                request,
-                num_new_computed_tokens,
-                new_computed_blocks,
-                num_external_computed_tokens,
-                num_encoder_tokens,
-            )
+            result: bool = original_can_fit(self, *args, **kwargs)
             while not result and _try_grow_cache(self):
-                result = original_can_fit(
-                    self,
-                    request,
-                    num_new_computed_tokens,
-                    new_computed_blocks,
-                    num_external_computed_tokens,
-                    num_encoder_tokens,
-                )
+                result = original_can_fit(self, *args, **kwargs)
             return result
 
         KVCacheManager.can_fit_full_sequence = patched_can_fit
