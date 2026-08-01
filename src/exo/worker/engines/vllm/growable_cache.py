@@ -71,9 +71,7 @@ def _patch_mm_prefix_capability() -> None:
     try:
         from vllm.v1.attention.backends.flashinfer import FlashInferBackend
 
-        FlashInferBackend.supports_mm_prefix = classmethod(  # pyright: ignore[reportAttributeAccessIssue]
-            lambda cls: True
-        )
+        FlashInferBackend.supports_mm_prefix = classmethod(lambda cls: True)
     except Exception:
         logger.warning("mm-prefix capability patch not applied", exc_info=True)
 
