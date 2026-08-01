@@ -492,16 +492,37 @@ class Master:
 
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands
     async def _plan(self) -> None:
+        # Instance-kill grace: a node must be absent from the topology for
+        # this many consecutive passes (10s apart) before its instances are
+        # destroyed. Heavy engine loads (31B Triton compile pegging every
+        # core) drop the zenoh session briefly; killing the instance whose
+        # runner is mid-load turns a transient hiccup into a hard failure —
+        # observed reproducibly ~130s into gemma4 loads.
+        absent_passes: dict[NodeId, int] = {}
         while True:
-            # kill broken instances
+            # kill broken instances (with grace for transient disconnects)
             connected_node_ids = set(self.state.topology.list_nodes())
             for instance_id, instance in self.state.instances.items():
                 for node_id in instance.shard_assignments.node_to_runner:
                     if node_id not in connected_node_ids:
+                        absent_passes[node_id] = absent_passes.get(node_id, 0) + 1
+                        if absent_passes[node_id] < 3:
+                            logger.warning(
+                                f"Node {node_id} absent from topology "
+                                f"(pass {absent_passes[node_id]}/3) — holding "
+                                f"instance {instance_id}"
+                            )
+                            continue
+                        logger.warning(
+                            f"Killing instance {instance_id}: node {node_id} "
+                            f"absent from topology for 3 passes"
+                        )
                         await self.event_sender.send(
                             InstanceDeleted(instance_id=instance_id)
                         )
                         break
+                    else:
+                        absent_passes.pop(node_id, None)
 
             # time out dead nodes. 120s, not 30: heavy engine loads (Triton
             # kernel compilation for a 31B model saturating every core) can
