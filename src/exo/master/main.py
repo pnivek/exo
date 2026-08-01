@@ -503,10 +503,14 @@ class Master:
                         )
                         break
 
-            # time out dead nodes
+            # time out dead nodes. 120s, not 30: heavy engine loads (Triton
+            # kernel compilation for a 31B model saturating every core) can
+            # starve a worker's heartbeats past 30s, and the reap cascade
+            # kills the very instance being loaded. Observed reproducibly at
+            # ~130s into gemma4 loads on DGX Spark.
             for node_id, time in self.state.last_seen.items():
                 now = datetime.now(tz=timezone.utc)
-                if now - time > timedelta(seconds=30):
+                if now - time > timedelta(seconds=120):
                     logger.info(f"Manually removing node {node_id} due to inactivity")
                     await self.event_sender.send(NodeTimedOut(node_id=node_id))
 
