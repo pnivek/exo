@@ -1,11 +1,12 @@
 import contextlib
 import itertools
+import queue
 import threading
 import time
 from collections import deque
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import torch
 from vllm import SamplingParams
@@ -309,6 +310,51 @@ class VllmEngine(Engine):
                             f"First KV chunk: layer={layer_idx} keys={keys.shape} "
                             f"keys.dtype={keys.dtype} values.dtype={values.dtype}"
                         )
+                    chunks_sent += 1
+                    # Hand off to the dedicated sender so socket writes overlap
+                    # with waiting on the producer — measured perfectly ADDITIVE
+                    # otherwise (sock 8.0s + producer_wait 11.9s = 19.9s elapsed
+                    # at 16K tokens). keys/values tensors ride along to keep the
+                    # memory behind the zero-copy views alive until sent.
+                    send_queue.put(
+                        (
+                            layer_idx,
+                            num_tokens,
+                            n_heads,
+                            head_dim,
+                            dtype_w,
+                            keys_bytes,
+                            values_bytes,
+                            payload_bytes,
+                            keys,
+                            values,
+                        )
+                    )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "serve_prefill writer thread crashed"
+                )
+            finally:
+                send_queue.put(None)
+
+        def sender_loop() -> None:
+            try:
+                while True:
+                    item = send_queue.get()
+                    if item is None:
+                        break
+                    (
+                        layer_idx,
+                        num_tokens,
+                        n_heads,
+                        head_dim,
+                        dtype_w,
+                        keys_bytes,
+                        values_bytes,
+                        payload_bytes,
+                        _keys_alive,
+                        _values_alive,
+                    ) = item
                     t_sock = time.perf_counter()
                     with wfile_lock:
                         write_kv_chunk(
@@ -324,10 +370,9 @@ class VllmEngine(Engine):
                     writer_stats["socket_secs"] += time.perf_counter() - t_sock
                     writer_stats["bytes_shipped"] += payload_bytes
                     writer_stats["last_byte_t"] = time.perf_counter()
-                    chunks_sent += 1
             except Exception:
                 logger.opt(exception=True).warning(
-                    "serve_prefill writer thread crashed"
+                    "serve_prefill sender thread crashed"
                 )
 
         def arrays_writer_loop() -> None:
@@ -350,8 +395,14 @@ class VllmEngine(Engine):
                     "serve_prefill arrays writer thread crashed"
                 )
 
+        # Depth 8: enough for the sender to always have work while the
+        # preparer waits on the producer; bounded so pinned chunk memory in
+        # flight stays capped (~8 x ~14MB).
+        send_queue: queue.Queue[tuple[Any, ...] | None] = queue.Queue(maxsize=8)
         writer_thread = threading.Thread(target=writer_loop, daemon=True)
         writer_thread.start()
+        sender_thread = threading.Thread(target=sender_loop, daemon=True)
+        sender_thread.start()
         arrays_writer_thread = threading.Thread(target=arrays_writer_loop, daemon=True)
         arrays_writer_thread.start()
 
@@ -424,6 +475,7 @@ class VllmEngine(Engine):
             kv_queue.put(None)
             arrays_queue.put(None)
             writer_thread.join(timeout=30)
+            sender_thread.join(timeout=30)
             arrays_writer_thread.join(timeout=30)
             if writer_thread.is_alive():
                 logger.warning("serve_prefill: kv writer thread did not exit")
