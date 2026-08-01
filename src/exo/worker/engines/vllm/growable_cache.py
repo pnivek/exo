@@ -57,7 +57,25 @@ def patch_vllm() -> None:
     _patch_allocate_slots()
     _patch_moe_sum()
     _patch_marlin_w2_thread_config()
+    _patch_mm_prefix_capability()
     logger.info("vLLM growable KV cache patch applied")
+
+
+def _patch_mm_prefix_capability() -> None:
+    # Multimodal models (gemma4, qwen3.5-VL-class) declare partial-attention
+    # image-token prefixes, and vLLM's backend validity check rejects
+    # FLASHINFER for them — the only working backend on GB10. This node is
+    # text-only (multimodal inputs are hard-disabled via limit_mm_per_prompt),
+    # so no mm token can ever reach attention; report the capability as
+    # supported to pass validation.
+    try:
+        from vllm.v1.attention.backends.flashinfer import FlashInferBackend
+
+        FlashInferBackend.supports_mm_prefix = classmethod(  # pyright: ignore[reportAttributeAccessIssue]
+            lambda cls: True
+        )
+    except Exception:
+        logger.warning("mm-prefix capability patch not applied", exc_info=True)
 
 
 def _patch_nogds() -> None:
