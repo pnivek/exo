@@ -429,7 +429,20 @@ def load_vllm_engine(
         )
     except Exception:
         pass
-    if has_mamba:
+    is_blackwell = False
+    try:
+        major, _minor = torch.cuda.get_device_capability()
+        is_blackwell = major >= 10
+    except Exception:
+        pass
+    if is_blackwell:
+        # sm_12x (GB10): FLASH_ATTN segfaults in cudaFuncSetAttribute
+        # (uncatchable) and TRITON_ATTN fails to initialize — for ALL model
+        # types including linear-attention hybrids like qwen3_5. FLASHINFER
+        # is the only working backend; make it terminal so a failure surfaces
+        # instead of cascading into a segfault.
+        backends = [AttentionBackendEnum.FLASHINFER]
+    elif has_mamba:
         backends = [AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.TRITON_ATTN]
     else:
         backends = [
