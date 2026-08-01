@@ -75,7 +75,9 @@ def to_bf16(t: torch.Tensor) -> torch.Tensor:
 
 
 def extract_kv_via_slot_mapping(
-    kv_layer: torch.Tensor, slot_mapping: torch.Tensor
+    kv_layer: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    num_actual_tokens: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pull (keys, values) for the fresh tokens of one layer using slot_mapping.
 
@@ -96,6 +98,16 @@ def extract_kv_via_slot_mapping(
         v_all = to_nhd(kv_layer[:, 1])
     k_flat = k_all.reshape(-1, *k_all.shape[-2:])
     v_flat = v_all.reshape(-1, *v_all.shape[-2:])
+    if num_actual_tokens is not None:
+        # Sync-free path: padding in vLLM slot_mapping is trailing and the
+        # true token count is known CPU-side, so a slice + gather keeps the
+        # whole extraction asynchronous. The boolean-mask path below forces a
+        # cudaStreamSynchronize per call (output size lives on the GPU) —
+        # measured at ~20s of compute-thread stalls per 16K-token request.
+        sm = slot_mapping[:num_actual_tokens].clamp(min=0)
+        keys = to_bf16(k_flat[sm])
+        values = to_bf16(v_flat[sm])
+        return keys, values
     valid = slot_mapping >= 0
     safe_sm = slot_mapping.clamp(min=0)
     keys = to_bf16(k_flat[safe_sm][valid])

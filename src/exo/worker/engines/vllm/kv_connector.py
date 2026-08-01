@@ -322,9 +322,14 @@ class StreamingConnector(KVConnectorBase_V1, SupportsHMA):
             try:
                 save_stream = _get_save_stream()
                 save_stream.wait_stream(torch.cuda.current_stream())
+                num_actual = getattr(attn_metadata, "num_actual_tokens", None)
+                if num_actual is not None:
+                    num_actual = int(num_actual)
+                    if num_actual <= 0 or num_actual > int(slot_mapping.shape[0]):
+                        num_actual = None
                 with torch.cuda.stream(save_stream):
                     keys_gpu, values_gpu = extract_kv_via_slot_mapping(
-                        kv_layer, slot_mapping
+                        kv_layer, slot_mapping, num_actual_tokens=num_actual
                     )
                     keys_host = _pinned_take(tuple(keys_gpu.shape), keys_gpu.dtype)
                     values_host = _pinned_take(
