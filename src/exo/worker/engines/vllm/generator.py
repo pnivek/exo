@@ -441,7 +441,14 @@ def load_vllm_engine(
         # types including linear-attention hybrids like qwen3_5. FLASHINFER
         # is the only working backend; make it terminal so a failure surfaces
         # instead of cascading into a segfault.
-        backends = [AttentionBackendEnum.FLASHINFER]
+        # TRITON_ATTN as fallback: unlike FLASH_ATTN (uncatchable segfault),
+        # its sm_121a failure mode is a clean init error — and newer Triton
+        # builds in the eugr image may support what FLASHINFER lacks (e.g.
+        # gemma4's head size, rejected with 'head_size not supported').
+        backends = [
+            AttentionBackendEnum.FLASHINFER,
+            AttentionBackendEnum.TRITON_ATTN,
+        ]
     elif has_mamba:
         backends = [AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.TRITON_ATTN]
     else:
