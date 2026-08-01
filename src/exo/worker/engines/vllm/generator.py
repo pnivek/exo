@@ -445,8 +445,12 @@ def load_vllm_engine(
         # its sm_121a failure mode is a clean init error — and newer Triton
         # builds in the eugr image may support what FLASHINFER lacks (e.g.
         # gemma4's head size, rejected with 'head_size not supported').
+        # None = let vLLM's default selection choose — proven working for
+        # gemma4 (head_dim=256, which FLASHINFER's static support list
+        # rejects) on this exact image via plain `vllm serve`.
         backends = [
             AttentionBackendEnum.FLASHINFER,
+            None,
             AttentionBackendEnum.TRITON_ATTN,
         ]
     elif has_mamba:
@@ -460,6 +464,9 @@ def load_vllm_engine(
 
     engine: LLMEngine | None = None
     for backend in backends:
+        logger.info(
+            f"Trying attention backend: {backend if backend is not None else 'vLLM default'}"
+        )
         try:
             engine_args = EngineArgs(
                 model=str(model_path.expanduser().resolve()),
