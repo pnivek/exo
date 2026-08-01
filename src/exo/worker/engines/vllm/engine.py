@@ -47,9 +47,11 @@ from exo.worker.engines.vllm.kv_connector import (
     get_gdn_shipped,
     get_gdn_states,
     get_kv_queue,
+    get_producer_stats,
     get_save_kv_layer_diag,
     init_gdn_layer_order,
     reset_capture_state,
+    return_pinned_buffers,
     set_capture_active,
 )
 from exo.worker.runner.bootstrap import logger
@@ -370,6 +372,7 @@ class VllmEngine(Engine):
                     writer_stats["socket_secs"] += time.perf_counter() - t_sock
                     writer_stats["bytes_shipped"] += payload_bytes
                     writer_stats["last_byte_t"] = time.perf_counter()
+                    return_pinned_buffers(_keys_alive, _values_alive)
             except Exception:
                 logger.opt(exception=True).warning(
                     "serve_prefill sender thread crashed"
@@ -551,6 +554,9 @@ class VllmEngine(Engine):
             f"ship_ms={ship_secs * 1000:.0f} "
             f"wait_event_ms={wait_secs * 1000:.0f} sock_ms={sock_secs * 1000:.0f} "
             f"producer_wait_ms={writer_stats.get('queue_wait_secs', 0.0) * 1000:.0f} "
+            f"capture_ms={get_producer_stats().get('capture_secs', 0.0) * 1000:.0f} "
+            f"pool_hits={get_producer_stats().get('pool_hits', 0):.0f} "
+            f"pool_misses={get_producer_stats().get('pool_misses', 0):.0f} "
             f"eff_bw={eff_bw_mbps:.0f}MB/s peak_bw={peak_bw_mbps:.0f}MB/s"
         )
 
