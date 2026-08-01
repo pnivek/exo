@@ -77,7 +77,11 @@ def entrypoint(
 
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
             os.environ["VLLM_KV_CACHE_LAYOUT"] = "NHD"
-            os.environ["VLLM_BATCH_INVARIANT"] = "1"
+            # NOT setting VLLM_BATCH_INVARIANT: batch-invariant mode makes
+            # vLLM 0.21 reject FLASHINFER for hybrid (linear-attention) models
+            # ("batch invariance not supported"), and FLASHINFER is the only
+            # working backend on GB10. Determinism across batch compositions
+            # is not load-bearing for prefill serving.
             os.environ.setdefault("FASTSAFETENSORS_NOGDS", "1")
 
             patch_vllm()

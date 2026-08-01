@@ -68,7 +68,6 @@ RUN python3 -c "import tiktoken; tiktoken.get_encoding('o200k_base'); tiktoken.g
 # ── Runtime env (mirrors worker/runner/bootstrap.py for manual runs) ────
 ENV VLLM_ENABLE_V1_MULTIPROCESSING=0
 ENV VLLM_KV_CACHE_LAYOUT=NHD
-ENV VLLM_BATCH_INVARIANT=1
 ENV FASTSAFETENSORS_NOGDS=1
 
 EXPOSE 52415 52413/udp 52414
