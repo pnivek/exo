@@ -2,6 +2,8 @@
 import contextlib
 import queue
 import re
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -70,6 +72,43 @@ _capture_active: list[bool] = [False]
 
 def set_capture_active(active: bool) -> None:
     _capture_active[0] = active
+
+
+# Reusable pinned host buffers. torch.empty(pin_memory=True) is a synchronous
+# cudaHostAlloc issued on the COMPUTE thread inside save_kv_layer -- measured
+# to stall the forward pass badly (producer rate 2.4x slower than the model's
+# own prefill floor at 640 allocs per 16K-token request). Buffers cycle:
+# save_kv_layer takes, the sender returns after the bytes hit the socket.
+_PINNED_POOL_PER_SHAPE = 16
+_pinned_pool: dict[tuple[tuple[int, ...], torch.dtype], list[torch.Tensor]] = {}
+_pinned_pool_lock = threading.Lock()
+_producer_stats: dict[str, float] = {}
+
+
+def _pinned_take(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    key = (shape, dtype)
+    with _pinned_pool_lock:
+        bucket = _pinned_pool.get(key)
+        if bucket:
+            _producer_stats["pool_hits"] = _producer_stats.get("pool_hits", 0) + 1
+            return bucket.pop()
+    _producer_stats["pool_misses"] = _producer_stats.get("pool_misses", 0) + 1
+    return torch.empty(shape, dtype=dtype, pin_memory=True)
+
+
+def return_pinned_buffers(*tensors: torch.Tensor) -> None:
+    # Sender-side: recycle pinned staging buffers once their bytes are on the
+    # wire (the kernel has copied them into the socket buffer by then).
+    with _pinned_pool_lock:
+        for t in tensors:
+            key = (tuple(t.shape), t.dtype)
+            bucket = _pinned_pool.setdefault(key, [])
+            if len(bucket) < _PINNED_POOL_PER_SHAPE:
+                bucket.append(t)
+
+
+def get_producer_stats() -> dict[str, float]:
+    return _producer_stats
 _captured_layers: dict[int, dict[str, torch.Tensor]] = {}
 _captured_arrays: dict[int, list[torch.Tensor]] = {}
 # Hybrid-model SSM/conv state captured via causal_conv1d + delta-rule patches.
@@ -187,6 +226,7 @@ def reset_capture_state() -> None:
     _ssm_call_idx[0] = 0
     _save_kv_layer_diag.clear()
     _apc_hit_tokens.clear()
+    _producer_stats.clear()
     apc_set = _apc_extracted_set_ref.get("set")
     if apc_set is not None:
         apc_set.clear()
@@ -278,6 +318,7 @@ class StreamingConnector(KVConnectorBase_V1, SupportsHMA):
         # The writer thread later waits on the CUDA event (CPU-side wait,
         # doesn't block GPU) and ships the already-on-host bytes.
         if slot_mapping is not None:
+            t_capture = time.perf_counter()
             try:
                 save_stream = _get_save_stream()
                 save_stream.wait_stream(torch.cuda.current_stream())
@@ -285,17 +326,18 @@ class StreamingConnector(KVConnectorBase_V1, SupportsHMA):
                     keys_gpu, values_gpu = extract_kv_via_slot_mapping(
                         kv_layer, slot_mapping
                     )
-                    keys_host = torch.empty(
-                        keys_gpu.shape, dtype=keys_gpu.dtype, pin_memory=True
-                    )
-                    values_host = torch.empty(
-                        values_gpu.shape, dtype=values_gpu.dtype, pin_memory=True
+                    keys_host = _pinned_take(tuple(keys_gpu.shape), keys_gpu.dtype)
+                    values_host = _pinned_take(
+                        tuple(values_gpu.shape), values_gpu.dtype
                     )
                     keys_host.copy_(keys_gpu, non_blocking=True)
                     values_host.copy_(values_gpu, non_blocking=True)
                     num_tokens = int(keys_gpu.shape[0])
                 event = torch.cuda.Event()
                 event.record(save_stream)
+                _producer_stats["capture_secs"] = _producer_stats.get(
+                    "capture_secs", 0.0
+                ) + (time.perf_counter() - t_capture)
             except Exception as exc:
                 logger.warning(
                     f"save_kv_layer extract failed layer={layer_idx} "
