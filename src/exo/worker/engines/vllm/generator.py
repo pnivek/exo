@@ -395,6 +395,31 @@ def build_layer_groups(kv_cache_config: KVCacheConfig) -> list[int]:
     return layer_to_group
 
 
+def _choose_load_format(model_path) -> str:
+    # fastsafetensors bulk-buffers ENTIRE shards host+device — a single
+    # 50GB shard (gemma-4-31B bf16 ships weights in 2 files) transiently
+    # doubles into ~100GB on unified memory and earlyoom kills the load at
+    # 0%. Stream-load instead when any shard is huge. Override with
+    # EXO_VLLM_LOAD_FORMAT (e.g. "instanttensor" from the eugr image).
+    forced = os.environ.get("EXO_VLLM_LOAD_FORMAT")
+    if forced:
+        return forced
+    try:
+        max_shard = max(
+            (p.stat().st_size for p in model_path.glob("*.safetensors")),
+            default=0,
+        )
+        if max_shard > 20 * 1024**3:
+            logger.info(
+                f"Largest shard {max_shard / 1e9:.0f}GB > 20GB: using streaming "
+                f"safetensors loader instead of fastsafetensors"
+            )
+            return "safetensors"
+    except Exception:
+        pass
+    return "fastsafetensors"
+
+
 def load_vllm_engine(
     model_id: ModelId,
     trust_remote_code: bool,
@@ -478,7 +503,7 @@ def load_vllm_engine(
                 served_model_name=str(model_id),
                 gpu_memory_utilization=0.05,
                 trust_remote_code=trust_remote_code,
-                load_format="fastsafetensors",
+                load_format=_choose_load_format(model_path),
                 enable_prefix_caching=True,
                 # Cap context: without this vLLM sizes init-time buffers for
                 # the model's native max (gemma4: 262144), spiking memory to
