@@ -43,15 +43,17 @@ def wire_to_torch_dtype(dtype: DType) -> torch.dtype:
     return _WIRE_TO_TORCH[dtype]
 
 
-def tensor_to_wire_bytes(t: torch.Tensor) -> bytes:
-    """Serialize an NHD-laid-out tensor to wire bytes.
+def tensor_to_wire_bytes(t: torch.Tensor) -> "bytes | memoryview":
+    """Serialize an NHD-laid-out tensor to wire bytes without copying.
 
-    bfloat16 has no native numpy dtype — bitcast through uint16.
+    bfloat16 has no native numpy dtype — bitcast through uint16. The returned
+    memoryview aliases the tensor's memory: callers must keep the tensor alive
+    until the bytes have been written (write_kv_chunk consumes it in-scope).
     """
     t = t.detach().contiguous().cpu()
     if t.dtype == torch.bfloat16:
-        return bytes(t.view(torch.uint16).numpy().tobytes())
-    return bytes(t.numpy().tobytes())
+        t = t.view(torch.uint16)
+    return memoryview(t.numpy()).cast("B")
 
 
 def to_nhd(t: torch.Tensor) -> torch.Tensor:
@@ -132,7 +134,9 @@ def arrays_to_blobs(arrays: list[torch.Tensor]) -> list[TensorBlob]:
         TensorBlob(
             dtype=torch_dtype_to_wire(arr.dtype),
             shape=tuple(int(d) for d in arr.shape),
-            data=tensor_to_wire_bytes(arr),
+            # ArraysState rides inside msgpack (small SSM states) — needs
+            # real bytes, unlike the raw-payload KV path.
+            data=bytes(tensor_to_wire_bytes(arr)),
         )
         for arr in arrays
     ]

@@ -31,7 +31,9 @@ from exo.worker.engines.mlx.disaggregated.adapter import (
 # timed out and silently fell back to local prefill — while the server kept
 # streaming into a dead socket.
 _SOCKET_TIMEOUT_SECS = 300
-_RECV_BUFFER_BYTES = 4 * 1024 * 1024
+# 64MB: matched to the server's SO_SNDBUF; at 10GbE+ rates a 4MB receive
+# window stalls the sender between chunks.
+_RECV_BUFFER_BYTES = 64 * 1024 * 1024
 
 
 @dataclass

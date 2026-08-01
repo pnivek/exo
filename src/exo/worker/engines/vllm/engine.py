@@ -247,6 +247,7 @@ class VllmEngine(Engine):
             last_hb = time.perf_counter()
             try:
                 while True:
+                    t_get = time.perf_counter()
                     try:
                         item = kv_queue.get(timeout=3.0)
                     except Exception:
@@ -264,6 +265,9 @@ class VllmEngine(Engine):
                         continue
                     if item is None:
                         break
+                    writer_stats["queue_wait_secs"] = writer_stats.get(
+                        "queue_wait_secs", 0.0
+                    ) + (time.perf_counter() - t_get)
                     layer_idx, count, keys, values, copy_event = item
                     # Wait for the side-stream D2H to finish populating the
                     # pinned host buffers. CPU-side wait, doesn't block GPU.
@@ -494,6 +498,7 @@ class VllmEngine(Engine):
             f"bytes={bytes_shipped / 1e6:.0f}MB ttfb_ms={first_byte_dt * 1000:.0f} "
             f"ship_ms={ship_secs * 1000:.0f} "
             f"wait_event_ms={wait_secs * 1000:.0f} sock_ms={sock_secs * 1000:.0f} "
+            f"producer_wait_ms={writer_stats.get('queue_wait_secs', 0.0) * 1000:.0f} "
             f"eff_bw={eff_bw_mbps:.0f}MB/s peak_bw={peak_bw_mbps:.0f}MB/s"
         )
 
