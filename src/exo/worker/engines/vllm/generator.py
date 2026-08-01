@@ -461,6 +461,11 @@ def load_vllm_engine(
                 trust_remote_code=trust_remote_code,
                 load_format="fastsafetensors",
                 enable_prefix_caching=True,
+                # Text-only prefill node: disabling multimodal inputs skips the
+                # vision tower, whose attention requirements ('partial
+                # multimodal token full attention') FLASHINFER doesn't support
+                # (gemma4 on GB10 hit this; PR #1842 hit the equivalent).
+                limit_mm_per_prompt={"image": 0, "video": 0},
                 attention_backend=backend,
                 compilation_config=CompilationConfig(
                     mode=CompilationMode.NONE,
