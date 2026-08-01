@@ -1,6 +1,7 @@
 import gc
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -420,6 +421,7 @@ def load_vllm_engine(
         }
 
     has_mamba = False
+    native_context: int | None = None
     try:
         with open(model_path / "config.json") as f:
             model_config = json.load(f)
@@ -427,6 +429,9 @@ def load_vllm_engine(
         has_mamba = "mamba_ssm_dtype" in text_config or "linear_attention" in (
             text_config.get("layer_types") or []
         )
+        raw_ctx = text_config.get("max_position_embeddings")
+        if isinstance(raw_ctx, int) and raw_ctx > 0:
+            native_context = raw_ctx
     except Exception:
         pass
     is_blackwell = False
@@ -475,6 +480,14 @@ def load_vllm_engine(
                 trust_remote_code=trust_remote_code,
                 load_format="fastsafetensors",
                 enable_prefix_caching=True,
+                # Cap context: without this vLLM sizes init-time buffers for
+                # the model's native max (gemma4: 262144), spiking memory to
+                # <4% on GB10 — where earlyoom correctly SIGTERMs the runner.
+                # 32K covers our workloads; raise via EXO_MAX_MODEL_LEN.
+                max_model_len=min(
+                    int(os.environ.get("EXO_MAX_MODEL_LEN", "32768")),
+                    native_context or 32768,
+                ),
                 # Text-only prefill node: disabling multimodal inputs skips the
                 # vision tower, whose attention requirements ('partial
                 # multimodal token full attention') FLASHINFER doesn't support
