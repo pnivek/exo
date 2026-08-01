@@ -7,6 +7,7 @@ import sys
 import time
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import cast
 
 import torch
@@ -395,7 +396,7 @@ def build_layer_groups(kv_cache_config: KVCacheConfig) -> list[int]:
     return layer_to_group
 
 
-def _choose_load_format(model_path) -> str:
+def _choose_load_format(model_path: Path) -> str:
     # fastsafetensors bulk-buffers ENTIRE shards host+device — a single
     # 50GB shard (gemma-4-31B bf16 ships weights in 2 files) transiently
     # doubles into ~100GB on unified memory and earlyoom kills the load at
